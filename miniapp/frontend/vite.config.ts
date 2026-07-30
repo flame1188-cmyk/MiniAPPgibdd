@@ -5,6 +5,11 @@ import path from 'node:path'
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  // Mini App раздаётся из /app/ (StaticFiles mount в main.py).
+  // Без base: '/app/' Vite генерирует абсолютные пути /assets/...,
+  // а браузер запрашивает их от корня домена — FastAPI отдаёт 404.
+  // С base: '/app/' все ссылки станут /app/assets/... и /app/favicon.svg.
+  base: '/app/',
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
