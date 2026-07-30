@@ -51,16 +51,19 @@ COPY --from=build-frontend /build/dist ./miniapp/frontend/dist
 # Создаём директорию для данных
 RUN mkdir -p /app/data
 
-# Переменные окружения по умолчанию
+# Переменные окружения по умолчанию.
+# PORT не задаём здесь жёстко — bothost передаёт свой PORT через env (обычно 3000).
+# Если запускаем локально без bothost — main.py использует 8080 по умолчанию.
 ENV PYTHONPATH=/app
-ENV PORT=8080
 ENV CAMERA_DATA_DIR=/app/data
 
-# Healthcheck
+# Healthcheck: берём порт из $PORT, чтобы он работал и на bothost (3000), и локально (8080).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f "http://localhost:${PORT:-8080}/health" || exit 1
 
-EXPOSE 8080
+# Открываем оба порта: 3000 (bothost) и 8080 (локальный дефолт main.py).
+# EXPOSE — это метаданные, bothost всё равно использует поле «Порт» из дашборда.
+EXPOSE 3000 8080
 
 # Запуск: один процесс main.py (FastAPI + Telegram webhook)
 CMD ["python", "main.py"]
