@@ -346,13 +346,43 @@ async def execute_task(task_id: str) -> None:
 
         try:
             analytics_module = _import_module("analytics")
-            task.analytics = analytics_module.calculate_metrics(cards)
+
+            # Лучше-эффort загрузка карточек прошлого года для сравнения АППГ.
+            # Если prev_cards не загрузились — analytics всё равно валиден,
+            # но без блока comparison/previous.
+            try:
+                if not task.prev_cards_loaded:
+                    await ensure_prev_cards(task)
+                prev_cards = task.prev_cards or []
+                prev_label = task.prev_label
+            except Exception as exc:
+                logger.warning(
+                    f"Task {task_id}: prev_cards load for analytics failed: "
+                    f"{exc} — analytics without comparison"
+                )
+                prev_cards = []
+                prev_label = None
+
+            task.analytics = analytics_module.build_full_analytics(
+                cards,
+                prev_cards if prev_cards else None,
+                prev_label,
+            )
+            # Добавляем current_label для UI
+            if isinstance(task.analytics, dict):
+                task.analytics["current_label"] = task.period_label
+            logger.info(
+                f"Task {task_id}: analytics built — "
+                f"current={len(cards)} ДТП, "
+                f"prev={'нет' if not prev_cards else f'{len(prev_cards)} ДТП'}"
+            )
         except Exception as exc:
             logger.warning(f"Task {task_id}: analytics failed: {exc}")
             task.analytics = {
                 "total_dtp": task.total_dtp,
                 "total_dead": task.total_dead,
                 "total_injured": task.total_injured,
+                "has_prev_data": False,
             }
 
         # === 4. GENERATING ===
@@ -433,7 +463,15 @@ async def execute_task(task_id: str) -> None:
                 region_name=task.region_name,
                 period_label=task.period_label,
             )
-            html_content = generator.generate_dtp_map(cards, cameras=cameras)
+            # Передаём карточки прошлого года, чтобы на карте появилась
+            # динамика АППГ в верхней сводке (ДТП / Погибшие / Раненые).
+            prev_cards_for_map = task.prev_cards or None
+            html_content = generator.generate_dtp_map(
+                cards,
+                cameras=cameras,
+                prev_cards=prev_cards_for_map,
+                prev_label=task.prev_label,
+            )
 
             map_path = out_dir / f"dtp_map_{region_safe}_{period_safe}.html"
             map_path.write_text(html_content, encoding="utf-8")
