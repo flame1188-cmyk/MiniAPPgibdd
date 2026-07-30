@@ -791,6 +791,7 @@ async def start_clusters_calculation(task: Task) -> None:
             current_cards=task.cards,
             prev_cards=prev_cards,
             progress_callback=progress_cb,
+            reg_code=task.region_code,
         )
 
         state.progress = 90
