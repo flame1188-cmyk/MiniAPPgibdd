@@ -20,7 +20,7 @@ import {
   type PointStatsResponse,
   type TaskStatusResponse,
 } from '@/lib/api'
-import { haptic } from '@/lib/telegram'
+import { haptic, isTelegramDesktop } from '@/lib/telegram'
 
 interface PointStatsViewProps {
   task: TaskStatusResponse
@@ -301,7 +301,7 @@ export function PointStatsView({ task }: PointStatsViewProps) {
                   )}
                   style={{
                     width: '100%',
-                    height: 450,
+                    height: isTelegramDesktop() ? 700 : 450,
                     border: 'none',
                     display: 'block',
                   }}

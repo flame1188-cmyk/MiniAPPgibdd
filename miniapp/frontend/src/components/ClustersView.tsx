@@ -18,7 +18,7 @@ import {
   type ClusterItem,
   type TaskStatusResponse,
 } from '@/lib/api'
-import { haptic } from '@/lib/telegram'
+import { haptic, isTelegramDesktop } from '@/lib/telegram'
 import { useClustersPolling } from '@/hooks/useAnalysisPolling'
 
 interface ClustersViewProps {
@@ -291,7 +291,7 @@ export function ClustersView({ task }: ClustersViewProps) {
               src={api.getClustersMapUrl(task.task_id)}
               style={{
                 width: '100%',
-                height: 450,
+                height: isTelegramDesktop() ? 700 : 450,
                 border: 'none',
                 display: 'block',
               }}
