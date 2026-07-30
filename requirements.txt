@@ -3,6 +3,9 @@
 # ====================================
 
 # --- Telegram Bot ---
+# ВАЖНО: extra [webhooks] НЕ нужен — мы принимаем webhook через FastAPI
+# endpoint /bot/webhook и передаём в PTB через process_update().
+# Это стандартный паттерн интеграции PTB + FastAPI.
 python-telegram-bot==21.7
 
 # --- HTTP client ---

@@ -116,6 +116,62 @@ async def _set_bot_commands(app: Application) -> None:
         logger.warning(f"Не удалось установить меню команд: {exc}")
 
 
+async def _register_telegram_webhook() -> None:
+    """
+    Регистрирует webhook в Telegram через Bot API setWebhook.
+
+    Использует прямой HTTP-запрос к api.telegram.org (через httpx),
+    а не PTB updater — поэтому не требует extra `python-telegram-bot[webhooks]`.
+
+    Telegram будет слать POST /bot/webhook на наш BOTHOST_DOMAIN,
+    FastAPI принимает его и передаёт в tg_app.process_update().
+    """
+    if not WEBHOOK_URL:
+        logger.warning(
+            "BOTHOST_DOMAIN не задан — webhook URL не зарегистрирован в Telegram. "
+            "Укажите BOTHOST_DOMAIN в .env, либо установите webhook вручную: "
+            "curl 'https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<DOMAIN>/bot/webhook'"
+        )
+        return
+
+    import httpx
+
+    api_url = (
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    )
+    payload = {
+        "url": WEBHOOK_URL,
+        "allowed_updates": [
+            "message",
+            "edited_message",
+            "callback_query",
+            "inline_query",
+        ],
+        "drop_pending_updates": False,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(api_url, json=payload)
+            data = resp.json()
+        if data.get("ok"):
+            logger.info(
+                f"Telegram webhook зарегистрирован: {WEBHOOK_URL} "
+                f"(description: {data.get('description', 'ok')})"
+            )
+        else:
+            logger.error(
+                f"setWebhook failed: {data}. "
+                f"Webhook URL: {WEBHOOK_URL}"
+            )
+    except Exception as exc:
+        logger.warning(
+            f"Не удалось зарегистрировать webhook через API: {exc}. "
+            f"Установите вручную: "
+            f"curl 'https://api.telegram.org/bot<TOKEN>/setWebhook?url={WEBHOOK_URL}'"
+        )
+
+
 # Глобальный экземпляр Telegram Application
 tg_app: Application = None  # type: ignore
 
@@ -137,29 +193,23 @@ async def lifespan(app: FastAPI):
     # Создаём директорию для задач
     miniapp_settings.tasks_path.mkdir(parents=True, exist_ok=True)
 
-    # Запускаем Telegram-бот в webhook-режиме
+    # Запускаем Telegram-бота в webhook-режиме через FastAPI endpoint.
+    #
+    # ВАЖНО: мы НЕ используем tg_app.updater.start_webhook() — он запускает
+    # внутренний HTTP-сервер PTB и требует extra `python-telegram-bot[webhooks]`.
+    # Вместо этого FastAPI сам принимает POST /bot/webhook и вызывает
+    # tg_app.process_update(update). Это стандартный паттерн интеграции
+    # PTB + FastAPI, не требующий никаких extras.
     if TELEGRAM_BOT_TOKEN:
         try:
             tg_app = _create_telegram_app()
+            # initialize() загружает bot info (get_me) — проверяет токен
             await tg_app.initialize()
+            # start() запускает handlers, но НЕ запускает updater/polling
             await tg_app.start()
 
-            # Запускаем webhook (внутренний HTTP-сервер python-telegram-bot)
-            await tg_app.updater.start_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=WEBHOOK_PATH,
-                # bothost сам терминирует TLS — внутренний трафик HTTP
-                webhook_url=WEBHOOK_URL if WEBHOOK_URL else None,
-            )
-
-            if WEBHOOK_URL:
-                logger.info(f"Telegram webhook установлен: {WEBHOOK_URL}")
-            else:
-                logger.warning(
-                    "BOTHOST_DOMAIN не задан — webhook URL не установлен. "
-                    "Укажите BOTHOST_DOMAIN в .env"
-                )
+            # Явно регистрируем webhook в Telegram (FastAPI endpoint уже готов)
+            await _register_telegram_webhook()
 
             # Устанавливаем меню команд бота
             await _set_bot_commands(tg_app)
@@ -184,7 +234,7 @@ async def lifespan(app: FastAPI):
 
     if tg_app:
         try:
-            await tg_app.updater.stop()
+            # updater не запускали (нет start_webhook) — только stop+shutdown
             await tg_app.stop()
             await tg_app.shutdown()
             logger.info("Telegram-бот остановлен")
