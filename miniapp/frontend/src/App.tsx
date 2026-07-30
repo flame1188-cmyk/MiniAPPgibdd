@@ -9,7 +9,8 @@
  *  - История последних запросов
  */
 import { useState } from 'react'
-import { RequestForm } from '@/components/RequestForm'
+import { StructuredForm } from '@/components/StructuredForm'
+import { CamerasWidget } from '@/components/CamerasWidget'
 import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
@@ -62,7 +63,10 @@ export default function App() {
         )}
 
         {/* Форма запроса */}
-        <RequestForm onTaskCreated={setActiveTaskId} />
+        <StructuredForm onTaskCreated={setActiveTaskId} />
+
+        {/* Загрузка камер фотовидеофиксации */}
+        <CamerasWidget />
 
         {/* Активная задача */}
         {activeTaskId && task && (

@@ -36,11 +36,39 @@ router = APIRouter(prefix="/dtp", tags=["dtp"])
 # Schemas
 # ============================================================
 class TaskCreateRequest(BaseModel):
-    """Запрос на создание задачи выгрузки."""
+    """Запрос на создание задачи выгрузки.
 
-    query: str = Field(
-        ..., min_length=2, max_length=500,
-        description="Естественный язык или строгий формат '2.2024 1119'",
+    Поддерживает два режима:
+    1. Structured (рекомендуется): регион + период выбраны из списка.
+       Поля region_code, region_name, dat_list, period_label заполнены.
+       Парсинг текста не выполняется — ошибок распознавания нет.
+    2. Text (legacy): произвольный текст в `query`.
+       Парсится через user_request_parser.
+
+    Если region_code + dat_list заполнены → structured mode,
+    иначе — text mode (тогда `query` обязателен).
+    """
+
+    query: Optional[str] = Field(
+        default=None, max_length=500,
+        description="Текстовый запрос (legacy-режим). "
+                    "Игнорируется, если заданы region_code и dat_list.",
+    )
+    region_code: Optional[str] = Field(
+        default=None,
+        description="Код региона (например '1101'). Structured-режим.",
+    )
+    region_name: Optional[str] = Field(
+        default=None,
+        description="Название региона для отображения. Structured-режим.",
+    )
+    dat_list: Optional[List[str]] = Field(
+        default=None,
+        description="Список месяцев в формате 'M.YYYY' (например ['1.2025', '2.2025']).",
+    )
+    period_label: Optional[str] = Field(
+        default=None,
+        description="Человекочитаемая метка периода (например '2025 год').",
     )
 
 
@@ -88,23 +116,56 @@ async def create_dtp_task(
     """
     Создаёт задачу выгрузки ДТП и запускает её асинхронно (через asyncio).
 
-    Парсит запрос через user_request_parser, затем запускает
-    bot._fetch_cards_for_period в фоне.
+    Два режима:
+    - Structured: заполнены region_code + dat_list (+ region_name, period_label).
+      Парсинг текста не выполняется.
+    - Text (legacy): только query. Парсится через user_request_parser.
     """
-    parsed = await parse_user_query(request.query)
-    if not parsed.get("ok"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=parsed.get("error", "Не удалось распознать запрос"),
+    # === Определяем режим ===
+    is_structured = bool(
+        request.region_code
+        and request.dat_list
+        and len(request.dat_list) > 0
+    )
+
+    if is_structured:
+        # Structured mode — без парсинга
+        region_code = request.region_code or ""
+        region_name = request.region_name or f"Регион {region_code}"
+        dat_list = request.dat_list or []
+        period_label = request.period_label or (
+            f"{len(dat_list)} мес." if dat_list else "—"
         )
+        raw_query = f"[structured] {region_name} | {period_label} | {dat_list}"
+    else:
+        # Text mode — парсим через user_request_parser
+        if not request.query or len(request.query.strip()) < 2:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Укажите либо region_code + dat_list (structured mode), "
+                    "либо query длиной минимум 2 символа (text mode)."
+                ),
+            )
+        parsed = await parse_user_query(request.query)
+        if not parsed.get("ok"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=parsed.get("error", "Не удалось распознать запрос"),
+            )
+        region_code = parsed["region_code"]
+        region_name = parsed["region_name"]
+        dat_list = parsed["dat_list"]
+        period_label = parsed["period"]
+        raw_query = request.query
 
     task = create_task(
         user_id=user.id,
-        region_code=parsed["region_code"],
-        region_name=parsed["region_name"],
-        period_label=parsed["period"],
-        dat_list=parsed["dat_list"],
-        raw_query=request.query,
+        region_code=region_code,
+        region_name=region_name,
+        period_label=period_label,
+        dat_list=dat_list,
+        raw_query=raw_query,
     )
 
     # Асинхронный запуск в фоне — execute_task сам обновляет статус

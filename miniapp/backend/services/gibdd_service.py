@@ -327,11 +327,43 @@ async def execute_task(task_id: str) -> None:
         # HTML-карта через ReportGenerator
         try:
             report_gen_module = _import_module("report_generator")
+
+            # Подгружаем камеры из кэша, если они есть для этого региона.
+            # Файл должен лежать в data/cameras_{reg_code}.xls
+            # (загружается через Telegram-бота или через Mini App UI).
+            cameras = None
+            try:
+                camera_cache_module = _import_module("camera_cache")
+                if camera_cache_module.has_cached_cameras(task.region_code):
+                    cameras = camera_cache_module.load_cameras_from_cache(
+                        task.region_code
+                    )
+                    if cameras:
+                        with_pk = sum(
+                            1 for c in cameras if c.get("has_piket")
+                        )
+                        logger.info(
+                            f"Task {task_id}: loaded {len(cameras)} cameras "
+                            f"({with_pk} with piket) for region "
+                            f"{task.region_code}"
+                        )
+                    else:
+                        logger.warning(
+                            f"Task {task_id}: camera file exists for "
+                            f"{task.region_code} but parser returned empty"
+                        )
+            except Exception as exc:
+                logger.warning(
+                    f"Task {task_id}: camera cache load failed: {exc} "
+                    f"— building map without cameras"
+                )
+                cameras = None
+
             generator = report_gen_module.ReportGenerator(
                 region_name=task.region_name,
                 period_label=task.period_label,
             )
-            html_content = generator.generate_dtp_map(cards, cameras=None)
+            html_content = generator.generate_dtp_map(cards, cameras=cameras)
 
             map_path = out_dir / f"dtp_map_{region_safe}_{period_safe}.html"
             map_path.write_text(html_content, encoding="utf-8")

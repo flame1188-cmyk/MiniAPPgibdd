@@ -11,13 +11,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import dtp, parse, point, regions
+from .routers import cameras, dtp, parse, point, regions
 
 
 app = FastAPI(
     title="GIBDD Mini App API",
-    description="API для Mini App: регионы, парсинг, задачи выгрузки, точка.",
-    version="0.1.0",
+    description="API для Mini App: регионы, парсинг, задачи выгрузки, точка, камеры.",
+    version="0.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -27,6 +27,7 @@ app.include_router(regions.router)
 app.include_router(parse.router)
 app.include_router(dtp.router)
 app.include_router(point.router)
+app.include_router(cameras.router)
 
 
 @app.get("/miniapp/health")

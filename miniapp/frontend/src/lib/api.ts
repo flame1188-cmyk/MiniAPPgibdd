@@ -27,6 +27,9 @@ async function request<T>(
   const headers = new Headers(options.headers)
   headers.set('X-Tg-Init-Data', initData)
 
+  // Устанавливаем Content-Type: application/json ТОЛЬКО если body — строка
+  // (JSON). Для FormData браузер сам поставит multipart/form-data с
+  // правильным boundary — нельзя это перетирать.
   if (options.body && typeof options.body === 'string') {
     headers.set('Content-Type', 'application/json')
   }
@@ -106,6 +109,42 @@ export interface TaskStatusResponse {
   analytics?: Record<string, unknown> | null
 }
 
+// Структурированный запрос на создание задачи (без текстового парсинга)
+export interface StructuredTaskRequest {
+  region_code: string
+  region_name: string
+  dat_list: string[]          // ['1.2025', '2.2025', ...]
+  period_label: string         // '2025 год' / 'I квартал 2025'
+}
+
+// ============================================================
+// Cameras
+// ============================================================
+export interface CameraRegionInfo {
+  reg_code: string
+  reg_name: string | null
+  has_file: boolean
+  file_size_bytes: number
+  file_modified: string | null
+  cameras_count: number
+  cameras_with_piket: number
+}
+
+export interface CameraListResponse {
+  regions: CameraRegionInfo[]
+  total_regions: number
+  total_cameras: number
+}
+
+export interface CameraUploadResponse {
+  ok: boolean
+  reg_code: string
+  file_size_bytes: number
+  cameras_count: number
+  cameras_with_piket: number
+  message: string
+}
+
 // ============================================================
 // API methods
 // ============================================================
@@ -123,6 +162,17 @@ export const api = {
       body: JSON.stringify({ query }),
     }),
 
+  // Structured-режим: регион и период выбраны из списка, парсинг не нужен.
+  createStructuredTask: (params: StructuredTaskRequest) =>
+    request<{ task_id: string; status: TaskStatus; region_code: string; region_name: string; period: string }>(
+      '/api/dtp/tasks',
+      {
+        method: 'POST',
+        body: JSON.stringify(params),
+      }
+    ),
+
+  // Legacy-режим: текстовый запрос (для обратной совместимости).
   createTask: (params: { query?: string; region_code?: string; period?: string }) =>
     request<{ task_id: string; status: TaskStatus; region_code: string; region_name: string; period: string }>(
       '/api/dtp/tasks',
@@ -146,4 +196,29 @@ export const api = {
 
   getDownloadUrl: (taskId: string, fileType: string) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/download/${fileType}?tg_init_data=${encodeURIComponent(getInitData())}`,
+
+  // ============================================================
+  // Cameras
+  // ============================================================
+  listCameras: () => request<CameraListResponse>('/api/cameras'),
+
+  getCamerasStatus: (regCode: string) =>
+    request<CameraRegionInfo>(`/api/cameras/${regCode}`),
+
+  uploadCameras: (regCode: string, file: File) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return request<CameraUploadResponse>(`/api/cameras/${regCode}`, {
+      method: 'POST',
+      body: formData,
+      // НЕ устанавливаем Content-Type — браузер сам поставит multipart/form-data
+      // с правильным boundary. Заголовок X-Tg-Init-Data добавится в request().
+    })
+  },
+
+  deleteCameras: (regCode: string) =>
+    request<{ ok: boolean; reg_code: string; deleted: boolean }>(
+      `/api/cameras/${regCode}`,
+      { method: 'DELETE' }
+    ),
 }

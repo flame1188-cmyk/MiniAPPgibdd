@@ -6,6 +6,7 @@ import { api, type TaskStatusResponse } from '@/lib/api'
 import { haptic } from '@/lib/telegram'
 import { formatSize, statusLabel } from '@/lib/utils'
 import { MapFrame } from './MapFrame'
+import { AnalyticsView } from './AnalyticsView'
 
 interface ResultsPanelProps {
   task: TaskStatusResponse
@@ -95,54 +96,6 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
       )}
     </div>
   )
-}
-
-// ============================================================
-// Аналитика
-// ============================================================
-function AnalyticsView({ analytics }: { analytics: Record<string, unknown> }) {
-  const entries = Object.entries(analytics)
-
-  return (
-    <div className="tg-card">
-      <div className="tg-section-header">Сводка</div>
-      <div className="space-y-2">
-        {entries.map(([key, value]) => (
-          <div
-            key={key}
-            className="flex items-center justify-between py-2 border-b last:border-b-0"
-            style={{ borderColor: 'var(--tg-color-secondary-bg, #f1f1f1)' }}
-          >
-            <span className="text-sm opacity-80">{formatAnalyticsKey(key)}</span>
-            <span className="font-medium text-sm">{formatAnalyticsValue(value)}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function formatAnalyticsKey(key: string): string {
-  const labels: Record<string, string> = {
-    total_dtp: 'Всего ДТП',
-    total_dead: 'Погибших',
-    total_injured: 'Ранено',
-    total_participants: 'Участников',
-    severity_rate: 'Тяжесть',
-    comparison: 'Сравнение с прошлым годом',
-  }
-  return labels[key] ?? key
-}
-
-function formatAnalyticsValue(value: unknown): string {
-  if (value === null || value === undefined) return '—'
-  if (typeof value === 'number') {
-    return Number.isInteger(value) ? value.toString() : value.toFixed(2)
-  }
-  if (typeof value === 'object') {
-    return JSON.stringify(value)
-  }
-  return String(value)
 }
 
 // ============================================================
