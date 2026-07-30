@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -350,16 +352,19 @@ async def get_clusters_excel(
             detail="Excel generation failed",
         )
 
-    # Безопасное имя файла
-    safe_reg = "".join(
-        c if c.isalnum() or c in "-_" else "_"
-        for c in task.region_name[:30]
-    ) or "region"
-    safe_period = "".join(
-        c if c.isalnum() or c in "-_" else "_"
-        for c in task.period_label[:30]
-    ) or "period"
-    filename = f"dtp_ochagi_{safe_reg}_{safe_period}.xlsx"
+    # Безопасное имя файла (RFC 5987: ASCII-fallback + UTF-8 form)
+    # Cyrillic в filename= ломает starlette (latin-1 encode),
+    # поэтому ASCII fallback + filename*=UTF-8''<urlencoded>
+    safe_reg_ascii = re.sub(
+        r"[^A-Za-z0-9_-]", "_", task.region_name[:30]
+    ).strip("_") or "region"
+    safe_period_ascii = re.sub(
+        r"[^A-Za-z0-9_-]", "_", task.period_label[:30]
+    ).strip("_") or "period"
+    filename_ascii = f"dtp_ochagi_{safe_reg_ascii}_{safe_period_ascii}.xlsx"
+    # Полное имя с кириллицей для современных клиентов
+    filename_full = f"dtp_ochagi_{task.region_name}_{task.period_label}.xlsx"
+    filename_utf8 = urllib.parse.quote(filename_full, safe="")
 
     return Response(
         content=xlsx_bytes,
@@ -368,7 +373,10 @@ async def get_clusters_excel(
             "spreadsheetml.sheet"
         ),
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": (
+                f'attachment; filename="{filename_ascii}"; '
+                f"filename*=UTF-8''{filename_utf8}"
+            ),
         },
     )
 
@@ -455,16 +463,22 @@ async def get_point_stats_excel(
             detail="Excel generation failed",
         )
 
-    # Безопасное имя файла
-    safe_reg = "".join(
-        c if c.isalnum() or c in "-_" else "_"
-        for c in task.region_name[:30]
-    ) or "region"
+    # Безопасное имя файла (RFC 5987: ASCII-fallback + UTF-8 form)
+    safe_reg_ascii = re.sub(
+        r"[^A-Za-z0-9_-]", "_", task.region_name[:30]
+    ).strip("_") or "region"
     params = task.last_point_params or {}
     lat_str = f"{params.get('lat', 0):.4f}".replace(".", "-")
     lon_str = f"{params.get('lon', 0):.4f}".replace(".", "-")
     radius = int(params.get("radius_m", 0))
-    filename = f"point_stats_{safe_reg}_{lat_str}_{lon_str}_{radius}m.xlsx"
+    filename_ascii = (
+        f"point_stats_{safe_reg_ascii}_{lat_str}_{lon_str}_{radius}m.xlsx"
+    )
+    # Полное имя с кириллицей для современных клиентов
+    filename_full = (
+        f"point_stats_{task.region_name}_{lat_str}_{lon_str}_{radius}m.xlsx"
+    )
+    filename_utf8 = urllib.parse.quote(filename_full, safe="")
 
     return Response(
         content=xlsx_bytes,
@@ -473,7 +487,10 @@ async def get_point_stats_excel(
             "spreadsheetml.sheet"
         ),
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": (
+                f'attachment; filename="{filename_ascii}"; '
+                f"filename*=UTF-8''{filename_utf8}"
+            ),
         },
     )
 
