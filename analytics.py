@@ -118,6 +118,65 @@ def _has_pedestrian(card: dict) -> bool:
     return False
 
 
+# ============================================================
+# Группировка видов ДТП в 9 канонических категорий
+# (для читабельных графиков в Mini App)
+# ============================================================
+DTP_TYPE_GROUPS: list[tuple[str, list[str]]] = [
+    ("Столкновение", ["столкновение"]),
+    ("Наезд на пешехода", ["наезд на пешехода"]),
+    ("Наезд на велосипедиста", ["наезд на велосипед"]),
+    ("Наезд на стоящее ТС", ["наезд на стоящее"]),
+    ("Съезд с дороги", ["съезд с дороги"]),
+    ("Опрокидывание", ["опрокидывание"]),
+    ("Наезд на препятствие", ["наезд на препятствие"]),
+    (
+        "Наезд на лицо, использующее СИМ",
+        ["сим", "средство индивидуальной мобильности", "электросамокат"],
+    ),
+    # "Иные ДТП" — все остальные (добавляется автоматически в group_dtp_type)
+]
+
+# Порядок категорий для отображения на графике
+DTP_TYPE_ORDER: list[str] = [g[0] for g in DTP_TYPE_GROUPS] + ["Иные ДТП"]
+
+
+def group_dtp_type(raw_type: str) -> str:
+    """Приводит произвольный вид ДТП к одной из 9 канонических категорий.
+
+    Если ни одна из категорий не подошла — возвращает "Иные ДТП".
+    Пустая строка также классифицируется как "Иные ДТП".
+    """
+    if not raw_type:
+        return "Иные ДТП"
+    t = str(raw_type).lower().strip()
+    for canonical, aliases in DTP_TYPE_GROUPS:
+        for alias in aliases:
+            if alias in t:
+                return canonical
+    return "Иные ДТП"
+
+
+def _month_name_from_date(date_str: str) -> str | None:
+    """Возвращает русское название месяца по строке даты 'DD.MM.YYYY'.
+
+    Возвращает None, если дата не распарсена.
+    """
+    if not date_str:
+        return None
+    try:
+        from datetime import datetime
+        m = datetime.strptime(str(date_str).strip()[:10], "%d.%m.%Y").month
+        names = {
+            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+        }
+        return names.get(m)
+    except (ValueError, IndexError):
+        return None
+
+
 def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
     """
     Считает все метрики по списку карточек ДТП.
@@ -145,7 +204,10 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
     weekday_counter = Counter()
     hour_counter = Counter()
     type_counter = Counter()
+    type_grouped_counter = Counter()
     weather_counter = Counter()
+    road_counter = Counter()
+    month_counter: dict[str, dict[str, int]] = {}
 
     for card in cards:
         # Погибшие и раненые
@@ -170,10 +232,13 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if hour is not None:
             hour_counter[hour] += 1
 
-        # Вид ДТП
+        # Вид ДТП (raw — как в данных ГИБДД)
         dtp_type = str(card.get("dtpv", "")).strip()
         if dtp_type:
             type_counter[dtp_type] += 1
+
+        # Вид ДТП (сгруппированный — 9 категорий)
+        type_grouped_counter[group_dtp_type(dtp_type)] += 1
 
         # Погодные условия
         dor_usl = card.get("dor_usl", {}) or {}
@@ -183,6 +248,21 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
                 w_str = str(w).strip()
                 if w_str:
                     weather_counter[w_str] += 1
+
+        # Дорога (наименование — поле "dor")
+        road = str(card.get("dor", "")).strip()
+        if road:
+            road_counter[road] += 1
+
+        # Месяц × тяжесть
+        m_name = _month_name_from_date(str(card.get("date_dtp", "")))
+        if m_name:
+            bucket = month_counter.setdefault(
+                m_name, {"dtp": 0, "deaths": 0, "injured": 0}
+            )
+            bucket["dtp"] += 1
+            bucket["deaths"] += _safe_int(card.get("pog"))
+            bucket["injured"] += _safe_int(card.get("ran"))
 
     deaths_per_100 = round(deaths / total * 100, 1) if total > 0 else 0
     injured_per_100 = round(injured / total * 100, 1) if total > 0 else 0
@@ -198,7 +278,10 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "by_weekday": dict(weekday_counter),
         "by_hour": dict(hour_counter),
         "by_type": dict(type_counter),
+        "by_type_grouped": dict(type_grouped_counter),
         "by_weather": dict(weather_counter),
+        "by_road": dict(road_counter),
+        "by_month": month_counter,
     }
 
 
@@ -276,12 +359,63 @@ def compare_metrics(
         "current": current["by_type"],
         "previous": previous["by_type"],
     }
+    result["by_type_grouped"] = {
+        "current": current.get("by_type_grouped", {}),
+        "previous": previous.get("by_type_grouped", {}),
+    }
     result["by_weather"] = {
         "current": current["by_weather"],
         "previous": previous["by_weather"],
     }
+    result["by_road"] = {
+        "current": current.get("by_road", {}),
+        "previous": previous.get("by_road", {}),
+    }
+    result["by_month"] = {
+        "current": current.get("by_month", {}),
+        "previous": previous.get("by_month", {}),
+    }
 
     return result
+
+
+def build_full_analytics(
+    current_cards: list[dict[str, Any]],
+    prev_cards: list[dict[str, Any]] | None = None,
+    prev_label: str | None = None,
+) -> dict[str, Any]:
+    """Собирает расширенный аналитический блок для Mini App.
+
+    Возвращает dict со следующей структурой:
+      {
+        "current": {…результат calculate_metrics для текущего периода…},
+        "previous": {…то же для прошлого периода или None…} | None,
+        "comparison": {…результат compare_metrics или None…} | None,
+        "has_prev_data": bool,
+        "prev_label": "Январь-Июнь 2025" | None,
+        "current_label": "Январь-Июнь 2026"  // не задаётся здесь, копируется позже
+      }
+
+    Функция safe для пустых списков: вернёт корректный zero-state.
+    """
+    current = calculate_metrics(current_cards or [])
+
+    if prev_cards:
+        previous = calculate_metrics(prev_cards)
+        comparison = compare_metrics(current, previous)
+        has_prev = True
+    else:
+        previous = None
+        comparison = None
+        has_prev = False
+
+    return {
+        "current": current,
+        "previous": previous,
+        "comparison": comparison,
+        "has_prev_data": has_prev,
+        "prev_label": prev_label if has_prev else None,
+    }
 
 
 def format_change(value: float) -> str:

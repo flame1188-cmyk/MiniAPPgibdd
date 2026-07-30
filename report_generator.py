@@ -737,10 +737,12 @@ body {
         self,
         cards: list[dict],
         cameras: list[dict] | None = None,
+        prev_cards: list[dict] | None = None,
+        prev_label: str | None = None,
     ) -> str:
         """
         Генерирует HTML-файл с картой всех ДТП.
-        Опционально с маркерами камер.
+        Опционально с маркерами камер и сравнением с АППГ в сводке.
         """
         # Фильтруем карточки с координатами
         cards_with_coords = [
@@ -748,18 +750,30 @@ body {
         ]
         cards_no_coords = len(cards) - len(cards_with_coords)
 
-        # Статистика
+        # Статистика текущего периода
         total = len(cards)
         pog_total = sum(int(c.get("pog", 0) or 0) for c in cards)
         ran_total = sum(int(c.get("ran", 0) or 0) for c in cards)
 
-        # Сводка
+        # Статистика прошлого периода (для динамики АППГ)
+        if prev_cards:
+            prev_total = len(prev_cards)
+            prev_pog = sum(int(c.get("pog", 0) or 0) for c in prev_cards)
+            prev_ran = sum(int(c.get("ran", 0) or 0) for c in prev_cards)
+        else:
+            prev_total = prev_pog = prev_ran = None
+
+        # Сводка с динамикой АППГ
         summary_html = self._build_summary(
             total=total,
             deaths=pog_total,
             injured=ran_total,
             no_coords=cards_no_coords,
             cameras=len(cameras) if cameras else 0,
+            prev_total=prev_total,
+            prev_deaths=prev_pog,
+            prev_injured=prev_ran,
+            prev_label=prev_label,
         )
 
         # Легенда
@@ -815,20 +829,59 @@ body {
         injured: int,
         no_coords: int = 0,
         cameras: int = 0,
+        prev_total: int | None = None,
+        prev_deaths: int | None = None,
+        prev_injured: int | None = None,
+        prev_label: str | None = None,
     ) -> str:
+        """HTML-сводка. Если переданы prev_*, рендерит под каждым значением
+        динамику vs АППГ: «+5 (+2,1%) vs <prev_label>».
+        """
+
+        def delta_html(cur: int, prev: int | None) -> str:
+            """HTML-блок динамики под значением."""
+            if prev is None:
+                return ""
+            abs_d = cur - prev
+            if prev == 0:
+                pct_str = "новое" if cur > 0 else "0%"
+            else:
+                pct = (abs_d / prev) * 100
+                pct_str = f"{pct:+.1f}%"
+            # Цвет: рост — красный (ухудшение), снижение — зелёное, нейтрально — серое
+            if abs_d > 0:
+                color = "#d32f2f"
+                arrow = "↑"
+                abs_str = f"+{abs_d}"
+            elif abs_d < 0:
+                color = "#2e7d32"
+                arrow = "↓"
+                abs_str = f"{abs_d}"
+            else:
+                color = "#757575"
+                arrow = "→"
+                abs_str = "0"
+            return (
+                f'<div class="delta" style="font-size:12px;color:{color};'
+                f'margin-top:2px;">{abs_str} ({pct_str}) {arrow}</div>'
+            )
+
         cards_html = f"""
 <div class="summary-grid">
   <div class="summary-card total">
     <div class="value">{total}</div>
     <div class="label">Всего ДТП</div>
+    {delta_html(total, prev_total)}
   </div>
   <div class="summary-card fatal">
     <div class="value">{deaths}</div>
     <div class="label">Погибло</div>
+    {delta_html(deaths, prev_deaths)}
   </div>
   <div class="summary-card injured">
     <div class="value">{injured}</div>
     <div class="label">Ранено</div>
+    {delta_html(injured, prev_injured)}
   </div>"""
         if cameras > 0:
             cards_html += f"""
@@ -843,6 +896,15 @@ body {
     <div class="label">Без координат</div>
   </div>"""
         cards_html += "\n</div>"
+
+        # Подпись сравнения
+        if prev_total is not None and prev_label:
+            cards_html += (
+                f'<div style="font-size:12px;color:#757575;'
+                f'margin-top:6px;text-align:center;">'
+                f"Сравнение с АППГ: {self._esc(prev_label)}"
+                f"</div>"
+            )
         return cards_html
 
     def _build_dtp_legend(self) -> str:
