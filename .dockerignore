@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Локальный кэш — НЕ должен попадать в Docker-образ.
+# Кэш живёт в persistent volume /app/data на Bothost.
+.cache/
+data/osm_cache/
+data/cameras/
+.cache_*/
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.bak
+
+# Сборки фронтенда (собирается в Docker, не нужно тащить локальную)
+miniapp/frontend/node_modules/
+miniapp/frontend/dist/
+miniapp/frontend/.vite/
+
+# Git
+.git/
+.gitignore
+
+# Документация и скрипты разработки
+*.md
+!README.md
+!README_DEPLOY*.md
+.gitlab-ci.yml
+github/
+
+# Тесты
+tests/
+*.test.py
