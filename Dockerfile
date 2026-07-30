@@ -1,0 +1,66 @@
+# ============================================================
+# Multi-stage Dockerfile для GIBDD Bot + Mini App
+#
+# Сборка:
+#   docker build -t gibdd-bot-miniapp .
+#
+# Запуск (локально):
+#   docker run -d --env-file .env -p 8080:8080 gibdd-bot-miniapp
+#
+# На bothost.ru: просто укажите этот Dockerfile как источник,
+# bothost автоматически соберёт и запустит.
+# ============================================================
+
+# --- Stage 1: Сборка frontend ---
+FROM node:20-alpine AS build-frontend
+WORKDIR /build
+
+# Кэшируем установку зависимостей
+COPY miniapp/frontend/package.json miniapp/frontend/package-lock.json* ./
+RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+# Копируем исходники и собираем
+COPY miniapp/frontend/ ./
+RUN npm run build
+
+
+# --- Stage 2: Runtime ---
+FROM python:3.11-slim AS runtime
+
+# Системные зависимости для Shapely + httpx
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libgeos-dev \
+    libxml2 \
+    libxslt1.1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Устанавливаем Python-зависимости
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем весь код проекта (gibdd-bot + miniapp)
+COPY . .
+
+# Копируем собранный frontend
+COPY --from=build-frontend /build/dist ./miniapp/frontend/dist
+
+# Создаём директорию для данных
+RUN mkdir -p /app/data
+
+# Переменные окружения по умолчанию
+ENV PYTHONPATH=/app
+ENV PORT=8080
+ENV CAMERA_DATA_DIR=/app/data
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+EXPOSE 8080
+
+# Запуск: один процесс main.py (FastAPI + Telegram webhook)
+CMD ["python", "main.py"]

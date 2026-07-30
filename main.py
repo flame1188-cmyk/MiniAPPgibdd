@@ -1,0 +1,336 @@
+"""
+Единая точка входа для bothost.ru: FastAPI + Telegram bot (webhook mode).
+
+Структура:
+- FastAPI запускается на порту из $PORT (bothost отдаёт через env)
+- Telegram-бот работает в webhook-режиме на /bot/webhook
+- Mini App frontend раздаётся из /app (после `npm run build` в miniapp/frontend)
+- Существующие модули gibdd-bot импортируются напрямую (мы в корне проекта)
+
+Запуск локально (для разработки):
+    PORT=8080 python main.py
+
+Запуск на bothost:
+    Главный файл в настройках bothost: main.py
+    Переменные окружения: см. .env.example
+
+После первого деплоя установите webhook:
+    curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<BOTHOST_DOMAIN>/bot/webhook"
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+# Убеждаемся, что корень gibdd-bot в sys.path
+_PROJECT_ROOT = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Импортируем существующий конфиг gibdd-bot
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    ALLOWED_USER_IDS,
+    LLM_API_KEY,
+    LOG_LEVEL,
+    validate_config,
+)
+
+# Настраиваем логирование ДО остальных импортов
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# FastAPI
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+
+# Telegram
+from telegram import Update
+from telegram.ext import Application
+
+# Mini App backend
+from miniapp.backend.main import app as miniapp_app
+from miniapp.backend.config import settings as miniapp_settings
+
+
+# ============================================================
+# Константы
+# ============================================================
+PORT = int(os.environ.get("PORT", "8080"))
+BOTHOST_DOMAIN = os.environ.get("BOTHOST_DOMAIN", "")
+WEBHOOK_PATH = "/bot/webhook"
+WEBHOOK_URL = f"https://{BOTHOST_DOMAIN}{WEBHOOK_PATH}" if BOTHOST_DOMAIN else ""
+
+# Путь к собранному фронтенду (после `npm run build`)
+FRONTEND_DIST = _PROJECT_ROOT / "miniapp" / "frontend" / "dist"
+
+
+# ============================================================
+# Создание Telegram Application (через существующий bot._build_app)
+# ============================================================
+def _create_telegram_app() -> Application:
+    """
+    Создаёт Telegram Application, переиспользуя существующую
+    фабрику _build_app() из bot.py.
+
+    bot.py уже настроил все handler'ы (start, help, dtp, regions,
+    callback_query, текстовые сообщения, локации, документы, error_handler).
+    """
+    import bot as bot_module
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN не задан. Укажите его в .env"
+        )
+
+    # Используем существующую фабрику
+    app = bot_module._build_app(TELEGRAM_BOT_TOKEN)
+    logger.info("Telegram Application создан (через bot._build_app)")
+    return app
+
+
+async def _set_bot_commands(app: Application) -> None:
+    """Устанавливает меню команд бота (видно в /menu и при вводе /)."""
+    from telegram import BotCommand
+
+    commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("dtp", "Выгрузка ДТП через кнопки"),
+        BotCommand("miniapp", "Открыть веб-приложение"),
+        BotCommand("regions", "Список регионов"),
+        BotCommand("help", "Справка"),
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+        logger.info("Меню команд бота установлено")
+    except Exception as exc:
+        logger.warning(f"Не удалось установить меню команд: {exc}")
+
+
+# Глобальный экземпляр Telegram Application
+tg_app: Application = None  # type: ignore
+
+
+# ============================================================
+# Lifespan: запуск и остановка Telegram-бота в webhook-режиме
+# ============================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Жизненный цикл: запуск Telegram-бота + инициализация Mini App."""
+    global tg_app
+
+    # Проверяем конфигурацию
+    errors = validate_config()
+    if errors:
+        logger.error(f"Ошибки конфигурации: {errors}")
+        # Не падаем — FastAPI поднимется, но бот работать не будет
+
+    # Создаём директорию для задач
+    miniapp_settings.tasks_path.mkdir(parents=True, exist_ok=True)
+
+    # Запускаем Telegram-бот в webhook-режиме
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            tg_app = _create_telegram_app()
+            await tg_app.initialize()
+            await tg_app.start()
+
+            # Запускаем webhook (внутренний HTTP-сервер python-telegram-bot)
+            await tg_app.updater.start_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=WEBHOOK_PATH,
+                # bothost сам терминирует TLS — внутренний трафик HTTP
+                webhook_url=WEBHOOK_URL if WEBHOOK_URL else None,
+            )
+
+            if WEBHOOK_URL:
+                logger.info(f"Telegram webhook установлен: {WEBHOOK_URL}")
+            else:
+                logger.warning(
+                    "BOTHOST_DOMAIN не задан — webhook URL не установлен. "
+                    "Укажите BOTHOST_DOMAIN в .env"
+                )
+
+            # Устанавливаем меню команд бота
+            await _set_bot_commands(tg_app)
+        except Exception as exc:
+            logger.exception(f"Не удалось запустить Telegram-бота: {exc}")
+            tg_app = None
+    else:
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN не задан — бот не запущен. "
+            "Mini App продолжит работать, но без webhook."
+        )
+
+    # Инициализация Mini App — регионы загружаются лениво при первом
+    # обращении к /api/regions, чтобы не блокировать старт сервера
+    # (API ГИБДД может тормозить с ретраями до 20 сек).
+    logger.info("Mini App: стартовая инициализация пропущена — lazy loading")
+
+    yield
+
+    # === Graceful shutdown ===
+    logger.info("Останавливаемся...")
+
+    if tg_app:
+        try:
+            await tg_app.updater.stop()
+            await tg_app.stop()
+            await tg_app.shutdown()
+            logger.info("Telegram-бот остановлен")
+        except Exception as exc:
+            logger.error(f"Ошибка при остановке бота: {exc}")
+
+        # Закрываем HTTP-клиенты gibdd-bot
+        try:
+            from api_client import close_client
+            await close_client()
+        except Exception:
+            pass
+        try:
+            from llm_analyzer import close_llm_client
+            await close_llm_client()
+        except Exception:
+            pass
+
+    logger.info("Сервер остановлен")
+
+
+# ============================================================
+# FastAPI приложение
+# ============================================================
+app = FastAPI(
+    title="GIBDD Stat Bot + Mini App",
+    description=(
+        "Telegram-бот + Mini App для выгрузки и анализа данных ДТП "
+        "из открытых данных ГИБДД (stat.gibdd.ru)."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=miniapp_settings.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["X-Task-Id"],
+)
+
+# Монтируем все роутеры Mini App под /api
+app.mount("/api", miniapp_app)
+
+
+# ============================================================
+# Webhook для Telegram
+# ============================================================
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    """Принимает updates от Telegram и передаёт в python-telegram-bot."""
+    if tg_app is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram bot not initialized",
+        )
+
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid JSON: {exc}",
+        )
+
+    try:
+        update = Update.de_json(data, tg_app.bot)
+        await tg_app.process_update(update)
+    except Exception as exc:
+        logger.exception(f"Ошибка обработки update: {exc}")
+        # Возвращаем 200, чтобы Telegram не ретраил бесконечно
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=200)
+
+    return JSONResponse({"ok": True})
+
+
+# ============================================================
+# Health check
+# ============================================================
+@app.get("/health")
+async def health():
+    """Health-check для bothost / Docker / мониторинга."""
+    return {
+        "status": "ok",
+        "service": "gibdd-bot-miniapp",
+        "version": "1.0.0",
+        "telegram_bot": "running" if tg_app else "stopped",
+        "bothost_domain": BOTHOST_DOMAIN or "not_set",
+    }
+
+
+@app.get("/")
+async def root():
+    """Корневой endpoint с информацией о сервисе."""
+    return {
+        "name": "GIBDD Stat Bot + Mini App",
+        "docs": "/docs",
+        "health": "/health",
+        "miniapp": "/app/" if FRONTEND_DIST.exists() else "frontend not built",
+        "telegram_webhook": WEBHOOK_PATH,
+    }
+
+
+# ============================================================
+# Mini App frontend (статика)
+# ============================================================
+if FRONTEND_DIST.exists():
+    app.mount(
+        "/app",
+        StaticFiles(directory=str(FRONTEND_DIST), html=True),
+        name="frontend",
+    )
+    logger.info(f"Frontend раздаётся из {FRONTEND_DIST}")
+else:
+    logger.warning(
+        f"Frontend не собран ({FRONTEND_DIST} не существует). "
+        f"Запустите `cd miniapp/frontend && npm install && npm run build`"
+    )
+
+    @app.get("/app")
+    async def frontend_not_built():
+        return HTMLResponse(
+            "<h1>Frontend не собран</h1>"
+            "<p>Выполните:</p>"
+            "<pre>cd miniapp/frontend\nnpm install\nnpm run build</pre>",
+            status_code=503,
+        )
+
+
+# ============================================================
+# Точка входа для запуска напрямую (python main.py)
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+
+    logger.info(f"=== GIBDD Bot + Mini App запускается на порту {PORT} ===")
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        workers=1,  # на bothost один процесс
+        log_level=LOG_LEVEL.lower(),
+        access_log=True,
+    )
