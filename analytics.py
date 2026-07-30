@@ -141,6 +141,46 @@ DTP_TYPE_GROUPS: list[tuple[str, list[str]]] = [
 DTP_TYPE_ORDER: list[str] = [g[0] for g in DTP_TYPE_GROUPS] + ["Иные ДТП"]
 
 
+# ============================================================
+# Группировка значений дороги (поле dor_z) в канонические
+# категории: Федеральные / Региональные / Межмуниципальные /
+# Муниципальные / Иные.
+# ============================================================
+ROAD_SIGNIFICANCE_GROUPS: list[tuple[str, list[str]]] = [
+    ("Федеральные", ["федеральн"]),
+    ("Региональные", ["региональн"]),
+    ("Межмуниципальные", ["межмуниципальн"]),
+    ("Муниципальные", ["муниципальн"]),
+    # "Иные" — все остальные, включая пустое значение
+]
+
+ROAD_SIGNIFICANCE_ORDER: list[str] = (
+    [g[0] for g in ROAD_SIGNIFICANCE_GROUPS] + ["Иные"]
+)
+
+
+def group_road_significance(raw_value: str) -> str:
+    """Приводит произвольное значение dor_z к одной из канонических категорий.
+
+    ГИБДД хранит значения вроде:
+      - «Федерального значения»
+      - «Регионального или межмуниципального значения»
+      - «Муниципального значения»
+    Здесь мы проверяем подстроки по приоритету: федеральные → региональные →
+    межмуниципальные → муниципальные. Если ничего не подошло — «Иные».
+
+    Пустое значение также классифицируется как «Иные».
+    """
+    if not raw_value:
+        return "Иные"
+    t = str(raw_value).lower().strip()
+    for canonical, aliases in ROAD_SIGNIFICANCE_GROUPS:
+        for alias in aliases:
+            if alias in t:
+                return canonical
+    return "Иные"
+
+
 def group_dtp_type(raw_type: str) -> str:
     """Приводит произвольный вид ДТП к одной из 9 канонических категорий.
 
@@ -209,10 +249,32 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
     road_counter = Counter()
     month_counter: dict[str, dict[str, int]] = {}
 
+    # Severity-варианты для переключателя ДТП / Погибшие / Раненые в Mini App.
+    # Хранятся как {ключ: {"dtp": N, "deaths": N, "injured": N}} —
+    # старые простые Counter'ы сохранены для обратной совместимости
+    # (используются в build_analytics_message и тестах).
+    weekday_severity: dict[int, dict[str, int]] = {}
+    hour_severity: dict[int, dict[str, int]] = {}
+    type_grouped_severity: dict[str, dict[str, int]] = {}
+    weather_severity: dict[str, dict[str, int]] = {}
+    road_significance_severity: dict[str, dict[str, int]] = {}
+
+    def _bump_severity(
+        table: dict, key, deaths_add: int, injured_add: int
+    ) -> None:
+        bucket = table.setdefault(
+            key, {"dtp": 0, "deaths": 0, "injured": 0}
+        )
+        bucket["dtp"] += 1
+        bucket["deaths"] += deaths_add
+        bucket["injured"] += injured_add
+
     for card in cards:
         # Погибшие и раненые
-        deaths += _safe_int(card.get("pog"))
-        injured += _safe_int(card.get("ran"))
+        card_deaths = _safe_int(card.get("pog"))
+        card_injured = _safe_int(card.get("ran"))
+        deaths += card_deaths
+        injured += card_injured
 
         # Нетрезвые водители
         if _has_alcohol(card):
@@ -226,11 +288,13 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
         wd = _get_weekday(str(card.get("date_dtp", "")))
         if wd is not None:
             weekday_counter[wd] += 1
+            _bump_severity(weekday_severity, wd, card_deaths, card_injured)
 
         # Час
         hour = _get_hour(str(card.get("time", "")))
         if hour is not None:
             hour_counter[hour] += 1
+            _bump_severity(hour_severity, hour, card_deaths, card_injured)
 
         # Вид ДТП (raw — как в данных ГИБДД)
         dtp_type = str(card.get("dtpv", "")).strip()
@@ -238,7 +302,11 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
             type_counter[dtp_type] += 1
 
         # Вид ДТП (сгруппированный — 9 категорий)
-        type_grouped_counter[group_dtp_type(dtp_type)] += 1
+        grouped = group_dtp_type(dtp_type)
+        type_grouped_counter[grouped] += 1
+        _bump_severity(
+            type_grouped_severity, grouped, card_deaths, card_injured
+        )
 
         # Погодные условия
         dor_usl = card.get("dor_usl", {}) or {}
@@ -248,11 +316,22 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
                 w_str = str(w).strip()
                 if w_str:
                     weather_counter[w_str] += 1
+                    _bump_severity(
+                        weather_severity, w_str, card_deaths, card_injured
+                    )
 
         # Дорога (наименование — поле "dor")
         road = str(card.get("dor", "")).strip()
         if road:
             road_counter[road] += 1
+
+        # Значение дороги (поле "dor_z") — Федеральные / Региональные /
+        # Муниципальные / Иные. Группируем сырые значения ГИБДД в
+        # канонические категории для читаемого графика.
+        road_sig = group_road_significance(str(card.get("dor_z", "")).strip())
+        _bump_severity(
+            road_significance_severity, road_sig, card_deaths, card_injured
+        )
 
         # Месяц × тяжесть
         m_name = _month_name_from_date(str(card.get("date_dtp", "")))
@@ -261,8 +340,8 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
                 m_name, {"dtp": 0, "deaths": 0, "injured": 0}
             )
             bucket["dtp"] += 1
-            bucket["deaths"] += _safe_int(card.get("pog"))
-            bucket["injured"] += _safe_int(card.get("ran"))
+            bucket["deaths"] += card_deaths
+            bucket["injured"] += card_injured
 
     deaths_per_100 = round(deaths / total * 100, 1) if total > 0 else 0
     injured_per_100 = round(injured / total * 100, 1) if total > 0 else 0
@@ -282,6 +361,16 @@ def calculate_metrics(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "by_weather": dict(weather_counter),
         "by_road": dict(road_counter),
         "by_month": month_counter,
+        # Severity-варианты (новые поля, не ломают старый код):
+        "by_weekday_severity": {
+            str(k): v for k, v in weekday_severity.items()
+        },
+        "by_hour_severity": {
+            str(k): v for k, v in hour_severity.items()
+        },
+        "by_type_grouped_severity": type_grouped_severity,
+        "by_weather_severity": weather_severity,
+        "by_road_significance": road_significance_severity,
     }
 
 
@@ -374,6 +463,27 @@ def compare_metrics(
     result["by_month"] = {
         "current": current.get("by_month", {}),
         "previous": previous.get("by_month", {}),
+    }
+    # Severity-варианты для переключателя метрик в Mini App
+    result["by_weekday_severity"] = {
+        "current": current.get("by_weekday_severity", {}),
+        "previous": previous.get("by_weekday_severity", {}),
+    }
+    result["by_hour_severity"] = {
+        "current": current.get("by_hour_severity", {}),
+        "previous": previous.get("by_hour_severity", {}),
+    }
+    result["by_type_grouped_severity"] = {
+        "current": current.get("by_type_grouped_severity", {}),
+        "previous": previous.get("by_type_grouped_severity", {}),
+    }
+    result["by_weather_severity"] = {
+        "current": current.get("by_weather_severity", {}),
+        "previous": previous.get("by_weather_severity", {}),
+    }
+    result["by_road_significance"] = {
+        "current": current.get("by_road_significance", {}),
+        "previous": previous.get("by_road_significance", {}),
     }
 
     return result
