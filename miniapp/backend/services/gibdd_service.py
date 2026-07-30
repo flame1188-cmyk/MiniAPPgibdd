@@ -12,7 +12,7 @@
 - gibdd_parser.build_file1_data(cards) / build_file2_data(cards)
 - excel_generator.generate_both_files(file1, file2) → (bytes1, bytes2)
 - analytics.calculate_metrics(cards) → dict
-- report_generator.ReportGenerator(name, period).generate_dtp_map(cards) → HTML
+- report_generator.ReportGenerator(region_name, period_label).generate_dtp_map(cards) → HTML
 - regions_cache / regions_builtin — список регионов
 """
 from __future__ import annotations
@@ -929,8 +929,8 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
 
         # Генерируем карту через ReportGenerator
         gen = report_gen_module.ReportGenerator(
-            name=task.region_name,
-            period=task.period_label,
+            region_name=task.region_name,
+            period_label=task.period_label,
         )
         html = await asyncio.to_thread(
             gen.generate_cluster_map,
@@ -1251,8 +1251,8 @@ async def generate_point_stats_map_html(
             )
 
         gen = report_gen_module.ReportGenerator(
-            name=task.region_name,
-            period=task.period_label,
+            region_name=task.region_name,
+            period_label=task.period_label,
         )
         html = await asyncio.to_thread(
             gen.generate_point_stats_map,
