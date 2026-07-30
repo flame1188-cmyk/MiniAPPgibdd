@@ -66,7 +66,14 @@ from miniapp.backend.config import settings as miniapp_settings
 # Константы
 # ============================================================
 PORT = int(os.environ.get("PORT", "8080"))
-BOTHOST_DOMAIN = os.environ.get("BOTHOST_DOMAIN", "")
+# Нормализуем домен: убираем возможные протоколы/слэши/порт,
+# которые пользователь мог случайно добавить в BOTHOST_DOMAIN.
+# Например: "https://bot1234.bothost.tech/" → "bot1234.bothost.tech"
+_raw_domain = os.environ.get("BOTHOST_DOMAIN", "").strip()
+for _proto in ("https://", "http://", "www."):
+    if _raw_domain.startswith(_proto):
+        _raw_domain = _raw_domain[len(_proto):]
+BOTHOST_DOMAIN = _raw_domain.rstrip("/").split(":")[0]  # отбрасываем порт, если есть
 WEBHOOK_PATH = "/bot/webhook"
 WEBHOOK_URL = f"https://{BOTHOST_DOMAIN}{WEBHOOK_PATH}" if BOTHOST_DOMAIN else ""
 
@@ -376,6 +383,17 @@ if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"=== GIBDD Bot + Mini App запускается на порту {PORT} ===")
+    if BOTHOST_DOMAIN:
+        logger.info(
+            f"BOTHOST_DOMAIN: {BOTHOST_DOMAIN} | "
+            f"webhook URL: {WEBHOOK_URL} | "
+            f"Mini App: /app/"
+        )
+    else:
+        logger.warning(
+            "BOTHOST_DOMAIN не задан — Telegram webhook и Mini App работать не будут. "
+            "Укажите BOTHOST_DOMAIN (без https://) в .env"
+        )
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

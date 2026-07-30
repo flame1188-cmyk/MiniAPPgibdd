@@ -749,7 +749,13 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     import os
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    domain = os.getenv("BOTHOST_DOMAIN", "").strip()
+    # Нормализуем домен (убираем возможный протокол/слэш/порт)
+    raw_domain = os.getenv("BOTHOST_DOMAIN", "").strip()
+    for proto in ("https://", "http://", "www."):
+        if raw_domain.startswith(proto):
+            raw_domain = raw_domain[len(proto):]
+    domain = raw_domain.rstrip("/").split(":")[0]
+
     if not domain:
         await update.message.reply_text(
             "Mini App недоступен: администратор не задал BOTHOST_DOMAIN.\n"
