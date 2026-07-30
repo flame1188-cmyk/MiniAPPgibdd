@@ -43,6 +43,8 @@ const DYNAMICS_LABELS: Record<string, { label: string; color: string; icon: stri
 export function ClustersView({ task }: ClustersViewProps) {
   const [started, setStarted] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
+  const [excelLoading, setExcelLoading] = useState(false)
+  const [excelError, setExcelError] = useState<string | null>(null)
 
   // Опрашиваем только если пользователь запустил расчёт ИЛИ
   // если операция уже была запущена (например, в предыдущей сессии вкладки)
@@ -71,6 +73,21 @@ export function ClustersView({ task }: ClustersViewProps) {
     } catch (e: any) {
       setStartError(e?.message ?? 'Не удалось запустить расчёт')
       haptic('error')
+    }
+  }
+
+  const handleDownloadExcel = async () => {
+    setExcelError(null)
+    setExcelLoading(true)
+    haptic('medium')
+    try {
+      await api.downloadClustersExcel(task.task_id)
+      haptic('success')
+    } catch (e: any) {
+      setExcelError(e?.message ?? 'Не удалось скачать Excel')
+      haptic('error')
+    } finally {
+      setExcelLoading(false)
     }
   }
 
@@ -258,6 +275,11 @@ export function ClustersView({ task }: ClustersViewProps) {
         {/* Карта очагов */}
         <div className="tg-card">
           <div className="tg-section-header mb-2">Карта очагов</div>
+          <p className="text-xs opacity-70 mb-2">
+            Полноценная карта со слоями, попапами на каждом ДТП и очаге,
+            линейкой для измерения расстояний и фильтром камер.
+            Используйте кнопки в правом верхнем углу карты.
+          </p>
           <div
             style={{
               borderRadius: 12,
@@ -269,13 +291,50 @@ export function ClustersView({ task }: ClustersViewProps) {
               src={api.getClustersMapUrl(task.task_id)}
               style={{
                 width: '100%',
-                height: 400,
+                height: 450,
                 border: 'none',
                 display: 'block',
               }}
               title="Карта очагов ДТП"
             />
           </div>
+        </div>
+
+        {/* Excel-выгрузка */}
+        <div className="tg-card">
+          <div className="tg-section-header mb-2">Excel-отчёт по очагам</div>
+          <p className="text-xs opacity-70 mb-3">
+            Файл с 4 листами: очаги, динамика (с исчезнувшими), детализация
+            всех ДТП, предочаги. Цветовое кодирование по типу зоны и статусу.
+          </p>
+          <button
+            onClick={handleDownloadExcel}
+            disabled={excelLoading}
+            className="w-full py-3 rounded-xl font-medium text-sm flex items-center justify-center gap-2"
+            style={{
+              backgroundColor: excelLoading
+                ? 'var(--tg-color-secondary-bg, #f1f1f1)'
+                : 'var(--tg-color-button, #2481cc)',
+              color: excelLoading
+                ? 'var(--tg-color-text, #333)'
+                : 'var(--tg-color-button-text, #ffffff)',
+              opacity: excelLoading ? 0.6 : 1,
+            }}
+          >
+            {excelLoading ? (
+              <>
+                <span className="inline-block animate-spin">⏳</span>
+                Генерация Excel...
+              </>
+            ) : (
+              <>📥 Скачать Excel (4 листа)</>
+            )}
+          </button>
+          {excelError && (
+            <p className="text-xs mt-2" style={{ color: '#ff3b30' }}>
+              {excelError}
+            </p>
+          )}
         </div>
 
         {/* Топ-очаги */}

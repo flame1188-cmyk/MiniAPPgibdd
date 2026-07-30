@@ -63,6 +63,51 @@ async function request<T>(
   return (await response.text()) as unknown as T
 }
 
+/**
+ * Скачивает бинарный файл (Excel, PDF, ...) через fetch с X-Tg-Init-Data,
+ * преобразует в Blob и запускает браузерный download с заданным именем.
+ *
+ * Обычный <a download> не подходит, т.к. не передаёт custom headers.
+ */
+async function downloadBlobUrl(url: string, fallbackFilename: string): Promise<void> {
+  const initData = getInitData()
+  const headers = new Headers()
+  headers.set('X-Tg-Init-Data', initData)
+
+  const response = await fetch(`${API_BASE}${url}`, { headers })
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`
+    try {
+      const body = await response.json()
+      detail = (body as { detail?: string })?.detail ?? detail
+    } catch {
+      // не JSON
+    }
+    throw new ApiError(response.status, detail)
+  }
+
+  const blob = await response.blob()
+
+  // Имя файла из Content-Disposition (если сервер его прислал)
+  let filename = fallbackFilename
+  const cd = response.headers.get('content-disposition')
+  if (cd) {
+    const match = cd.match(/filename="?([^";]+)"?/)
+    if (match && match[1]) filename = match[1]
+  }
+
+  // Создаём временный <a> и кликаем по нему
+  const objectUrl = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = objectUrl
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  // Освобождаем память через небольшую задержку (для надёжности download)
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000)
+}
+
 // ============================================================
 // Types
 // ============================================================
@@ -358,6 +403,15 @@ export const api = {
   getClustersMapUrl: (taskId: string) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/clusters/map?tg_init_data=${encodeURIComponent(getInitData())}`,
 
+  /**
+   * Скачивает Excel с очагами (4 листа: очаги/динамика/детализация/предочаги).
+   * Запускает браузерный download через создание <a> и клика по нему.
+   */
+  downloadClustersExcel: async (taskId: string): Promise<void> => {
+    const url = `${API_BASE}/api/dtp/tasks/${taskId}/clusters/excel`
+    await downloadBlobUrl(url, `dtp_ochagi_${taskId}.xlsx`)
+  },
+
   // ============================================================
   // Analysis: Point statistics
   // ============================================================
@@ -366,6 +420,29 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ lat, lon, radius_m }),
     }),
+
+  /**
+   * Скачивает Excel со статистикой по точке (2 листа: текущий/прошлый период).
+   * Требует предварительно выполненный computePointStats.
+   */
+  downloadPointStatsExcel: async (taskId: string): Promise<void> => {
+    const url = `${API_BASE}/api/dtp/tasks/${taskId}/point/excel`
+    await downloadBlobUrl(url, `point_stats_${taskId}.xlsx`)
+  },
+
+  /**
+   * Возвращает URL HTML-карты точки (для <iframe>).
+   * Карта: точка + радиус + ДТП (текущий/прошлый) + камеры в радиусе.
+   */
+  getPointStatsMapUrl: (
+    taskId: string,
+    lat: number,
+    lon: number,
+    radius_m: number
+  ) =>
+    `${API_BASE}/api/dtp/tasks/${taskId}/point/map` +
+    `?lat=${lat}&lon=${lon}&radius_m=${radius_m}` +
+    `&tg_init_data=${encodeURIComponent(getInitData())}`,
 
   // ============================================================
   // Analysis: LLM

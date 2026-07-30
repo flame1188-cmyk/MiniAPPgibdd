@@ -122,6 +122,15 @@ class Task:
     # Кэш: последняя точечная статистика (для отображения без пересчёта)
     last_point_stats: Optional[Dict[str, Any]] = None
 
+    # === Raw данные для Excel-выгрузки и продвинутой карты ===
+    # Полные объекты очагов (с cards внутри) — не проходят через JSON-API,
+    # но нужны для generate_cluster_map() и generate_concentration_dynamics_file()
+    raw_clusters: List[Dict[str, Any]] = field(default_factory=list)
+    # Полные карточки последнего point stats запроса (с _dist_m) — для Excel
+    last_point_cards_current: List[Dict[str, Any]] = field(default_factory=list)
+    last_point_cards_prev: List[Dict[str, Any]] = field(default_factory=list)
+    last_point_params: Optional[Dict[str, Any]] = None  # {lat, lon, radius_m}
+
 
 # In-memory хранилище задач (для production заменить на Redis/PostgreSQL)
 _tasks: Dict[str, Task] = {}
@@ -691,6 +700,12 @@ async def compute_point_stats(
 
     # Кэшируем на задаче для повторного отображения
     task.last_point_stats = result
+    # Сохраняем карточки (с _dist_m) для Excel-выгрузки
+    cur = (stats.get("current") or {})
+    prev = (stats.get("prev") or {})
+    task.last_point_cards_current = list(cur.get("cards", []) or [])
+    task.last_point_cards_prev = list(prev.get("cards", []) or []) if prev_cards else []
+    task.last_point_params = {"lat": lat, "lon": lon, "radius_m": radius_m}
     return result
 
 
@@ -818,6 +833,8 @@ async def start_clusters_calculation(task: Task) -> None:
         }
 
         state.result = result
+        # Сохраняем raw очаги (с cards) для Excel-выгрузки и продвинутой карты
+        task.raw_clusters = clusters
         state.status = AnalysisStatus.DONE
         state.progress = 100
         state.stage = "Готово"
@@ -859,25 +876,98 @@ def _serialize_cluster(c: dict) -> dict:
 
 
 async def generate_clusters_map_html(task: Task) -> Optional[str]:
-    """Генерирует HTML-карту очагов через ReportGenerator."""
+    """
+    Генерирует HTML-карту очагов через ReportGenerator.generate_cluster_map().
+
+    Полноценная карта из Telegram-бота:
+      - Слои (Очаги / ДТП в очагах / Предочаги / Камеры)
+      - Popups на каждом ДТП и очаге
+      - Линейка для измерения расстояний
+      - Фильтр камер по моделям
+      - Convex hull (зона очага)
+      - Динамика (новые/рост/снижение/стабильный/исчезнувший)
+      - Камеры с кластеризацией
+    """
     if not task.clusters_state.result:
         return None
 
     try:
         report_gen_module = _import_module("report_generator")
-        conc_module = _import_module("concentration_points")
+        camera_cache_module = _import_module("camera_cache")
 
-        # Восстанавливаем очаги из результата (минимально — для карты нужны
-        # сами объекты с координатами участников)
-        # К сожалению, после сериализации мы потеряли список карточек
-        # каждого очага. Поэтому генерируем карту по-другому:
-        # берём все карточки и фильтруем по принадлежности к очагам.
-        #
-        # Альтернатива: использовать готовую функцию generate_clusters_map
-        # из report_generator, если она принимает clusters + cards.
-        #
-        # Для MVP: используем простой Leaflet с маркерами очагов.
-        return _build_clusters_map_html(task)
+        # Raw очаги с cards внутри (сохранены в start_clusters_calculation)
+        raw_clusters = task.raw_clusters or []
+        if not raw_clusters:
+            # Fallback на старую реализацию, если raw по какой-то причине нет
+            logger.warning(
+                f"Task {task.id}: raw_clusters empty, fallback to simple map"
+            )
+            return _build_clusters_map_html(task)
+
+        # Разделяем: текущие очаги + исчезнувшие (отдельно)
+        current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
+        lost_clusters = [c for c in raw_clusters if c.get("_is_lost", False)]
+
+        # Предочаги — сохранены в clusters[0]["_preclusters"]
+        preclusters = []
+        if raw_clusters and raw_clusters[0].get("_preclusters"):
+            preclusters = raw_clusters[0]["_preclusters"]
+
+        # Камеры (если есть в кэше)
+        cameras = []
+        try:
+            if camera_cache_module.has_cached_cameras(task.region_code):
+                cameras = camera_cache_module.load_cameras_from_cache(
+                    task.region_code
+                ) or []
+        except Exception as exc:
+            logger.warning(f"Task {task.id}: camera load for map failed: {exc}")
+
+        # Добавляем исчезнувшие очаги в основной список с пометкой dynamics.status='lost'
+        # чтобы bot ReportGenerator отрисовал их как отдельный слой через dynamics
+        all_clusters_for_map = list(current_only) + list(lost_clusters)
+
+        # Генерируем карту через ReportGenerator
+        gen = report_gen_module.ReportGenerator(
+            name=task.region_name,
+            period=task.period_label,
+        )
+        html = await asyncio.to_thread(
+            gen.generate_cluster_map,
+            all_clusters_for_map,
+            preclusters if preclusters else None,
+            cameras if cameras else None,
+        )
+
+        # Добавляем плашку про исчезнувшие очаги (если есть)
+        if lost_clusters:
+            lost_count = len(lost_clusters)
+            lost_dtp = sum(c.get("total_accidents", 0) for c in lost_clusters)
+            lost_deaths = sum(c.get("deaths", 0) for c in lost_clusters)
+            banner = f"""
+<div class="lost-banner" style="
+  position:absolute;top:10px;right:10px;z-index:1000;
+  background:#fff3e0;border:1px solid #ff9800;border-radius:6px;
+  padding:8px 12px;font:12px/1.4 -apple-system,system-ui,sans-serif;
+  box-shadow:0 2px 8px rgba(0,0,0,0.2);max-width:240px;">
+  <b style="color:#d32f2f;">❌ Исчезнувшие очаги: {lost_count}</b><br>
+  <span style="color:#555;">Это очаги, которые были в прошлом периоде,
+  но не подтвердились в текущем.</span><br>
+  <span style="color:#888;font-size:11px;">
+  ДТП прошлого периода: {lost_dtp} | Погибло: {lost_deaths}</span>
+</div>"""
+            # Вставляем плашку после <body>
+            html = html.replace(
+                "<body>", f"<body>{banner}", 1
+            ) if "<body>" in html else html + banner
+
+        logger.info(
+            f"Task {task.id}: clusters map generated — "
+            f"{len(current_only)} текущих, {len(lost_clusters)} исчезнувших, "
+            f"{len(preclusters)} предочагов, {len(cameras)} камер"
+        )
+        return html
+
     except Exception as exc:
         logger.exception(f"Task {task.id}: clusters map generation failed")
         return None
@@ -993,6 +1083,197 @@ def _color_for_severity(cluster: dict) -> str:
     if deaths >= 1:
         return "#ff9500"
     return "#2481cc"
+
+
+# ============================================================
+# Excel-выгрузка: очаги (4 листа)
+# ============================================================
+async def generate_clusters_excel(task: Task) -> Optional[bytes]:
+    """
+    Генерирует Excel-файл с очагами ДТП (4 листа):
+      Лист 1 «Очаги ДТП» — текущие очаги
+      Лист 2 «Динамика очагов» — текущие + исчезнувшие со статусом
+      Лист 3 «Детализация ДТП» — все ДТП по периодам
+      Лист 4 «Предочаги» — места, не дотянувшие до очага
+
+    Использует excel_generator.generate_concentration_dynamics_file() из бота.
+    """
+    if not task.raw_clusters:
+        return None
+
+    try:
+        conc_module = _import_module("concentration_points")
+        excel_module = _import_module("excel_generator")
+
+        raw_clusters = task.raw_clusters
+        current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
+        preclusters = (
+            raw_clusters[0].get("_preclusters", [])
+            if raw_clusters else []
+        )
+
+        # Лист 1: очаги текущего года
+        current_data = conc_module.build_concentration_excel_data(current_only)
+        current_columns = conc_module.get_concentration_column_names()
+
+        # Лист 2: динамика (текущие + исчезнувшие)
+        dynamics_data = conc_module.build_dynamics_excel_data(raw_clusters)
+        dynamics_columns = conc_module.get_dynamics_column_names()
+
+        # Лист 3: детализация ДТП
+        detail_data = conc_module.build_dynamics_detail_data(
+            raw_clusters,
+            task.period_label,
+            task.prev_label or "",
+        )
+        detail_columns = conc_module.get_dynamics_detail_column_names()
+
+        # Лист 4: предочаги
+        precluster_data = None
+        precluster_columns = None
+        if preclusters:
+            precluster_data = conc_module.build_precluster_excel_data(preclusters)
+            precluster_columns = conc_module.get_precluster_column_names()
+
+        # Генерация Excel (тяжёлая операция — в потоке)
+        xlsx_bytes = await asyncio.to_thread(
+            excel_module.generate_concentration_dynamics_file,
+            current_data, current_columns,
+            dynamics_data, dynamics_columns,
+            detail_data, detail_columns,
+            precluster_data, precluster_columns,
+        )
+
+        logger.info(
+            f"Task {task.id}: clusters Excel generated — "
+            f"{len(current_data)} очагов, {len(dynamics_data)} в динамике, "
+            f"{len(detail_data)} ДТП, {len(preclusters)} предочагов"
+        )
+        return xlsx_bytes
+
+    except Exception as exc:
+        logger.exception(f"Task {task.id}: clusters Excel generation failed")
+        return None
+
+
+# ============================================================
+# Excel-выгрузка: статистика по точке (2 листа)
+# ============================================================
+async def generate_point_stats_excel(task: Task) -> Optional[bytes]:
+    """
+    Генерирует Excel-файл со статистикой по точке (2 листа):
+      Лист 1 — текущий период (все ДТП в радиусе с детализацией)
+      Лист 2 — прошлый период (если есть данные)
+
+    Требует предварительно выполненный compute_point_stats —
+    берёт сохранённые в task карточки (с дистанцией _dist_m).
+    """
+    if not task.last_point_cards_current and not task.last_point_cards_prev:
+        return None
+
+    try:
+        point_stats_module = _import_module("point_statistics")
+        excel_module = _import_module("excel_generator")
+
+        current_rows, prev_rows = point_stats_module.build_point_stats_excel_data(
+            task.last_point_cards_current,
+            task.last_point_cards_prev if task.last_point_cards_prev else None,
+            task.period_label,
+            task.prev_label or "",
+        )
+        columns = point_stats_module.get_point_stats_column_names()
+
+        xlsx_bytes = await asyncio.to_thread(
+            excel_module.generate_point_stats_file,
+            current_rows,
+            prev_rows if prev_rows else None,
+            columns,
+            task.period_label,
+            task.prev_label if prev_rows else None,
+        )
+
+        logger.info(
+            f"Task {task.id}: point stats Excel generated — "
+            f"{len(current_rows)} текущих, {len(prev_rows)} прошлых"
+        )
+        return xlsx_bytes
+
+    except Exception as exc:
+        logger.exception(f"Task {task.id}: point stats Excel generation failed")
+        return None
+
+
+# ============================================================
+# Карта статистики по точке
+# ============================================================
+async def generate_point_stats_map_html(
+    task: Task,
+    lat: float,
+    lon: float,
+    radius_m: int,
+) -> Optional[str]:
+    """
+    Генерирует HTML-карту статистики по точке через
+    ReportGenerator.generate_point_stats_map() из бота.
+
+    Карта: точка + радиус + ДТП (текущий/прошлый) + камеры в радиусе.
+    """
+    if not task.cards:
+        return None
+
+    try:
+        report_gen_module = _import_module("report_generator")
+        point_stats_module = _import_module("point_statistics")
+        camera_cache_module = _import_module("camera_cache")
+        camera_matcher_module = _import_module("camera_matcher")
+
+        # Загружаем прошлый год (если ещё нет)
+        if not task.prev_cards_loaded:
+            await ensure_prev_cards(task)
+        prev_cards = task.prev_cards or []
+
+        # Камеры в радиусе
+        cameras_in_radius = []
+        try:
+            if camera_cache_module.has_cached_cameras(task.region_code):
+                all_cameras = camera_cache_module.load_cameras_from_cache(
+                    task.region_code
+                ) or []
+                for cam in all_cameras:
+                    d = camera_matcher_module.haversine(
+                        lat, lon, cam["lat"], cam["lon"]
+                    )
+                    if d <= radius_m:
+                        cameras_in_radius.append({**cam, "distance_m": round(d, 0)})
+        except Exception as exc:
+            logger.warning(
+                f"Task {task.id}: cameras for point map failed: {exc}"
+            )
+
+        gen = report_gen_module.ReportGenerator(
+            name=task.region_name,
+            period=task.period_label,
+        )
+        html = await asyncio.to_thread(
+            gen.generate_point_stats_map,
+            lat, lon, radius_m,
+            task.cards,
+            prev_cards if prev_cards else None,
+            cameras_in_radius if cameras_in_radius else None,
+            task.period_label,
+            task.prev_label or "",
+        )
+
+        logger.info(
+            f"Task {task.id}: point stats map generated — "
+            f"lat={lat}, lon={lon}, radius={radius_m}м, "
+            f"{len(cameras_in_radius)} камер в радиусе"
+        )
+        return html
+
+    except Exception as exc:
+        logger.exception(f"Task {task.id}: point stats map generation failed")
+        return None
 
 
 # ============================================================

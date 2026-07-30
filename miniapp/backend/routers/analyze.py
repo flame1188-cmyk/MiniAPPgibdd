@@ -9,7 +9,10 @@ Endpoints:
 - POST /api/dtp/tasks/{task_id}/clusters        — запуск расчёта очагов (async)
 - GET  /api/dtp/tasks/{task_id}/clusters        — статус/результат очагов
 - GET  /api/dtp/tasks/{task_id}/clusters/map    — HTML-карта очагов (iframe)
+- GET  /api/dtp/tasks/{task_id}/clusters/excel  — Excel-файл очагов (4 листа)
 - POST /api/dtp/tasks/{task_id}/point           — статистика по точке (sync)
+- GET  /api/dtp/tasks/{task_id}/point/excel     — Excel статистики по точке
+- GET  /api/dtp/tasks/{task_id}/point/map       — HTML-карта точки (iframe)
 - POST /api/dtp/tasks/{task_id}/llm/summary     — запуск генерации резюме (async)
 - GET  /api/dtp/tasks/{task_id}/llm/summary     — статус/результат резюме
 - POST /api/dtp/tasks/{task_id}/llm/ask         — вопрос нейросети (sync)
@@ -21,8 +24,8 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from ..services.gibdd_service import (
@@ -31,7 +34,10 @@ from ..services.gibdd_service import (
     TaskStatus,
     ask_llm_question,
     compute_point_stats,
+    generate_clusters_excel,
     generate_clusters_map_html,
+    generate_point_stats_excel,
+    generate_point_stats_map_html,
     get_llm_providers_status,
     get_task,
     start_clusters_calculation,
@@ -293,6 +299,14 @@ async def get_clusters_map(
     """
     Отдаёт HTML-карту очагов (Leaflet с маркерами).
     Используется в <iframe> на frontend.
+
+    Полноценная карта из Telegram-бота:
+    - Слои (Очаги / ДТП в очагах / Предочаги / Камеры)
+    - Popups на ДТП и очагах с детальной информацией
+    - Линейка для измерения расстояний
+    - Convex hull (зона очага)
+    - Динамика (новые/рост/снижение/стабильный/исчезнувший)
+    - Фильтр камер по моделям
     """
     task = _require_done_task(task_id, user)
     if task.clusters_state.status != AnalysisStatus.DONE:
@@ -304,6 +318,59 @@ async def get_clusters_map(
     if not html:
         raise HTTPException(status_code=500, detail="Map generation failed")
     return HTMLResponse(content=html)
+
+
+@router.get(
+    "/tasks/{task_id}/clusters/excel",
+)
+async def get_clusters_excel(
+    task_id: str,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Скачивает Excel-файл с очагами ДТП (4 листа):
+      Лист 1 «Очаги ДТП» — текущие очаги (с цветовым кодированием зоны)
+      Лист 2 «Динамика очагов» — текущие + исчезнувшие со статусом
+      Лист 3 «Детализация ДТП» — все ДТП по периодам
+      Лист 4 «Предочаги» — места, не дотянувшие до очага
+
+    Content-Disposition: attachment; filename="dtp_ochagi_<регион>_<период>.xlsx"
+    """
+    task = _require_done_task(task_id, user)
+    if task.clusters_state.status != AnalysisStatus.DONE:
+        raise HTTPException(
+            status_code=404,
+            detail="Clusters not calculated yet. Call POST /clusters first.",
+        )
+
+    xlsx_bytes = await generate_clusters_excel(task)
+    if not xlsx_bytes:
+        raise HTTPException(
+            status_code=500,
+            detail="Excel generation failed",
+        )
+
+    # Безопасное имя файла
+    safe_reg = "".join(
+        c if c.isalnum() or c in "-_" else "_"
+        for c in task.region_name[:30]
+    ) or "region"
+    safe_period = "".join(
+        c if c.isalnum() or c in "-_" else "_"
+        for c in task.period_label[:30]
+    ) or "period"
+    filename = f"dtp_ochagi_{safe_reg}_{safe_period}.xlsx"
+
+    return Response(
+        content=xlsx_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
 
 
 # ============================================================
@@ -352,6 +419,94 @@ async def compute_point_statistics(
         current=result.get("current"),
         prev=result.get("prev"),
     )
+
+
+@router.get(
+    "/tasks/{task_id}/point/excel",
+)
+async def get_point_stats_excel(
+    task_id: str,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Скачивает Excel-файл со статистикой по точке (2 листа):
+      Лист 1 — текущий период (все ДТП в радиусе с детальной информацией)
+      Лист 2 — прошлый период (если есть)
+
+    Требует предварительно выполненный POST /point — берёт карточки из кэша задачи.
+
+    Content-Disposition: attachment; filename="point_stats_<регион>_<период>.xlsx"
+    """
+    task = _require_done_task(task_id, user)
+
+    if not task.last_point_cards_current and not task.last_point_cards_prev:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Point statistics not calculated yet. "
+                "Call POST /point first with lat/lon/radius_m."
+            ),
+        )
+
+    xlsx_bytes = await generate_point_stats_excel(task)
+    if not xlsx_bytes:
+        raise HTTPException(
+            status_code=500,
+            detail="Excel generation failed",
+        )
+
+    # Безопасное имя файла
+    safe_reg = "".join(
+        c if c.isalnum() or c in "-_" else "_"
+        for c in task.region_name[:30]
+    ) or "region"
+    params = task.last_point_params or {}
+    lat_str = f"{params.get('lat', 0):.4f}".replace(".", "-")
+    lon_str = f"{params.get('lon', 0):.4f}".replace(".", "-")
+    radius = int(params.get("radius_m", 0))
+    filename = f"point_stats_{safe_reg}_{lat_str}_{lon_str}_{radius}m.xlsx"
+
+    return Response(
+        content=xlsx_bytes,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+@router.get(
+    "/tasks/{task_id}/point/map",
+    response_class=HTMLResponse,
+)
+async def get_point_stats_map(
+    task_id: str,
+    lat: float = Query(..., ge=-90, le=90, description="Широта"),
+    lon: float = Query(..., ge=-180, le=180, description="Долгота"),
+    radius_m: int = Query(
+        default=500, gt=0, le=10000,
+        description="Радиус в метрах",
+    ),
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Отдаёт HTML-карту статистики по точке (Leaflet в iframe).
+
+    Карта: точка запроса + круг радиуса + ДТП (текущий/прошлый) +
+    камеры в радиусе. С попапами на каждой точке.
+    """
+    task = _require_done_task(task_id, user)
+
+    html = await generate_point_stats_map_html(task, lat, lon, radius_m)
+    if not html:
+        raise HTTPException(
+            status_code=500,
+            detail="Map generation failed",
+        )
+    return HTMLResponse(content=html)
 
 
 # ============================================================

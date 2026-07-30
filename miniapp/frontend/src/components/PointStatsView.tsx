@@ -40,6 +40,9 @@ export function PointStatsView({ task }: PointStatsViewProps) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<PointStatsResponse | null>(null)
+  const [excelLoading, setExcelLoading] = useState(false)
+  const [excelError, setExcelError] = useState<string | null>(null)
+  const [showMap, setShowMap] = useState(false)
 
   const handleCalculate = async () => {
     setError(null)
@@ -93,6 +96,28 @@ export function PointStatsView({ task }: PointStatsViewProps) {
       // Автопересчёт при изменении радиуса
       setTimeout(() => handleCalculate(), 0)
     }
+  }
+
+  // Скачивание Excel со статистикой по точке
+  const handleDownloadExcel = async () => {
+    setExcelError(null)
+    setExcelLoading(true)
+    haptic('medium')
+    try {
+      await api.downloadPointStatsExcel(task.task_id)
+      haptic('success')
+    } catch (e: any) {
+      setExcelError(e?.message ?? 'Не удалось скачать Excel')
+      haptic('error')
+    } finally {
+      setExcelLoading(false)
+    }
+  }
+
+  // Переключение видимости карты
+  const toggleMap = () => {
+    setShowMap(!showMap)
+    haptic('light')
   }
 
   return (
@@ -206,7 +231,88 @@ export function PointStatsView({ task }: PointStatsViewProps) {
 
       {/* Результат */}
       {result?.ok && result.current && (
-        <PointStatsResult result={result} />
+        <>
+          {/* Кнопки действий: Карта + Excel */}
+          <div className="tg-card">
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={toggleMap}
+                className="py-2.5 rounded-xl font-medium text-xs flex items-center justify-center gap-1.5"
+                style={{
+                  backgroundColor: showMap
+                    ? 'var(--tg-color-button, #2481cc)'
+                    : 'var(--tg-color-secondary-bg, #f1f1f1)',
+                  color: showMap
+                    ? 'var(--tg-color-button-text, #ffffff)'
+                    : 'var(--tg-color-text, #000)',
+                }}
+              >
+                {showMap ? '🗺 Скрыть карту' : '🗺 Открыть карту'}
+              </button>
+              <button
+                onClick={handleDownloadExcel}
+                disabled={excelLoading}
+                className="py-2.5 rounded-xl font-medium text-xs flex items-center justify-center gap-1.5"
+                style={{
+                  backgroundColor: excelLoading
+                    ? 'var(--tg-color-secondary-bg, #f1f1f1)'
+                    : 'var(--tg-color-button, #2481cc)',
+                  color: excelLoading
+                    ? 'var(--tg-color-text, #333)'
+                    : 'var(--tg-color-button-text, #ffffff)',
+                  opacity: excelLoading ? 0.6 : 1,
+                }}
+              >
+                {excelLoading ? '⏳ Генерация...' : '📥 Excel по точке'}
+              </button>
+            </div>
+            {excelError && (
+              <p className="text-xs mt-2" style={{ color: '#ff3b30' }}>
+                {excelError}
+              </p>
+            )}
+          </div>
+
+          {/* Карта точки (iframe) */}
+          {showMap && result.ok && (
+            <div className="tg-card">
+              <div className="tg-section-header mb-2">
+                Карта точки — радиус {result.radius_m >= 1000
+                  ? `${result.radius_m / 1000} км`
+                  : `${result.radius_m} м`}
+              </div>
+              <p className="text-xs opacity-70 mb-2">
+                Точка запроса + круг радиуса + ДТП текущего/прошлого периода +
+                камеры в радиусе. Кликайте на маркеры для деталей.
+              </p>
+              <div
+                style={{
+                  borderRadius: 12,
+                  overflow: 'hidden',
+                  border: '1px solid var(--tg-color-secondary-bg, #f1f1f1)',
+                }}
+              >
+                <iframe
+                  src={api.getPointStatsMapUrl(
+                    task.task_id,
+                    result.center.lat,
+                    result.center.lon,
+                    result.radius_m
+                  )}
+                  style={{
+                    width: '100%',
+                    height: 450,
+                    border: 'none',
+                    display: 'block',
+                  }}
+                  title="Карта статистики по точке"
+                />
+              </div>
+            </div>
+          )}
+
+          <PointStatsResult result={result} />
+        </>
       )}
     </div>
   )
