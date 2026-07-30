@@ -49,7 +49,9 @@ COPY . .
 COPY --from=build-frontend /build/dist ./miniapp/frontend/dist
 
 # Создаём директорию для данных
-RUN mkdir -p /app/data
+# /app/data — persistent volume на Bothost (переживает redeploy).
+# Внутри: osm_cache/ (предкэш границ НП), cameras/ (кэш камер).
+RUN mkdir -p /app/data /app/data/osm_cache /app/data/cameras
 
 # Переменные окружения по умолчанию.
 # PORT не задаём здесь жёстко — bothost передаёт свой PORT через env (обычно 3000).
