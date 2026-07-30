@@ -15,7 +15,12 @@ import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
 import { useTaskPolling } from '@/hooks/useTaskPolling'
-import { getCurrentUser, isInsideTelegram } from '@/lib/telegram'
+import {
+  getCurrentUser,
+  getContainerMaxWidth,
+  isInsideTelegram,
+  isTelegramDesktop,
+} from '@/lib/telegram'
 
 export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
@@ -24,6 +29,8 @@ export default function App() {
 
   const user = getCurrentUser()
   const showDevWarning = !isInsideTelegram()
+  const isDesktop = isTelegramDesktop()
+  const containerMaxWidth = getContainerMaxWidth()
 
   const handleSelectTask = (taskId: string) => {
     setActiveTaskId(taskId)
@@ -33,7 +40,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen pb-8">
-      <div className="max-w-xl mx-auto px-4 py-4 space-y-4">
+      <div className={`${containerMaxWidth} mx-auto px-4 py-4 space-y-4`}>
         {/* Шапка */}
         <header className="text-center pb-2">
           <h1 className="text-xl font-bold mb-0.5">ДТП Статистика</h1>
@@ -47,6 +54,20 @@ export default function App() {
             </p>
           )}
         </header>
+
+        {/* Подсказка для desktop-пользователей */}
+        {isDesktop && (
+          <div
+            className="rounded-xl p-2.5 text-xs"
+            style={{
+              backgroundColor: 'rgba(36, 129, 204, 0.08)',
+              color: 'var(--tg-color-link, #2481cc)',
+            }}
+          >
+            💻 Desktop-режим: потяните за левый край окна, чтобы
+            растянуть приложение на весь экран.
+          </div>
+        )}
 
         {/* Предупреждение о dev-режиме */}
         {showDevWarning && (
