@@ -1912,9 +1912,16 @@ async def _run_analysis(
                     )
                     # Используем полигоны из кэша (если есть от «Очаги ДТП»)
                     existing_polygons = context.user_data.get("_settlement_polygons")
+                    # Код региона — для проверки регион-уровневого OSM-кэша
+                    _llm_reg_code = (
+                        context.user_data.get("reg_code", "")
+                        or context.user_data.get("analytics_reg_code", "")
+                        or context.user_data.get("concentration_reg_code", "")
+                    )
                     clusters, _preclusters, calc_polygons = await calculate_concentration_points(
                         current_cards,
                         settlement_polygons=existing_polygons,
+                        reg_code=_llm_reg_code or None,
                     )
                     if clusters:
                         clusters_ctx = format_clusters_for_prompt(clusters, max_clusters=10)
@@ -2298,10 +2305,17 @@ async def _run_concentration_points(
             # Fallback — передаём как есть
             await progress_callback(f"\u23F3 {text}")
 
+        # Код региона — для проверки регион-уровневого OSM-кэша
+        _dyn_reg_code = (
+            context.user_data.get("reg_code", "")
+            or context.user_data.get("analytics_reg_code", "")
+            or context.user_data.get("concentration_reg_code", "")
+        )
         clusters, saved_polygons = await calculate_concentration_dynamics(
             current_cards,
             prev_cards,
             progress_callback=staged_progress,
+            reg_code=_dyn_reg_code or None,
         )
 
         # Сохраняем полигоны для переиспользования в аналитике с ИИ

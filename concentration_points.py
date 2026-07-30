@@ -112,12 +112,21 @@ EXCLUDED_SDOR_FOR_KUL = [
 ]
 
 # Кэширование границ НП
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
-CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа
+# ВАЖНО: кэш хранится в persistent volume (CAMERA_DATA_DIR/data), чтобы переживать
+# redeploy контейнера на Bothost. Фолбэк на .cache/ рядом с кодом — для локального запуска.
+_DATA_DIR = os.environ.get(
+    "CAMERA_DATA_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"),
+)
+CACHE_DIR = os.path.join(_DATA_DIR, "osm_cache")  # тайл-уровень (существующий формат)
+REGION_CACHE_DIR = os.path.join(_DATA_DIR, "osm_cache")  # регион-уровень (новый формат)
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 часа (тайл-уровень)
+REGION_CACHE_TTL_SECONDS = 90 * 24 * 60 * 60  # 90 дней (регион-уровень — реже устаревает)
 
 # In-memory LRU-кэш распарсенных полигонов (избегает повторного парсинга JSON)
-MEMORY_CACHE_MAX = 4  # максимум записей (2 bbox × текущий+прошлый год)
-_memory_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()  # bbox → (timestamp, polygons)
+# Ключи — bbox-строка (как раньше) или "region:{code}" для регион-уровня.
+MEMORY_CACHE_MAX = 8  # максимум записей (4 bbox + 4 региона)
+_memory_cache: OrderedDict[str, tuple[float, list]] = OrderedDict()  # key → (timestamp, polygons)
 
 # Параметры bbox
 BBOX_MARGIN = 0.02  # ~2.2 км — минимальный запас вокруг ДТП
@@ -411,6 +420,81 @@ def _save_cache(bbox_str: str, elements: list[dict]) -> None:
         )
     except Exception as e:
         logger.warning(f"Ошибка записи кэша: {e}")
+
+
+# ========================
+# Регион-уровень кэша (для precache_osm.py)
+# ========================
+
+def _region_cache_path(reg_code: str) -> str:
+    """Путь к файлу кэша для региона по его коду."""
+    # Безопасное имя файла: только цифры (код региона ГИБДД — 4 цифры).
+    safe = "".join(c for c in str(reg_code) if c.isdigit()) or "unknown"
+    return os.path.join(REGION_CACHE_DIR, f"region_{safe}.json")
+
+
+def _load_region_cache(reg_code: str) -> list[dict] | None:
+    """
+    Загружает предкэшированные элементы Overpass для целого региона.
+
+    Returns:
+        Список elements из Overpass или None, если кэш отсутствует/просрочен.
+    """
+    path = _region_cache_path(reg_code)
+    if not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        age = time.time() - data.get("timestamp", 0)
+        ttl = data.get("ttl_seconds", REGION_CACHE_TTL_SECONDS)
+        if age > ttl:
+            logger.info(
+                f"Региональный кэш границ НП просрочен: {path} "
+                f"(возраст: {age / 86400:.1f} дней)"
+            )
+            return None
+
+        elements = data.get("elements", [])
+        logger.info(
+            f"Региональный кэш границ НП загружен: {path} "
+            f"(возраст: {age / 86400:.1f} дней, "
+            f"{len(elements)} элементов)"
+        )
+        return elements
+    except Exception as e:
+        logger.warning(f"Ошибка чтения регионального кэша ({reg_code}): {e}")
+        return None
+
+
+def _save_region_cache(reg_code: str, elements: list[dict], region_name: str = "") -> None:
+    """
+    Сохраняет элементы Overpass для региона в кэш.
+
+    Используется скриптом precache_osm.py для прогрева кэша топ-N регионов.
+    Формат файла идентичен _save_cache() плюс поля region_code/region_name.
+    """
+    try:
+        os.makedirs(REGION_CACHE_DIR, exist_ok=True)
+        path = _region_cache_path(reg_code)
+        data = {
+            "timestamp": time.time(),
+            "ttl_seconds": REGION_CACHE_TTL_SECONDS,
+            "region_code": str(reg_code),
+            "region_name": region_name,
+            "count": len(elements),
+            "elements": elements,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        logger.info(
+            f"Региональный кэш границ НП сохранён: {path} "
+            f"({len(elements)} элементов, регион: {region_name or reg_code})"
+        )
+    except Exception as e:
+        logger.warning(f"Ошибка записи регионального кэша ({reg_code}): {e}")
 
 
 # ========================
@@ -738,6 +822,7 @@ PLACE_FILTER = "city|town|village|hamlet"
 async def fetch_settlement_boundaries(
     cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
+    reg_code: str | None = None,
 ) -> list[Polygon | MultiPolygon]:
     """
     Получает полигоны границ населённых пунктов через Overpass API.
@@ -748,6 +833,18 @@ async def fetch_settlement_boundaries(
     2. In-memory LRU-кэш — избегает повторного парсинга JSON.
     3. STRtree вместо unary_union при >2000 полигонов.
     4. Упрощение полигонов (preserve_topology).
+
+    Приоритеты кэша:
+    1. In-memory LRU (по bbox ИЛИ по "region:{code}")
+    2. Регион-уровневый кэш (если передан reg_code) — для предкэшированных
+       топ-N регионов. Содержит ВСЕ НП региона за один раз.
+    3. Тайл-уровневый кэш + live-запрос к Overpass (как раньше)
+
+    Args:
+        cards: Список карточек ДТП (используется для вычисления bbox)
+        progress_callback: async-функция для обновления статуса
+        reg_code: Код региона ГИБДД (например, "1145" для Москвы).
+            Если передан — сначала проверяется регион-уровневый кэш.
 
     Returns:
         Список Shapely-полигонов (Polygon или MultiPolygon).
@@ -785,7 +882,51 @@ async def fetch_settlement_boundaries(
 
     bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
 
-    # --- Шаг 1: In-memory кэш ---
+    # --- Шаг 0: Регион-уровневый кэш (предкэш от precache_osm.py) ---
+    # Проверяем ПЕРВЫМ, чтобы избежать тайл-запросов для предкэшированных
+    # регионов. Если регион закэширован целиком — фильтруем полигоны по bbox
+    # текущих ДТП и возвращаем. Тайл-уровень не затрагивается.
+    if reg_code:
+        region_key = f"region:{reg_code}"
+        mem_polygons = _memory_cache_get(region_key)
+        if mem_polygons is not None:
+            logger.info(
+                f"Используем регион-кэш (in-memory) для {reg_code}: "
+                f"{len(mem_polygons)} полигонов"
+            )
+            return mem_polygons
+
+        # Дисковый регион-кэш
+        region_elements = _load_region_cache(reg_code)
+        if region_elements is not None:
+            if progress_callback:
+                await progress_callback(
+                    f"Загрузка границ НП из кэша региона {reg_code}..."
+                )
+            region_polys, region_is_bbox, _ = _parse_overpass_elements_with_ids(
+                region_elements
+            )
+            if region_polys and not region_is_bbox:
+                # Сохраняем в in-memory LRU (полный набор региона).
+                # Фильтрация по bbox текущих ДТП произойдёт позже
+                # в classify_dtp_by_settlements (STRtree выполнит
+                # эффективный пространственный запрос).
+                _memory_cache_put(region_key, region_polys)
+                logger.info(
+                    f"Региональный кэш {reg_code}: "
+                    f"загружено {len(region_polys)} полигонов, "
+                    f"OSM-запрос не требуется"
+                )
+                del region_elements
+                return region_polys
+            else:
+                logger.warning(
+                    f"Региональный кэш {reg_code}: содержит bbox-фолбэк, "
+                    f"игнорируем и делаем тайл-запрос"
+                )
+            del region_elements
+
+    # --- Шаг 1: In-memory кэш по bbox (как раньше) ---
     mem_polygons = _memory_cache_get(bbox)
     if mem_polygons is not None:
         return mem_polygons
@@ -2693,6 +2834,7 @@ async def calculate_concentration_points(
     cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
     settlement_polygons: list[Polygon | MultiPolygon] | None = None,
+    reg_code: str | None = None,
 ) -> tuple[list[dict], list[dict], list[Polygon | MultiPolygon] | None]:
     """
     Главная функция: расчёт всех очагов концентрации ДТП.
@@ -2703,6 +2845,10 @@ async def calculate_concentration_points(
         settlement_polygons: Если переданы — используются вместо запроса к OSM.
             Это позволяет переиспользовать полигоны между вызовами
             (например, при сравнении с прошлым годом).
+        reg_code: Код региона ГИБДД (например, "1145" для Москвы).
+            Используется для проверки регион-уровневого кэша
+            (предкэшированные top-N регионы от precache_osm.py).
+            Игнорируется, если settlement_polygons уже передан.
 
     Returns:
         (очаги, предочаги, settlement_polygons) — полигоны для переиспользования.
@@ -2729,7 +2875,7 @@ async def calculate_concentration_points(
     # Если полигоны переданы снаружи — используем их (OSM не запрашиваем)
     if settlement_polygons is None:
         settlement_polygons = await fetch_settlement_boundaries(
-            cards_with_coords, progress_callback,
+            cards_with_coords, progress_callback, reg_code=reg_code,
         )
     else:
         logger.info(
@@ -2893,6 +3039,7 @@ async def calculate_concentration_dynamics(
     prev_cards: list[dict],
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
     settlement_polygons: list[Polygon | MultiPolygon] | None = None,
+    reg_code: str | None = None,
 ) -> tuple[list[dict], list[Polygon | MultiPolygon] | None]:
     """
     Рассчитывает очаги для двух периодов и определяет динамику каждого.
@@ -2918,6 +3065,7 @@ async def calculate_concentration_dynamics(
         prev_cards: Карточки ДТП прошлого периода (те же месяцы)
         progress_callback: async-функция для обновления статуса
         settlement_polygons: Если переданы — используются вместо запроса к OSM.
+        reg_code: Код региона ГИБДД для проверки регион-уровневого кэша.
 
     Returns:
         (очаги_с_dynamics, settlement_polygons) — полигоны для переиспользования.
@@ -2948,11 +3096,11 @@ async def calculate_concentration_dynamics(
                     f"прошлого: {len(prev_filtered)}"
                 )
             settlement_polygons = await fetch_settlement_boundaries(
-                combined_cards, progress_callback,
+                combined_cards, progress_callback, reg_code=reg_code,
             )
         else:
             settlement_polygons = await fetch_settlement_boundaries(
-                current_filtered, progress_callback,
+                current_filtered, progress_callback, reg_code=reg_code,
             )
 
         if settlement_polygons:
@@ -2974,6 +3122,7 @@ async def calculate_concentration_dynamics(
         current_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,
+        reg_code=reg_code,
     )
 
     if not prev_cards:
