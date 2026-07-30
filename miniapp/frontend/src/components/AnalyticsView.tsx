@@ -6,13 +6,22 @@
  *    current: { total, deaths, injured, alcohol, pedestrians,
  *               deaths_per_100, injured_per_100,
  *               by_weekday, by_hour, by_type, by_type_grouped,
- *               by_weather, by_road, by_month },
+ *               by_weather, by_road, by_month,
+ *               // severity-варианты для переключателя метрик:
+ *               by_weekday_severity, by_hour_severity,
+ *               by_type_grouped_severity, by_weather_severity,
+ *               by_road_significance },
  *    previous: {...} | null,
  *    comparison: { total: {current, previous, change, abs_change},
  *                  deaths: {...}, injured: {...}, ...,
  *                  by_type_grouped: {current, previous},
  *                  by_road: {current, previous},
- *                  by_month: {current, previous} } | null,
+ *                  by_month: {current, previous},
+ *                  by_road_significance: {current, previous},
+ *                  by_weekday_severity: {current, previous},
+ *                  by_hour_severity: {current, previous},
+ *                  by_type_grouped_severity: {current, previous},
+ *                  by_weather_severity: {current, previous} } | null,
  *    has_prev_data: boolean,
  *    prev_label: "Январь-Июнь 2025" | null,
  *    current_label: "Январь-Июнь 2026"
@@ -20,24 +29,22 @@
  *
  * Возможности:
  *  - KPI с динамикой vs АППГ (если has_prev_data)
- *  - Переключатель метрики: ДТП / Погибшие / Раненые
- *  - График по месяцам (current vs prev) — работает с переключателем метрики
- *  - График по дорогам (топ-10) — работает с переключателем метрики
+ *  - Переключатель метрики: ДТП / Погибшие / Раненые — применяется ко ВСЕМ графикам
+ *  - График по месяцам (current vs prev)
+ *  - График по значению дорог: Федеральные / Региональные / Межмуниципальные / Муниципальные / Иные
  *  - График по видам ДТП (9 канонических категорий)
- *  - График по дням недели и часам (только текущий период)
- *  - График по погоде (donut)
+ *  - График по дням недели
+ *  - График по часам суток
+ *  - График по погоде (сортировка по выбранной метрике)
  */
 import { useState } from 'react'
 import {
   Bar,
   BarChart,
   CartesianGrid,
-  Cell,
   Legend,
   Line,
   LineChart,
-  Pie,
-  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -87,20 +94,17 @@ const DTP_TYPE_SHORT: Record<string, string> = {
   'Иные ДТП': 'Иные ДТП',
 }
 
-// Палитра цветов (адаптивная к Telegram-теме через CSS-вары)
-const COLORS_PALETTE = [
-  '#2481cc', // primary blue
-  '#ff9500', // orange
-  '#34c759', // green
-  '#af52de', // purple
-  '#ff3b30', // red
-  '#5ac8fa', // light blue
-  '#ffcc00', // yellow
-  '#5856d6', // indigo
-  '#8e8e93', // grey
+// Канонические категории значений дорог — порядок соответствует
+// ROAD_SIGNIFICANCE_ORDER в analytics.py
+const ROAD_SIGNIFICANCE_ORDER = [
+  'Федеральные',
+  'Региональные',
+  'Межмуниципальные',
+  'Муниципальные',
+  'Иные',
 ]
 
-// Метрики для переключателя
+// Метрики для переключателя — применяется ко всем визуализациям
 type Metric = 'dtp' | 'deaths' | 'injured'
 const METRICS: { id: Metric; label: string; color: string }[] = [
   { id: 'dtp', label: 'ДТП', color: '#2481cc' },
@@ -108,15 +112,18 @@ const METRICS: { id: Metric; label: string; color: string }[] = [
   { id: 'injured', label: 'Раненые', color: '#ff9500' },
 ]
 
-// Утилиты извлечения метрик из by_month (структура {dtp, deaths, injured})
-function getMonthMetric(
-  monthData: { dtp: number; deaths: number; injured: number } | undefined,
+// Структура severity-бакета: {dtp, deaths, injured}
+type SeverityBucket = { dtp?: number; deaths?: number; injured?: number }
+
+// Утилита: извлечение значения метрики из severity-бакета
+function getMetricValue(
+  bucket: SeverityBucket | undefined,
   metric: Metric
 ): number {
-  if (!monthData) return 0
-  if (metric === 'dtp') return monthData.dtp ?? 0
-  if (metric === 'deaths') return monthData.deaths ?? 0
-  return monthData.injured ?? 0
+  if (!bucket) return 0
+  if (metric === 'dtp') return bucket.dtp ?? 0
+  if (metric === 'deaths') return bucket.deaths ?? 0
+  return bucket.injured ?? 0
 }
 
 // Форматирование динамики для KPI
@@ -140,6 +147,30 @@ function formatDelta(
   }
 }
 
+// ============================================================
+// Tooltip-форматтеры (используются во всех бар-чартах)
+// ============================================================
+function makeBarTooltipFormatter(
+  currentLabel: string,
+  prevLabel: string
+) {
+  return (value: any, name: any): [any, string] => [
+    value,
+    name === 'current' ? currentLabel : prevLabel,
+  ]
+}
+
+function makeBarLegendFormatter(
+  currentLabel: string,
+  prevLabel: string
+) {
+  return (value: string): string =>
+    value === 'current' ? currentLabel : prevLabel
+}
+
+// ============================================================
+// Главный компонент
+// ============================================================
 export function AnalyticsView({ analytics }: AnalyticsViewProps) {
   const a = analytics as Record<string, any>
   const [metric, setMetric] = useState<Metric>('dtp')
@@ -150,6 +181,10 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
   const hasPrev = !!a.has_prev_data && !!previous
   const prevLabel = (a.prev_label ?? 'АППГ') as string
   const currentLabel = (a.current_label ?? 'Текущий период') as string
+
+  // Текущая метрика для подписи
+  const currentMetricLabel =
+    METRICS.find((m) => m.id === metric)?.label ?? 'ДТП'
 
   // === KPI с динамикой ===
   const kpiItems = [
@@ -170,84 +205,93 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
   ]
 
   // === Данные для графиков ===
-  // По дням недели
-  const weekdayData = Object.entries(current.by_weekday ?? {})
-    .map(([k, v]) => ({
-      day: DAY_SHORT[Number(k)] ?? k,
-      value: Number(v),
-    }))
-    .sort(
-      (x, y) =>
-        DAY_SHORT.indexOf(x.day) - DAY_SHORT.indexOf(y.day)
-    )
 
-  // По часам
-  const hourData = Array.from({ length: 24 }, (_, h) => ({
-    hour: `${h}`,
-    value: Number((current.by_hour ?? {})[String(h)] ?? 0),
-  }))
+  // По дням недели (severity-вариант)
+  const weekdayCur = (current.by_weekday_severity ?? {}) as Record<string, SeverityBucket>
+  const weekdayPrev = (previous?.by_weekday_severity ?? {}) as Record<string, SeverityBucket>
+  const weekdayData = Array.from({ length: 7 }, (_, i) => {
+    const k = String(i)
+    return {
+      day: DAY_SHORT[i],
+      current: getMetricValue(weekdayCur[k], metric),
+      previous: hasPrev ? getMetricValue(weekdayPrev[k], metric) : undefined,
+    }
+  }).filter((d) => d.current > 0 || (d.previous ?? 0) > 0)
 
-  // По видам ДТП (9 категорий, упорядочено по DTP_TYPE_ORDER)
-  const typeGroupedCurrent = (current.by_type_grouped ?? {}) as Record<string, number>
-  const typeGroupedPrev = (previous?.by_type_grouped ?? {}) as Record<string, number>
+  // По часам (severity-вариант)
+  const hourCur = (current.by_hour_severity ?? {}) as Record<string, SeverityBucket>
+  const hourPrev = (previous?.by_hour_severity ?? {}) as Record<string, SeverityBucket>
+  const hourData = Array.from({ length: 24 }, (_, h) => {
+    const k = String(h)
+    return {
+      hour: `${h}`,
+      current: getMetricValue(hourCur[k], metric),
+      previous: hasPrev ? getMetricValue(hourPrev[k], metric) : undefined,
+    }
+  })
+
+  // По видам ДТП (9 категорий, severity-вариант)
+  const typeCur = (current.by_type_grouped_severity ?? {}) as Record<string, SeverityBucket>
+  const typePrev = (previous?.by_type_grouped_severity ?? {}) as Record<string, SeverityBucket>
   const typeData = DTP_TYPE_ORDER.filter(
-    (t) => (typeGroupedCurrent[t] ?? 0) > 0 || (typeGroupedPrev[t] ?? 0) > 0
+    (t) =>
+      (typeCur[t]?.dtp ?? 0) > 0 || (typePrev[t]?.dtp ?? 0) > 0
   ).map((t) => ({
     name: DTP_TYPE_SHORT[t] ?? t,
     fullName: t,
-    current: typeGroupedCurrent[t] ?? 0,
-    previous: hasPrev ? typeGroupedPrev[t] ?? 0 : undefined,
+    current: getMetricValue(typeCur[t], metric),
+    previous: hasPrev ? getMetricValue(typePrev[t], metric) : undefined,
   }))
 
-  // По погоде
-  const weatherData = Object.entries(current.by_weather ?? {})
-    .map(([k, v]) => ({ name: k, value: Number(v) }))
-    .sort((a, b) => b.value - a.value)
-
-  // По месяцам (с АППГ) — зависит от переключателя metric
-  const byMonthCurrent = (current.by_month ?? {}) as Record<
-    string,
-    { dtp: number; deaths: number; injured: number }
-  >
-  const byMonthPrev = (previous?.by_month ?? {}) as Record<
-    string,
-    { dtp: number; deaths: number; injured: number }
-  >
-  const monthData = MONTH_ORDER.filter(
-    (m) => byMonthCurrent[m] || byMonthPrev[m]
-  ).map((m) => ({
-    month: MONTH_SHORT[MONTH_ORDER.indexOf(m)],
-    fullMonth: m,
-    current: getMonthMetric(byMonthCurrent[m], metric),
-    previous: hasPrev ? getMonthMetric(byMonthPrev[m], metric) : undefined,
-  }))
-
-  // По дорогам (топ-10) — зависит от переключателя metric
-  // by_road — это просто Counter по дороге (только количество ДТП).
-  // Для deaths/injured нужно посчитать дополнительно.
-  // Т.к. в analytics мы храним только count ДТП на дорогу — для deaths/injured
-  // используем ту же цифру, но помечаем в tooltip.
-  const roadDataCurrent = (current.by_road ?? {}) as Record<string, number>
-  const roadDataPrev = (previous?.by_road ?? {}) as Record<string, number>
-  const roadData = Object.keys(roadDataCurrent)
-    .map((road) => ({
-      name: road,
-      current: roadDataCurrent[road] ?? 0,
-      previous: hasPrev ? roadDataPrev[road] ?? 0 : undefined,
+  // По погоде (severity-вариант) — сортировка по выбранной метрике
+  const weatherCur = (current.by_weather_severity ?? {}) as Record<string, SeverityBucket>
+  const weatherPrev = (previous?.by_weather_severity ?? {}) as Record<string, SeverityBucket>
+  const weatherKeys = Array.from(
+    new Set([...Object.keys(weatherCur), ...Object.keys(weatherPrev)])
+  )
+  const weatherData = weatherKeys
+    .map((w) => ({
+      name: w,
+      current: getMetricValue(weatherCur[w], metric),
+      previous: hasPrev ? getMetricValue(weatherPrev[w], metric) : undefined,
     }))
     .filter((d) => d.current > 0 || (d.previous ?? 0) > 0)
     .sort((a, b) => b.current - a.current)
     .slice(0, 10)
 
-  // Текущая метрика для подписи
-  const currentMetricLabel =
-    METRICS.find((m) => m.id === metric)?.label ?? 'ДТП'
+  // По месяцам (severity-вариант) — структура уже {dtp, deaths, injured}
+  const byMonthCurrent = (current.by_month ?? {}) as Record<string, SeverityBucket>
+  const byMonthPrev = (previous?.by_month ?? {}) as Record<string, SeverityBucket>
+  const monthData = MONTH_ORDER.filter(
+    (m) => byMonthCurrent[m] || byMonthPrev[m]
+  ).map((m) => ({
+    month: MONTH_SHORT[MONTH_ORDER.indexOf(m)],
+    fullMonth: m,
+    current: getMetricValue(byMonthCurrent[m], metric),
+    previous: hasPrev ? getMetricValue(byMonthPrev[m], metric) : undefined,
+  }))
+
+  // По значению дорог (Федеральные / Региональные / Муниципальные / ...)
+  const roadSigCur = (current.by_road_significance ?? {}) as Record<string, SeverityBucket>
+  const roadSigPrev = (previous?.by_road_significance ?? {}) as Record<string, SeverityBucket>
+  const roadSigData = ROAD_SIGNIFICANCE_ORDER.filter(
+    (cat) =>
+      (roadSigCur[cat]?.dtp ?? 0) > 0 || (roadSigPrev[cat]?.dtp ?? 0) > 0
+  ).map((cat) => ({
+    name: cat,
+    current: getMetricValue(roadSigCur[cat], metric),
+    previous: hasPrev ? getMetricValue(roadSigPrev[cat], metric) : undefined,
+  }))
+
+  // Форматтеры
+  const tooltipFormatter = makeBarTooltipFormatter(currentLabel, prevLabel)
+  const legendFormatter = makeBarLegendFormatter(currentLabel, prevLabel)
 
   return (
     <div className="space-y-3">
-      {/* === Переключатель метрики === */}
+      {/* === Переключатель метрики — применяется ко всем графикам === */}
       <div className="tg-card">
-        <div className="tg-section-header mb-2">Метрика</div>
+        <div className="tg-section-header mb-2">Метрика визуализаций</div>
         <div className="grid grid-cols-3 gap-1.5">
           {METRICS.map((m) => (
             <button
@@ -273,7 +317,7 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
           ))}
         </div>
         <div className="text-[10px] opacity-60 mt-1.5 text-center">
-          Графики по месяцам и дорогам используют выбранную метрику
+          Все графики ниже отображают выбранную метрику
         </div>
       </div>
 
@@ -284,21 +328,11 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
         </div>
         <div className="grid grid-cols-3 gap-2">
           {kpiItems.map((kpi) => {
-            // Для deaths_per_100 динамика = разница, а не %
-            const isRate = kpi.key === 'deaths_per_100'
             const prevValue = hasPrev
-              ? isRate
-                ? Number(previous[kpi.key] ?? 0)
-                : Number(previous[kpi.key] ?? 0)
+              ? Number(previous[kpi.key] ?? 0)
               : undefined
-            const curValue = isRate
-              ? Number(kpi.value)
-              : Number(kpi.value)
-            const delta = hasPrev
-              ? isRate
-                ? formatDelta(curValue, prevValue)
-                : formatDelta(curValue, prevValue)
-              : null
+            const curValue = Number(kpi.value)
+            const delta = hasPrev ? formatDelta(curValue, prevValue) : null
             return (
               <div
                 key={kpi.label}
@@ -408,9 +442,7 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                 {hasPrev && (
                   <Legend
                     wrapperStyle={{ fontSize: 11 }}
-                    formatter={(value) =>
-                      value === 'current' ? currentLabel : prevLabel
-                    }
+                    formatter={legendFormatter}
                   />
                 )}
                 <Line
@@ -437,22 +469,23 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
         </div>
       )}
 
-      {/* === По дорогам (топ-10) === */}
-      {roadData.length > 0 && (
+      {/* === По значению дорог: Федеральные / Региональные / Муниципальные === */}
+      {roadSigData.length > 0 && (
         <div className="tg-card">
           <div className="tg-section-header mb-3">
-            Аварийность по дорогам ({currentMetricLabel}, топ-10)
+            Аварийность по значению дорог ({currentMetricLabel})
+            {hasPrev && ` vs ${prevLabel}`}
           </div>
           <div
             style={{
               width: '100%',
-              height: Math.max(200, roadData.length * 32 + 30),
+              height: Math.max(180, roadSigData.length * 36 + 30),
             }}
           >
             <ResponsiveContainer width="100%" height="100%">
               <BarChart
                 layout="vertical"
-                data={roadData}
+                data={roadSigData}
                 margin={{ top: 5, right: 15, bottom: 5, left: 5 }}
               >
                 <CartesianGrid
@@ -474,17 +507,12 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                   type="category"
                   dataKey="name"
                   tick={{
-                    fontSize: 10,
+                    fontSize: 11,
                     fill: 'var(--tg-color-text, #000)',
                   }}
                   axisLine={false}
                   tickLine={false}
-                  width={130}
-                  tickFormatter={(v) =>
-                    String(v).length > 22
-                      ? String(v).slice(0, 22) + '…'
-                      : v
-                  }
+                  width={120}
                 />
                 <Tooltip
                   cursor={{ fill: 'rgba(0,0,0,0.05)' }}
@@ -495,31 +523,26 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                     borderRadius: 8,
                     fontSize: 12,
                   }}
-                  formatter={(value: any, name: any) => [
-                    value,
-                    name === 'current' ? currentLabel : prevLabel,
-                  ]}
+                  formatter={tooltipFormatter}
                 />
                 {hasPrev && (
                   <Legend
                     wrapperStyle={{ fontSize: 11 }}
-                    formatter={(value) =>
-                      value === 'current' ? currentLabel : prevLabel
-                    }
+                    formatter={legendFormatter}
                   />
                 )}
                 <Bar
                   dataKey="current"
                   fill="#2481cc"
                   radius={[0, 4, 4, 0]}
-                  barSize={hasPrev ? 10 : 16}
+                  barSize={hasPrev ? 12 : 18}
                 />
                 {hasPrev && (
                   <Bar
                     dataKey="previous"
                     fill="#ff9500"
                     radius={[0, 4, 4, 0]}
-                    barSize={10}
+                    barSize={12}
                   />
                 )}
               </BarChart>
@@ -532,7 +555,8 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
       {typeData.length > 0 && (
         <div className="tg-card">
           <div className="tg-section-header mb-3">
-            По видам ДТП {hasPrev && `vs ${prevLabel}`}
+            По видам ДТП ({currentMetricLabel})
+            {hasPrev && ` vs ${prevLabel}`}
           </div>
           <div
             style={{
@@ -581,10 +605,7 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                     borderRadius: 8,
                     fontSize: 12,
                   }}
-                  formatter={(value: any, name: any) => [
-                    value,
-                    name === 'current' ? currentLabel : prevLabel,
-                  ]}
+                  formatter={tooltipFormatter}
                   labelFormatter={(_, payload) =>
                     payload?.[0]?.payload?.fullName ?? ''
                   }
@@ -592,9 +613,7 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                 {hasPrev && (
                   <Legend
                     wrapperStyle={{ fontSize: 11 }}
-                    formatter={(value) =>
-                      value === 'current' ? currentLabel : prevLabel
-                    }
+                    formatter={legendFormatter}
                   />
                 )}
                 <Bar
@@ -621,14 +640,20 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
       {weekdayData.length > 0 && (
         <div className="tg-card">
           <div className="tg-section-header mb-3">
-            По дням недели ({currentLabel})
+            По дням недели ({currentMetricLabel})
+            {hasPrev && ` vs ${prevLabel}`}
           </div>
-          <div style={{ width: '100%', height: 200 }}>
+          <div style={{ width: '100%', height: 220 }}>
             <ResponsiveContainer width="100%" height="100%">
               <BarChart
                 data={weekdayData}
                 margin={{ top: 5, right: 5, bottom: 5, left: -20 }}
               >
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke="var(--tg-color-hint, #ccc)"
+                  strokeOpacity={0.3}
+                />
                 <XAxis
                   dataKey="day"
                   tick={{
@@ -656,33 +681,52 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                     borderRadius: 8,
                     fontSize: 12,
                   }}
+                  formatter={tooltipFormatter}
                 />
-                <Bar dataKey="value" radius={[4, 4, 0, 0]}>
-                  {weekdayData.map((_, idx) => (
-                    <Cell
-                      key={idx}
-                      fill={COLORS_PALETTE[idx % COLORS_PALETTE.length]}
-                    />
-                  ))}
-                </Bar>
+                {hasPrev && (
+                  <Legend
+                    wrapperStyle={{ fontSize: 11 }}
+                    formatter={legendFormatter}
+                  />
+                )}
+                <Bar
+                  dataKey="current"
+                  fill="#2481cc"
+                  radius={[4, 4, 0, 0]}
+                  barSize={hasPrev ? 10 : 18}
+                />
+                {hasPrev && (
+                  <Bar
+                    dataKey="previous"
+                    fill="#ff9500"
+                    radius={[4, 4, 0, 0]}
+                    barSize={10}
+                  />
+                )}
               </BarChart>
             </ResponsiveContainer>
           </div>
         </div>
       )}
 
-      {/* === По часам === */}
-      {hourData.some((d) => d.value > 0) && (
+      {/* === По часам суток === */}
+      {hourData.some((d) => d.current > 0 || (d.previous ?? 0) > 0) && (
         <div className="tg-card">
           <div className="tg-section-header mb-3">
-            По часам суток ({currentLabel})
+            По часам суток ({currentMetricLabel})
+            {hasPrev && ` vs ${prevLabel}`}
           </div>
-          <div style={{ width: '100%', height: 200 }}>
+          <div style={{ width: '100%', height: 220 }}>
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
                 data={hourData}
                 margin={{ top: 5, right: 5, bottom: 5, left: -20 }}
               >
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke="var(--tg-color-hint, #ccc)"
+                  strokeOpacity={0.3}
+                />
                 <XAxis
                   dataKey="hour"
                   tick={{
@@ -710,87 +754,122 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                     borderRadius: 8,
                     fontSize: 12,
                   }}
+                  formatter={tooltipFormatter}
                   labelFormatter={(l) => `${l}:00`}
                 />
+                {hasPrev && (
+                  <Legend
+                    wrapperStyle={{ fontSize: 11 }}
+                    formatter={legendFormatter}
+                  />
+                )}
                 <Line
                   type="monotone"
-                  dataKey="value"
+                  dataKey="current"
                   stroke="#2481cc"
                   strokeWidth={2}
                   dot={{ r: 2, fill: '#2481cc' }}
                   activeDot={{ r: 4 }}
                 />
+                {hasPrev && (
+                  <Line
+                    type="monotone"
+                    dataKey="previous"
+                    stroke="#ff9500"
+                    strokeWidth={2}
+                    strokeDasharray="5 3"
+                    dot={false}
+                  />
+                )}
               </LineChart>
             </ResponsiveContainer>
           </div>
         </div>
       )}
 
-      {/* === По погоде === */}
+      {/* === По погоде (топ-10 по выбранной метрике) === */}
       {weatherData.length > 0 && (
         <div className="tg-card">
           <div className="tg-section-header mb-3">
-            По погодным условиям ({currentLabel})
+            По погоде ({currentMetricLabel}, топ-{weatherData.length})
+            {hasPrev && ` vs ${prevLabel}`}
           </div>
           <div
-            className="flex items-center"
-            style={{ width: '100%', height: 200 }}
+            style={{
+              width: '100%',
+              height: Math.max(200, weatherData.length * 32 + 30),
+            }}
           >
-            <div style={{ width: '50%', height: '100%' }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={weatherData}
-                    dataKey="value"
-                    nameKey="name"
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={35}
-                    outerRadius={70}
-                    paddingAngle={2}
-                  >
-                    {weatherData.map((_, idx) => (
-                      <Cell
-                        key={idx}
-                        fill={COLORS_PALETTE[idx % COLORS_PALETTE.length]}
-                      />
-                    ))}
-                  </Pie>
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor:
-                        'var(--tg-color-section-bg, #fff)',
-                      border: 'none',
-                      borderRadius: 8,
-                      fontSize: 12,
-                    }}
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                layout="vertical"
+                data={weatherData}
+                margin={{ top: 5, right: 15, bottom: 5, left: 5 }}
+              >
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke="var(--tg-color-hint, #ccc)"
+                  strokeOpacity={0.3}
+                  horizontal={false}
+                />
+                <XAxis
+                  type="number"
+                  tick={{
+                    fontSize: 10,
+                    fill: 'var(--tg-color-hint, #999)',
+                  }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <YAxis
+                  type="category"
+                  dataKey="name"
+                  tick={{
+                    fontSize: 10,
+                    fill: 'var(--tg-color-text, #000)',
+                  }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={140}
+                  tickFormatter={(v) =>
+                    String(v).length > 22
+                      ? String(v).slice(0, 22) + '…'
+                      : v
+                  }
+                />
+                <Tooltip
+                  cursor={{ fill: 'rgba(0,0,0,0.05)' }}
+                  contentStyle={{
+                    backgroundColor:
+                      'var(--tg-color-section-bg, #fff)',
+                    border: 'none',
+                    borderRadius: 8,
+                    fontSize: 12,
+                  }}
+                  formatter={tooltipFormatter}
+                />
+                {hasPrev && (
+                  <Legend
+                    wrapperStyle={{ fontSize: 11 }}
+                    formatter={legendFormatter}
                   />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="flex-1 pl-2 space-y-1">
-              {weatherData.map((w, idx) => (
-                <div
-                  key={w.name}
-                  className="flex items-center gap-2 text-xs"
-                >
-                  <span
-                    style={{
-                      display: 'inline-block',
-                      width: 10,
-                      height: 10,
-                      borderRadius: 2,
-                      backgroundColor:
-                        COLORS_PALETTE[idx % COLORS_PALETTE.length],
-                    }}
+                )}
+                <Bar
+                  dataKey="current"
+                  fill="#2481cc"
+                  radius={[0, 4, 4, 0]}
+                  barSize={hasPrev ? 10 : 16}
+                />
+                {hasPrev && (
+                  <Bar
+                    dataKey="previous"
+                    fill="#ff9500"
+                    radius={[0, 4, 4, 0]}
+                    barSize={10}
                   />
-                  <span className="opacity-80 flex-1 truncate">
-                    {w.name}
-                  </span>
-                  <span className="font-medium">{w.value}</span>
-                </div>
-              ))}
-            </div>
+                )}
+              </BarChart>
+            </ResponsiveContainer>
           </div>
         </div>
       )}

@@ -10,6 +10,12 @@
  *  - Месяцы: 12 чипов, можно выбрать несколько (или все через пресет).
  *  - Пресеты: «Весь год», «I квартал», «II квартал», «Полгода».
  *
+ * Блок сворачиваемый:
+ *  - По умолчанию развёрнут (пользователь выбирает параметры).
+ *  - Автоматически сворачивается после успешного нажатия «Выгрузить данные».
+ *  - В свёрнутом виде показывает краткую сводку региона + периода и
+ *    кнопку «Развернуть» для повторного запроса с другими параметрами.
+ *
  * Отправляет на backend уже готовый region_code + dat_list —
  * парсинг текста не выполняется.
  */
@@ -46,6 +52,10 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
   const [year, setYear] = useState<number>(YEARS[0])
   const [selectedMonths, setSelectedMonths] = useState<number[]>([])
 
+  // Сворачиваемый блок: по умолчанию развёрнут.
+  // После успешной отправки задачи — автоматически сворачивается.
+  const [collapsed, setCollapsed] = useState(false)
+
   // === Загрузка регионов ===
   const regionsQuery = useQuery({
     queryKey: ['regions'],
@@ -79,6 +89,9 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
     },
     onSuccess: (data) => {
       haptic('success')
+      // Автоматически сворачиваем форму после успешной отправки,
+      // чтобы освободить место для прогресс-индикатора и результатов.
+      setCollapsed(true)
       onTaskCreated(data.task_id)
     },
     onError: async (err: Error) => {
@@ -115,12 +128,75 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
     createMutation.mutate()
   }
 
+  const handleToggleCollapse = () => {
+    haptic('light')
+    setCollapsed((v) => !v)
+  }
+
   const isLoading = createMutation.isPending
   const canSubmit = selectedRegion !== null && selectedMonths.length > 0 && !isLoading
+  const periodLabel = selectedMonths.length > 0
+    ? buildPeriodLabel(selectedMonths, year)
+    : ''
 
+  // === Свёрнутый режим: компактная полоска с кнопкой «Развернуть» ===
+  if (collapsed) {
+    return (
+      <div className="tg-card">
+        <button
+          type="button"
+          onClick={handleToggleCollapse}
+          className="w-full flex items-center justify-between text-left active:opacity-70"
+        >
+          <div className="min-w-0 flex-1 pr-3">
+            <div className="text-[10px] opacity-60 uppercase tracking-wider mb-0.5">
+              Параметры запроса
+            </div>
+            <div className="text-sm font-medium truncate">
+              {selectedRegion ? selectedRegion.name : 'Регион не выбран'}
+              {selectedRegion && (
+                <span className="opacity-50"> · код {selectedRegion.code}</span>
+              )}
+            </div>
+            <div className="text-xs opacity-70 truncate">
+              {periodLabel || 'Период не выбран'}
+            </div>
+          </div>
+          <div
+            className="shrink-0 px-3 py-2 rounded-lg text-xs font-medium"
+            style={{
+              backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+              color: 'var(--tg-color-link, #2481cc)',
+            }}
+          >
+            ▼ Развернуть
+          </div>
+        </button>
+      </div>
+    )
+  }
+
+  // === Развёрнутый режим: полная форма ===
   return (
     <div className="tg-card">
-      <div className="tg-section-header">Запрос данных ДТП</div>
+      <div className="flex items-center justify-between mb-3">
+        <div className="tg-section-header">Запрос данных ДТП</div>
+        {/* Кнопка свернуть (иконка ▲) — видна только если уже есть выбранные параметры */}
+        {canSubmit && (
+          <button
+            type="button"
+            onClick={handleToggleCollapse}
+            className="text-xs px-2 py-1 rounded-md"
+            style={{
+              backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+              color: 'var(--tg-color-link, #2481cc)',
+            }}
+            title="Свернуть"
+          >
+            ▲ Свернуть
+          </button>
+        )}
+      </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
         {/* === Регион === */}
@@ -288,7 +364,7 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
             <div className="font-medium mb-0.5">
               {selectedRegion?.name} ({selectedRegion?.code})
             </div>
-            <div className="opacity-70">{buildPeriodLabel(selectedMonths, year)}</div>
+            <div className="opacity-70">{periodLabel}</div>
           </div>
         )}
 
