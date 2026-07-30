@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import cameras, dtp, parse, point, regions
+from .routers import analyze, cameras, dtp, parse, point, regions
 
 
 app = FastAPI(
@@ -26,6 +26,7 @@ app = FastAPI(
 app.include_router(regions.router)
 app.include_router(parse.router)
 app.include_router(dtp.router)
+app.include_router(analyze.router)
 app.include_router(point.router)
 app.include_router(cameras.router)
 

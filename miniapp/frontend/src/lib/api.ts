@@ -146,6 +146,127 @@ export interface CameraUploadResponse {
 }
 
 // ============================================================
+// Analysis: Clusters / Point / LLM
+// ============================================================
+export type AnalysisStatus = 'idle' | 'running' | 'done' | 'failed'
+
+export interface AnalysisStateResponse {
+  status: AnalysisStatus
+  progress: number
+  stage: string
+  error?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface ClusterItem {
+  road: string
+  zone_type: string
+  total_accidents: number
+  deaths: number
+  injured: number
+  dominant_type: string
+  type_counter: Record<string, number>
+  center?: { lat: number; lon: number } | null
+  start_pos?: number | null
+  end_pos?: number | null
+  dates: string[]
+  dynamics: Record<string, any>
+  camera_match?: Record<string, any> | null
+}
+
+export interface ClustersSummary {
+  total_clusters: number
+  total_lost: number
+  total_preclusters: number
+  current_total_dtp: number
+  current_deaths: number
+  current_injured: number
+  dynamics: Record<string, number>
+  has_prev_data: boolean
+  prev_label?: string | null
+  current_label: string
+  region_name: string
+}
+
+export interface ClustersResult {
+  summary: ClustersSummary
+  clusters: ClusterItem[]
+  preclusters: ClusterItem[]
+}
+
+export interface ClustersResponse {
+  state: AnalysisStateResponse
+  result?: ClustersResult | null
+}
+
+export interface PointPeriodStats {
+  total: number
+  deaths: number
+  injured: number
+  alcohol: number
+  pedestrians: number
+  by_type: Record<string, number>
+  by_road: Record<string, number>
+  by_weather: Record<string, number>
+  cards_count: number
+  cards_preview: Array<{
+    date: string
+    time: string
+    type: string
+    road: string
+    deaths: number
+    injured: number
+    dist_m: number
+    lat: number
+    lon: number
+  }>
+}
+
+export interface PointStatsResponse {
+  ok: boolean
+  center: { lat: number; lon: number }
+  radius_m: number
+  current_label: string
+  prev_label?: string | null
+  current?: PointPeriodStats | null
+  prev?: PointPeriodStats | null
+  error?: string | null
+}
+
+export interface LLMProvidersResponse {
+  free: boolean
+  paid: boolean
+  free_model: string
+  paid_model: string
+}
+
+export interface LLMSummaryResult {
+  text: string
+  provider: string
+  generated_at: string
+}
+
+export interface LLMSummaryResponse {
+  state: AnalysisStateResponse
+  result?: LLMSummaryResult | null
+}
+
+export interface LLMAskResponse {
+  ok: boolean
+  answer?: string | null
+  provider?: string | null
+  error?: string | null
+}
+
+export interface QAHistoryItem {
+  question: string
+  answer: string
+  provider: string
+  timestamp: string
+}
+
+// ============================================================
 // API methods
 // ============================================================
 export const api = {
@@ -221,4 +342,52 @@ export const api = {
       `/api/cameras/${regCode}`,
       { method: 'DELETE' }
     ),
+
+  // ============================================================
+  // Analysis: Clusters (очаги)
+  // ============================================================
+  startClusters: (taskId: string) =>
+    request<ClustersResponse>(`/api/dtp/tasks/${taskId}/clusters`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  getClusters: (taskId: string) =>
+    request<ClustersResponse>(`/api/dtp/tasks/${taskId}/clusters`),
+
+  getClustersMapUrl: (taskId: string) =>
+    `${API_BASE}/api/dtp/tasks/${taskId}/clusters/map?tg_init_data=${encodeURIComponent(getInitData())}`,
+
+  // ============================================================
+  // Analysis: Point statistics
+  // ============================================================
+  computePointStats: (taskId: string, lat: number, lon: number, radius_m: number) =>
+    request<PointStatsResponse>(`/api/dtp/tasks/${taskId}/point`, {
+      method: 'POST',
+      body: JSON.stringify({ lat, lon, radius_m }),
+    }),
+
+  // ============================================================
+  // Analysis: LLM
+  // ============================================================
+  getLLMProvidersForTask: (taskId: string) =>
+    request<LLMProvidersResponse>(`/api/dtp/tasks/${taskId}/llm/providers`),
+
+  startLLMSummary: (taskId: string, provider: 'free' | 'paid') =>
+    request<LLMSummaryResponse>(`/api/dtp/tasks/${taskId}/llm/summary`, {
+      method: 'POST',
+      body: JSON.stringify({ provider }),
+    }),
+
+  getLLMSummary: (taskId: string) =>
+    request<LLMSummaryResponse>(`/api/dtp/tasks/${taskId}/llm/summary`),
+
+  askLLM: (taskId: string, question: string, provider: 'free' | 'paid') =>
+    request<LLMAskResponse>(`/api/dtp/tasks/${taskId}/llm/ask`, {
+      method: 'POST',
+      body: JSON.stringify({ question, provider }),
+    }),
+
+  getQAHistory: (taskId: string) =>
+    request<QAHistoryItem[]>(`/api/dtp/tasks/${taskId}/llm/qa-history`),
 }

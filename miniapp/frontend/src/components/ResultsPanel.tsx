@@ -7,12 +7,15 @@ import { haptic } from '@/lib/telegram'
 import { formatSize, statusLabel } from '@/lib/utils'
 import { MapFrame } from './MapFrame'
 import { AnalyticsView } from './AnalyticsView'
+import { ClustersView } from './ClustersView'
+import { PointStatsView } from './PointStatsView'
+import { LLMAnalysisView } from './LLMAnalysisView'
 
 interface ResultsPanelProps {
   task: TaskStatusResponse
 }
 
-type Tab = 'map' | 'analytics' | 'files'
+type Tab = 'map' | 'analytics' | 'clusters' | 'point' | 'llm' | 'files'
 
 export function ResultsPanel({ task }: ResultsPanelProps) {
   const [tab, setTab] = useState<Tab>('map')
@@ -24,6 +27,9 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
   const tabs: { id: Tab; label: string; visible: boolean }[] = [
     { id: 'map', label: 'Карта', visible: !!mapFile },
     { id: 'analytics', label: 'Аналитика', visible: !!task.analytics },
+    { id: 'clusters', label: 'Очаги', visible: true },
+    { id: 'point', label: 'По точке', visible: true },
+    { id: 'llm', label: 'ИИ-анализ', visible: true },
     { id: 'files', label: 'Файлы', visible: task.files.length > 0 },
   ]
   const visibleTabs = tabs.filter((t) => t.visible)
@@ -51,7 +57,7 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
 
       {/* Табы */}
       {visibleTabs.length > 0 && (
-        <div className="flex gap-1 p-1 rounded-xl" style={{
+        <div className="flex gap-1 p-1 rounded-xl overflow-x-auto" style={{
           backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
         }}>
           {visibleTabs.map((t) => (
@@ -61,7 +67,7 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
                 setTab(t.id)
                 haptic('light')
               }}
-              className="flex-1 py-2 px-3 text-sm font-medium rounded-lg transition-colors"
+              className="flex-1 min-w-[70px] py-2 px-2 text-xs font-medium rounded-lg transition-colors whitespace-nowrap"
               style={{
                 backgroundColor:
                   tab === t.id
@@ -85,6 +91,12 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
       {tab === 'analytics' && task.analytics && (
         <AnalyticsView analytics={task.analytics} />
       )}
+
+      {tab === 'clusters' && <ClustersView task={task} />}
+
+      {tab === 'point' && <PointStatsView task={task} />}
+
+      {tab === 'llm' && <LLMAnalysisView task={task} />}
 
       {tab === 'files' && (
         <FilesList
