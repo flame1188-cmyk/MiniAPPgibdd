@@ -323,6 +323,30 @@ async def telegram_webhook(request: Request):
     return JSONResponse({"ok": True})
 
 
+@app.get(WEBHOOK_PATH)
+async def telegram_webhook_info():
+    """
+    Диагностический GET на /bot/webhook.
+    Telegram шлёт POST, но GET нужен, чтобы в браузере проверить, что
+    маршрут действительно живёт в нашем FastAPI (а не отдаётся 404 от Traefik).
+    """
+    return {
+        "ok": True,
+        "service": "gibdd-bot-miniapp",
+        "webhook_path": WEBHOOK_PATH,
+        "webhook_url": WEBHOOK_URL,
+        "bot_initialized": tg_app is not None,
+        "bothost_domain": BOTHOST_DOMAIN or "not_set",
+        "port": PORT,
+        "hint": (
+            "Если вы видите этот JSON — FastAPI работает и маршрут /bot/webhook "
+            "существует. Telegram должен слать POST сюда. Если вместо этого "
+            "вы видите '404 page not found' (plain text) — запрос не доходит "
+            "до контейнера: проверьте опцию 'Использовать домен' в bothost."
+        ),
+    }
+
+
 # ============================================================
 # Health check
 # ============================================================
