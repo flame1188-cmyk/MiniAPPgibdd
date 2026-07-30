@@ -177,6 +177,30 @@ export function isInsideTelegram(): boolean {
   return !!getWebApp()
 }
 
+/**
+ * Детектит Telegram Desktop (Windows/Mac/Linux).
+ * На desktop Mini App открывается в вертикальном окне, которое
+ * пользователь может растянуть мышью. Возвращаем true, чтобы UI
+ * мог переключиться в широкую раскладку (max-w-5xl вместо max-w-xl).
+ */
+export function isTelegramDesktop(): boolean {
+  const wa = getWebApp()
+  if (!wa) {
+    // Вне Telegram (dev-режим в браузере) — считаем десктопом по ширине окна
+    return typeof window !== 'undefined' && window.innerWidth >= 900
+  }
+  return wa.platform === 'tdesktop'
+}
+
+/**
+ * Возвращает рекомендуемый max-width для контейнера приложения.
+ * На мобильных (ios/android) — узкая вертикальная раскладка.
+ * На десктопе (tdesktop или широкий браузер) — широкая.
+ */
+export function getContainerMaxWidth(): string {
+  return isTelegramDesktop() ? 'max-w-5xl' : 'max-w-xl'
+}
+
 export function haptic(
   type: 'light' | 'medium' | 'heavy' | 'success' | 'warning' | 'error' = 'light'
 ): void {

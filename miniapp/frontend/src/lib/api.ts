@@ -88,12 +88,30 @@ async function downloadBlobUrl(url: string, fallbackFilename: string): Promise<v
 
   const blob = await response.blob()
 
-  // Имя файла из Content-Disposition (если сервер его прислал)
+  // Имя файла из Content-Disposition (если сервер его прислал).
+  // Поддерживаем RFC 5987: prefer filename*=UTF-8''... over ASCII filename=...
   let filename = fallbackFilename
   const cd = response.headers.get('content-disposition')
   if (cd) {
-    const match = cd.match(/filename="?([^";]+)"?/)
-    if (match && match[1]) filename = match[1]
+    // Сначала пробуем UTF-8 форму: filename*=UTF-8''<urlencoded>
+    const utf8Match = cd.match(/filename\*=([^;]+)/i)
+    if (utf8Match && utf8Match[1]) {
+      const raw = utf8Match[1].trim()
+      // Формат: UTF-8''<urlencoded>
+      const m = raw.match(/^[^']*''(.+)$/i)
+      if (m && m[1]) {
+        try {
+          filename = decodeURIComponent(m[1])
+        } catch {
+          filename = m[1]
+        }
+      }
+    }
+    // Fallback на ASCII форму: filename="..."
+    if (filename === fallbackFilename) {
+      const match = cd.match(/filename="?([^";]+)"?/i)
+      if (match && match[1]) filename = match[1]
+    }
   }
 
   // Создаём временный <a> и кликаем по нему
