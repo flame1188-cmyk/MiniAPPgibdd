@@ -580,7 +580,7 @@ def format_clusters_for_prompt(
         total = c["total_accidents"]
         deaths = c.get("deaths", 0)
         injured = c.get("injured", 0)
-        dominant = c.get("dominant_type", "")
+        dominant = c.get("dominant_type") or ""
 
         # Формируем строку видов ДТП
         type_counter = c.get("type_counter", {})
