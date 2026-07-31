@@ -1783,6 +1783,9 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
             if (c.get("camera_match") or {}).get("status") == "закрыт"
         )
         has_pre = preclusters and len(preclusters) > 0
+        has_lost = any(
+            (c.get("dynamics") or {}).get("status") == "lost" for c in clusters
+        )
 
         summary_html = self._build_summary(
             total=total_dtp,
@@ -1824,7 +1827,7 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         )
 
         # Легенда для карты очагов
-        legend_html = self._build_cluster_legend(has_pre)
+        legend_html = self._build_cluster_legend(has_pre, has_lost)
 
         # Фильтр камер по модели (если есть камеры)
         cam_models = sorted(set(
@@ -1933,10 +1936,12 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
 
         return json.dumps(result, ensure_ascii=False)
 
-    def _build_cluster_legend(self, has_preclusters: bool) -> str:
+    def _build_cluster_legend(self, has_preclusters: bool, has_lost: bool = False) -> str:
         """Легенда для карты очагов."""
         pre_row = """
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#e0e0e0;border:2px dashed #9e9e9e;"></span></td><td>Зона предочага (пунктир)</td></tr>""" if has_preclusters else ""
+        lost_row = """
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#c0c0c0;border:2px dashed #9e9e9e;"></span></td><td>Зона исчезнувшего очага (серый пунктир)</td></tr>""" if has_lost else ""
         return f"""
 <div class="legend">
   <div style="font-weight:600;margin-bottom:6px;">Условные обозначения</div>
@@ -1944,12 +1949,13 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>Очаг: 10+ ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>Очаг: 6–9 ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#fbc02d"></span></td><td>Очаг: 3–5 ДТП</td></tr>
-{pre_row}
+{lost_row}{pre_row}
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td style="font-size:12px;">— точка ДТП с погибшими</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td style="font-size:12px;">— точка ДТП с ранеными</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#9e9e9e"></span></td><td style="font-size:12px;">— ДТП в исчезнувшем очаге</td></tr>
     <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
   </table>
-  <div style="margin-top:6px;color:#757575;font-size:12px;">Кликните на зону очага для подробностей. Включите слои через панель справа.</div>
+  <div style="margin-top:6px;color:#757575;font-size:12px;">Кликните на зону очага для подробностей. Включите/выключите слои через панель справа.</div>
 </div>"""
 
     def _build_camera_filter_panel(self, cam_models: list[str]) -> str:
@@ -2157,11 +2163,13 @@ function clusterColor(count) {{
     return '#4caf50';
 }}
 
-// --- Слои: отдельные для ДТП очагов и предочагов ---
-var dtpClusterLayer = L.layerGroup();    // ДТП внутри очагов
+// --- Слои: отдельные для ДТП очагов, предочагов и исчезнувших ---
+var dtpClusterLayer = L.layerGroup();    // ДТП внутри текущих очагов
 var dtpPreclusterLayer = L.layerGroup(); // ДТП внутри предочагов
-var clusterLayer = L.layerGroup();      // зоны и маркеры очагов
+var dtpLostLayer = L.layerGroup();       // ДТП внутри исчезнувших очагов
+var clusterLayer = L.layerGroup();      // зоны и маркеры текущих очагов
 var preclusterLayer = L.layerGroup();   // зоны и маркеры предочагов
+var lostClusterLayer = L.layerGroup();  // зоны и маркеры исчезнувших очагов
 
 // --- Камеры (кластеризация) ---
 var cameraIcon = L.divIcon({{
@@ -2189,18 +2197,23 @@ cameraDataFull.forEach(function(c) {{
 }});
 cameraCluster.addTo(map);
 
-// --- Функция отрисовки очага/предочага ---
-function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
+// --- Функция отрисовки очага/предочага/исчезнувшего ---
+function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
     data.forEach(function(cl) {{
         if (cl.points.length === 0) return;
         var pts = cl.points;
 
         // Convex hull (зона)
         var hull = convexHull(pts);
-        var color = clusterColor(cl.count);
+        var baseColor = clusterColor(cl.count);
+        var color = isLost ? '#9e9e9e' : baseColor;
         var zoneStyle = isPre ? {{
             color: '#9e9e9e', fillColor: '#e0e0e0', fillOpacity: 0.08,
             weight: 2, dashArray: '6,4'
+        }} : isLost ? {{
+            // Исчезнувший очаг — светло-серый, пунктирная рамка
+            color: '#9e9e9e', fillColor: '#c0c0c0', fillOpacity: 0.10,
+            weight: 2, dashArray: '4,3'
         }} : {{
             color: color, fillColor: color, fillOpacity: 0.12, weight: 2
         }};
@@ -2210,9 +2223,10 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
         }}
 
         // Точки ДТП — в соответствующий DTP-слой
+        // Для исчезнувших очагов ДТП красим серым, чтобы визуально отделить
         pts.forEach(function(p) {{
             L.circleMarker([p.lat, p.lon], {{
-                radius: 5, fillColor: p.color, color: '#333',
+                radius: 5, fillColor: isLost ? '#9e9e9e' : p.color, color: '#333',
                 weight: 1, fillOpacity: 0.9
             }}).bindPopup(p.popup, {{maxWidth: 320}}).addTo(dtpLayer);
         }});
@@ -2221,10 +2235,10 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
         if (pts.length >= 2) {{
             var lineCoords = pts.map(function(p) {{ return [p.lat, p.lon]; }});
             var lineOpts = {{
-                color: isPre ? '#757575' : '#000000',
+                color: isPre ? '#757575' : (isLost ? '#9e9e9e' : '#000000'),
                 weight: 3, opacity: 0.8
             }};
-            if (isPre) lineOpts.dashArray = '6,4';
+            if (isPre || isLost) lineOpts.dashArray = '6,4';
             L.polyline(lineCoords, lineOpts).addTo(zoneLayer);
         }}
 
@@ -2265,10 +2279,11 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
         // Маркер центра с попапом очага
         if (cl.center) {{
             var marker = L.circleMarker(cl.center, {{
-                radius: 10, fillColor: color, color: '#000',
-                weight: 2, fillOpacity: 0.3
+                radius: 10, fillColor: isLost ? '#c0c0c0' : color, 
+                color: isLost ? '#757575' : '#000',
+                weight: 2, fillOpacity: isLost ? 0.5 : 0.3
             }});
-            var popupHtml = '<b>' + (isPre ? 'Предочаг' : 'Очаг') + ' №' + cl.id + '</b>' +
+            var popupHtml = '<b>' + (isPre ? 'Предочаг' : (isLost ? 'Исчезнувший очаг' : 'Очаг')) + ' №' + cl.id + '</b>' +
                 '<br>' + cl.road +
                 '<br>ДТП: ' + cl.count +
                 (cl.deaths ? ' | 💀 ' + cl.deaths : '') +
@@ -2295,22 +2310,37 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre) {{
 
 // --- Отрисовка ---
 var clusterData = {clusters_js};
-drawClusterGroup(clusterData, clusterLayer, dtpClusterLayer, false);
+// Разделяем: текущие очаги и исчезнувшие (по dynamics.status == 'lost')
+var lostData = clusterData.filter(function(cl) {{ return cl.dynamics && cl.dynamics.status === 'lost'; }});
+var currentData = clusterData.filter(function(cl) {{ return !(cl.dynamics && cl.dynamics.status === 'lost'); }});
+
+drawClusterGroup(currentData, clusterLayer, dtpClusterLayer, false, false);
+if (lostData.length > 0) {{
+    drawClusterGroup(lostData, lostClusterLayer, dtpLostLayer, false, true);
+}}
 
 var preclusterData = {preclusters_js};
 if (preclusterData.length > 0) {{
-    drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true);
+    drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true, false);
 }}
 
-// Добавляем слои на карту
+// Добавляем слои на карту (исчезнувшие по умолчанию включены, но можно выключить)
 dtpClusterLayer.addTo(map);
 clusterLayer.addTo(map);
+if (lostData.length > 0) {{
+    lostClusterLayer.addTo(map);
+    dtpLostLayer.addTo(map);
+}}
 
 // --- Управление слоями ---
 var overlayLayers = {{
     "Очаги (зоны)": clusterLayer,
     "ДТП в очагах": dtpClusterLayer
 }};
+if (lostData.length > 0) {{
+    overlayLayers["Исчезнувшие очаги (зоны)"] = lostClusterLayer;
+    overlayLayers["ДТП в исчезнувших"] = dtpLostLayer;
+}}
 if (preclusterData.length > 0) {{
     overlayLayers["Предочаги (зоны)"] = preclusterLayer;
     overlayLayers["ДТП в предочагах"] = dtpPreclusterLayer;
