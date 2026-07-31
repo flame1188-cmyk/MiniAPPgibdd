@@ -228,7 +228,8 @@ export interface ClusterItem {
   total_accidents: number
   deaths: number
   injured: number
-  dominant_type: string
+  // None (смешанный тип, 5+ ДТП разных видов) приходит как null
+  dominant_type: string | null
   type_counter: Record<string, number>
   center?: { lat: number; lon: number } | null
   start_pos?: number | null
