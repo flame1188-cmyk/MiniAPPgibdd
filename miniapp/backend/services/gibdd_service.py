@@ -903,7 +903,8 @@ def _serialize_cluster(c: dict) -> dict:
         "total_accidents": c.get("total_accidents", 0),
         "deaths": c.get("deaths", 0),
         "injured": c.get("injured", 0),
-        "dominant_type": c.get("dominant_type", ""),
+        # None (смешанный тип, 5+ ДТП разных видов) -> пустая строка для UI
+        "dominant_type": c.get("dominant_type") or "",
         "type_counter": dict(c.get("type_counter", {})),
         "center": {"lat": center[0], "lon": center[1]} if center else None,
         "start_pos": c.get("start_pos"),
@@ -1375,7 +1376,8 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
                     "total_accidents": c.get("total_accidents", 0),
                     "deaths": c.get("deaths", 0),
                     "injured": c.get("injured", 0),
-                    "dominant_type": c.get("dominant_type", ""),
+                    # None (смешанный тип) -> пустая строка для UI
+                    "dominant_type": c.get("dominant_type") or "",
                     "type_counter": c.get("type_counter", {}),
                     "start_pos": c.get("start_pos"),
                     "end_pos": c.get("end_pos"),
@@ -1506,7 +1508,8 @@ async def ask_llm_question(
                     "total_accidents": c.get("total_accidents", 0),
                     "deaths": c.get("deaths", 0),
                     "injured": c.get("injured", 0),
-                    "dominant_type": c.get("dominant_type", ""),
+                    # None (смешанный тип) -> пустая строка для UI
+                    "dominant_type": c.get("dominant_type") or "",
                     "type_counter": c.get("type_counter", {}),
                     "start_pos": c.get("start_pos"),
                     "end_pos": c.get("end_pos"),
