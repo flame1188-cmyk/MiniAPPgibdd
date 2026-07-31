@@ -15,10 +15,28 @@
 """
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+# ========================
+# API ГИБДД для справочника регионов — отключён
+# ========================
+# API ГИБДД (opendataapi/v1/dictionary) уже долгое время недоступен.
+# Каждый запуск мини-аппа пытается достучаться до API, ждёт таймаут,
+# и только потом fallback'ится на кэш/builtin — это лишняя задержка
+# при открытии региона.
+#
+# Флаг REGIONS_API_ENABLED=1 (env-переменная) можно установить, чтобы
+# вернуть прежнее поведение (API → кэш → builtin). Как только API ГИБДД
+# снова заработает — достаточно выставить эту env-переменную, удалять
+# код не нужно.
+REGIONS_API_ENABLED: bool = os.getenv("REGIONS_API_ENABLED", "").strip() in (
+    "1", "true", "True", "TRUE", "yes",
+)
 
 
 # ========================
@@ -93,7 +111,11 @@ async def ensure_regions_loaded() -> list[dict[str, str]]:
 
     Порядок:
       1. Модульный кэш (переменная _regions_cache)
-      2. API ГИБДД (при успехе — сохраняет в файловый кэш)
+      2. API ГИБДД (при успехе — сохраняет в файловый кэш) — ТОЛЬКО если
+         REGIONS_API_ENABLED=1. По умолчанию API пропускается, потому что
+         он уже долгое время недоступен (таймаут + fallback = лишняя задержка
+         при открытии мини-аппа). Код API сохранён — как только ГИБДД
+         починят, выставьте env-переменную REGIONS_API_ENABLED=1.
       3. Файловый кэш (data/regions_cache.json)
       4. Встроенный справочник (regions_builtin.BUILTIN_REGIONS)
     """
@@ -101,27 +123,40 @@ async def ensure_regions_loaded() -> list[dict[str, str]]:
     if _regions_cache is not None:
         return _regions_cache
 
-    from api_client import fetch_regions
-    from regions_cache import save_regions_to_cache, load_regions_from_cache
+    from regions_cache import load_regions_from_cache
 
-    # --- Пытаемся загрузить с API ---
-    try:
-        _regions_cache = await fetch_regions()
-        logger.info(f"Справочник регионов загружен: {len(_regions_cache)} записей")
-        # Сохраняем в файловый кэш для будущих запусков
-        if _regions_cache:
-            save_regions_to_cache(_regions_cache)
-        return _regions_cache
-    except Exception as e:
-        logger.error(f"Не удалось загрузить справочник регионов: {e}")
+    # --- Шаг API (только если REGIONS_API_ENABLED=1) ---
+    # По умолчанию пропускается — API ГИБДД недоступен уже давно.
+    if REGIONS_API_ENABLED:
+        from api_client import fetch_regions
+        from regions_cache import save_regions_to_cache
+
+        try:
+            _regions_cache = await fetch_regions()
+            logger.info(
+                f"Справочник регионов загружен из API: "
+                f"{len(_regions_cache)} записей"
+            )
+            # Сохраняем в файловый кэш для будущих запусков
+            if _regions_cache:
+                save_regions_to_cache(_regions_cache)
+            return _regions_cache
+        except Exception as e:
+            logger.error(f"Не удалось загрузить справочник регионов из API: {e}")
+    else:
+        logger.info(
+            "Справочник регионов: API ГИБДД пропущен "
+            "(REGIONS_API_ENABLED не установлен) — сразу файловый кэш / builtin. "
+            "Чтобы включить API, выставьте env REGIONS_API_ENABLED=1."
+        )
 
     # --- Fallback 1: файловый кэш ---
-    logger.info("Попытка загрузить справочник регионов из файлового кэша...")
     cached = load_regions_from_cache()
     if cached:
         _regions_cache = cached
-        logger.warning(
-            f"API недоступен, использован файловый кэш: {len(cached)} записей"
+        logger.info(
+            f"Справочник регионов загружен из файлового кэша: "
+            f"{len(cached)} записей"
         )
         return _regions_cache
 
@@ -129,8 +164,8 @@ async def ensure_regions_loaded() -> list[dict[str, str]]:
     from regions_builtin import BUILTIN_REGIONS
     if BUILTIN_REGIONS:
         _regions_cache = list(BUILTIN_REGIONS)  # копия
-        logger.warning(
-            f"API и кэш недоступны, использован встроенный справочник: "
+        logger.info(
+            f"Справочник регионов: использован встроенный справочник: "
             f"{len(_regions_cache)} записей"
         )
         return _regions_cache
