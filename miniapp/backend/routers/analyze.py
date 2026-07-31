@@ -108,7 +108,8 @@ class ClusterItem(BaseModel):
     total_accidents: int
     deaths: int
     injured: int
-    dominant_type: str
+    # None означает "смешанный тип" — 5+ ДТП разных видов без явного доминанта
+    dominant_type: Optional[str] = None
     type_counter: Dict[str, int]
     center: Optional[Dict[str, float]] = None
     start_pos: Optional[float] = None
