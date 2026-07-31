@@ -126,6 +126,11 @@ class Task:
     # Полные объекты очагов (с cards внутри) — не проходят через JSON-API,
     # но нужны для generate_cluster_map() и generate_concentration_dynamics_file()
     raw_clusters: List[Dict[str, Any]] = field(default_factory=list)
+    # Полные объекты предочагов — сохраняются ОТДЕЛЬНО, потому что
+    # предочаги могут существовать даже когда очагов нет (малые регионы).
+    # Ранее предочаги прикреплялись к clusters[0]["_preclusters"] и терялись
+    # при пустом списке очагов — это приводило к пустой карте и 500 в Excel.
+    raw_preclusters: List[Dict[str, Any]] = field(default_factory=list)
     # Полные карточки последнего point stats запроса (с _dist_m) — для Excel
     last_point_cards_current: List[Dict[str, Any]] = field(default_factory=list)
     last_point_cards_prev: List[Dict[str, Any]] = field(default_factory=list)
@@ -787,7 +792,7 @@ async def start_clusters_calculation(task: Task) -> None:
         state.progress = 20
         state.stage = "Загрузка границ НП из OpenStreetMap..."
 
-        clusters, _saved_polys = await conc_module.calculate_concentration_dynamics(
+        clusters, _saved_polys, preclusters_raw = await conc_module.calculate_concentration_dynamics(
             current_cards=task.cards,
             prev_cards=prev_cards,
             progress_callback=progress_cb,
@@ -840,13 +845,12 @@ async def start_clusters_calculation(task: Task) -> None:
             if status in dynamics_summary:
                 dynamics_summary[status] += 1
 
-        # Предочаги
-        preclusters = []
-        if clusters and clusters[0].get("_preclusters"):
-            preclusters = [
-                _serialize_cluster(p)
-                for p in clusters[0]["_preclusters"]
-            ]
+        # Предочаги — приходят отдельно от calculate_concentration_dynamics,
+        # чтобы они не терялись, когда очагов нет (малые регионы).
+        preclusters_raw = preclusters_raw or []
+        # Backward-compat: предочаги всё ещё прикреплены к clusters[0]["_preclusters"]
+        # когда clusters непустой (см. concentration_points.py).
+        preclusters = [_serialize_cluster(p) for p in preclusters_raw]
 
         result = {
             "total_clusters": len(current_only),
@@ -874,6 +878,9 @@ async def start_clusters_calculation(task: Task) -> None:
         state.result = result
         # Сохраняем raw очаги (с cards) для Excel-выгрузки и продвинутой карты
         task.raw_clusters = clusters
+        # Сохраняем raw предочаги отдельно — на случай, когда очагов нет,
+        # но предочаги есть (нужно для Excel и карты)
+        task.raw_preclusters = preclusters_raw
         state.status = AnalysisStatus.DONE
         state.progress = 100
         state.stage = "Готово"
@@ -937,21 +944,32 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
 
         # Raw очаги с cards внутри (сохранены в start_clusters_calculation)
         raw_clusters = task.raw_clusters or []
+        # Raw предочаги (сохранены отдельно — могут быть, даже если очагов нет)
+        raw_preclusters = task.raw_preclusters or []
         if not raw_clusters:
-            # Fallback на старую реализацию, если raw по какой-то причине нет
-            logger.warning(
-                f"Task {task.id}: raw_clusters empty, fallback to simple map"
-            )
+            # Если очагов нет, но есть предочаги — показываем простую карту
+            # с предочагами (а не «нет данных»). Если нет ни того, ни другого —
+            # простая карта покажет заглушку.
+            if not raw_preclusters:
+                logger.warning(
+                    f"Task {task.id}: raw_clusters and raw_preclusters empty, "
+                    f"fallback to simple map"
+                )
+            else:
+                logger.info(
+                    f"Task {task.id}: raw_clusters empty, "
+                    f"showing {len(raw_preclusters)} preclusters on simple map"
+                )
             return _build_clusters_map_html(task)
 
         # Разделяем: текущие очаги + исчезнувшие (отдельно)
         current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
         lost_clusters = [c for c in raw_clusters if c.get("_is_lost", False)]
 
-        # Предочаги — сохранены в clusters[0]["_preclusters"]
-        preclusters = []
-        if raw_clusters and raw_clusters[0].get("_preclusters"):
-            preclusters = raw_clusters[0]["_preclusters"]
+        # Предочаги — из отдельного поля task.raw_preclusters
+        # (раньше брались из raw_clusters[0]["_preclusters"], что ломалось
+        # при пустом списке очагов)
+        preclusters = raw_preclusters
 
         # Камеры (если есть в кэше)
         cameras = []
@@ -1161,19 +1179,20 @@ async def generate_clusters_excel(task: Task) -> Optional[bytes]:
 
     Использует excel_generator.generate_concentration_dynamics_file() из бота.
     """
-    if not task.raw_clusters:
+    if not task.raw_clusters and not task.raw_preclusters:
+        # Нет ни очагов, ни предочагов — выгружать нечего
         return None
 
     try:
         conc_module = _import_module("concentration_points")
         excel_module = _import_module("excel_generator")
 
-        raw_clusters = task.raw_clusters
+        raw_clusters = task.raw_clusters or []
+        raw_preclusters = task.raw_preclusters or []
         current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
-        preclusters = (
-            raw_clusters[0].get("_preclusters", [])
-            if raw_clusters else []
-        )
+        # Предочаги — из отдельного поля (раньше raw_clusters[0]["_preclusters"],
+        # что ломалось при пустом списке очагов)
+        preclusters = raw_preclusters
 
         # Лист 1: очаги текущего года
         current_data = conc_module.build_concentration_excel_data(current_only)
