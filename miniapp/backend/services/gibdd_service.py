@@ -1022,15 +1022,23 @@ def _build_clusters_map_html(task: Task) -> str:
     clusters = result.get("clusters", [])
     preclusters = result.get("preclusters", [])
 
-    # Leaflet-карта
-    markers_js = []
+    # Разделяем текущие и исчезнувшие очаги по dynamics.status == 'lost'
+    # Исчезнувшие рисуем светло-серым (#c0c0c0) в отдельном слое,
+    # который можно отключить через layer control.
+    current_clusters = []
+    lost_clusters = []
     for c in clusters:
+        if c.get("dynamics", {}).get("status") == "lost":
+            lost_clusters.append(c)
+        else:
+            current_clusters.append(c)
+
+    # Leaflet-карта
+    def _build_marker_js(c: dict, color: str, layer_var: str) -> str:
         center = c.get("center")
         if not center:
-            continue
+            return ""
         lat, lon = center["lat"], center["lon"]
-        is_lost = c.get("dynamics", {}).get("status") == "lost"
-        color = "#ff3b30" if is_lost else _color_for_severity(c)
         road = (c.get("road") or "Не указана").replace("'", "\\'")
         total = c.get("total_accidents", 0)
         deaths = c.get("deaths", 0)
@@ -1042,12 +1050,23 @@ def _build_clusters_map_html(task: Task) -> str:
             f"Тип: {zone}"
         ).replace('"', "&quot;")
         radius = max(8, min(30, total * 2))
-        markers_js.append(
+        return (
             f"L.circleMarker([{lat}, {lon}], "
             f"{{radius: {radius}, color: '{color}', "
             f"fillColor: '{color}', fillOpacity: 0.6}})"
-            f".addTo(map).bindPopup(\"{popup_html}\");"
+            f".addTo({layer_var}).bindPopup(\"{popup_html}\");"
         )
+
+    markers_js = []
+    # Слои: current — обычные цвета по тяжести, lost — серый
+    # Layer groups позволяют включать/выключать исчезнувшие через UI Leaflet
+    markers_js.append("var currentLayer = L.layerGroup().addTo(map);")
+    markers_js.append("var lostLayer = L.layerGroup().addTo(map);")
+    for c in current_clusters:
+        markers_js.append(_build_marker_js(c, _color_for_severity(c), "currentLayer"))
+    for c in lost_clusters:
+        # Исчезнувшие — светло-серый цвет, чтобы визуально отделить от активных очагов
+        markers_js.append(_build_marker_js(c, "#c0c0c0", "lostLayer"))
 
     for p in preclusters:
         center = p.get("center")
@@ -1098,7 +1117,7 @@ html, body, #map {{ margin: 0; padding: 0; height: 100%; width: 100%; }}
 <body>
 <div id="map"></div>
 <div class="legend">
-<div class="legend-item"><span class="legend-dot" style="background:#ff3b30"></span>Исчезнувший</div>
+<div class="legend-item"><span class="legend-dot" style="background:#c0c0c0;border:2px dashed #9e9e9e;"></span>Исчезнувший очаг</div>
 <div class="legend-item"><span class="legend-dot" style="background:#2481cc"></span>Очаг (низкая тяжесть)</div>
 <div class="legend-item"><span class="legend-dot" style="background:#ff9500"></span>Очаг (высокая тяжесть)</div>
 <div class="legend-item"><span class="legend-dot" style="background:#34c759;opacity:0.5"></span>Предочаг</div>
@@ -1109,6 +1128,10 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
   maxZoom: 18, attribution: '&copy; OpenStreetMap'
 }}).addTo(map);
 {chr(10).join(markers_js)}
+L.control.layers({{}}, {{
+  "Текущие очаги": currentLayer,
+  "Исчезнувшие очаги": lostLayer
+}}, {{collapsed: false}}).addTo(map);
 </script>
 </body>
 </html>"""
