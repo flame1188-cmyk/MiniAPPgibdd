@@ -2311,7 +2311,7 @@ async def _run_concentration_points(
             or context.user_data.get("analytics_reg_code", "")
             or context.user_data.get("concentration_reg_code", "")
         )
-        clusters, saved_polygons = await calculate_concentration_dynamics(
+        clusters, saved_polygons, _preclusters_dyn = await calculate_concentration_dynamics(
             current_cards,
             prev_cards,
             progress_callback=staged_progress,
@@ -2358,7 +2358,9 @@ async def _run_concentration_points(
             await progress_callback("\u23F3 [5/5] Генерация Excel-файла...")
 
         # --- Предочаги: извлекаем и обогащаем камерами ---
-        preclusters = clusters[0].get("_preclusters", []) if clusters else []
+        # Используем предочаги, возвращённые отдельно из calculate_concentration_dynamics,
+        # — раньше они терялись, когда clusters был пуст.
+        preclusters = _preclusters_dyn or []
         if preclusters and cameras:
             enrich_clusters_with_cameras(preclusters, cameras)
 

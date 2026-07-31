@@ -3040,9 +3040,16 @@ async def calculate_concentration_dynamics(
     progress_callback: Callable[[str], Awaitable[None]] | None = None,
     settlement_polygons: list[Polygon | MultiPolygon] | None = None,
     reg_code: str | None = None,
-) -> tuple[list[dict], list[Polygon | MultiPolygon] | None]:
+) -> tuple[list[dict], list[Polygon | MultiPolygon] | None, list[dict]]:
     """
     Рассчитывает очаги для двух периодов и определяет динамику каждого.
+
+    Возвращает кортеж ``(clusters, settlement_polygons, preclusters)``.
+    Третий элемент — список предочагов текущего периода. ВАЖНО: предочаги
+    возвращаются отдельно, потому что они существуют даже когда очагов нет
+    (например, в небольших регионах с малым числом ДТП). Ранее предочаги
+    прикреплялись к ``clusters[0]["_preclusters"]`` — но при пустом списке
+    очагов они терялись.
 
     Границы НП загружаются из OSM **один раз** по объединённому bbox
     обоих периодов — это сокращает нагрузку на Overpass API в 2 раза.
@@ -3139,10 +3146,11 @@ async def calculate_concentration_dynamics(
             f"Динамика: нет данных за прошлый год, "
             f"{len(current_clusters)} очагов помечены как новые"
         )
-        # Сохраняем предочаги в поле текущих очагов для передачи наверх
+        # Backward-compat: предочаги в clusters[0]["_preclusters"] (если очаги есть)
         if current_clusters:
             current_clusters[0]["_preclusters"] = current_preclusters
-        return current_clusters, settlement_polygons
+        # ВАЖНО: предочаги возвращаются отдельно — даже когда очагов нет
+        return current_clusters, settlement_polygons, current_preclusters
 
     # --- Очаги прошлого периода (те же полигоны!) ---
     if progress_callback:
@@ -3171,7 +3179,8 @@ async def calculate_concentration_dynamics(
         )
         if current_clusters:
             current_clusters[0]["_preclusters"] = current_preclusters
-        return current_clusters, settlement_polygons
+        # ВАЖНО: предочаги возвращаются отдельно — даже когда очагов нет
+        return current_clusters, settlement_polygons, current_preclusters
 
     # --- Сопоставление ---
     if progress_callback:
@@ -3245,11 +3254,11 @@ async def calculate_concentration_dynamics(
         f"всего={len(current_clusters)}"
     )
 
-    # Сохраняем предочаги текущего периода для передачи наверх
+    # Backward-compat: предочаги в clusters[0]["_preclusters"] (если очаги есть)
     if current_clusters:
         current_clusters[0]["_preclusters"] = current_preclusters
-
-    return current_clusters, settlement_polygons
+    # ВАЖНО: предочаги возвращаются отдельно — даже когда очагов нет
+    return current_clusters, settlement_polygons, current_preclusters
 
 
 # ========================
