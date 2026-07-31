@@ -946,21 +946,21 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
         raw_clusters = task.raw_clusters or []
         # Raw предочаги (сохранены отдельно — могут быть, даже если очагов нет)
         raw_preclusters = task.raw_preclusters or []
-        if not raw_clusters:
-            # Если очагов нет, но есть предочаги — показываем простую карту
-            # с предочагами (а не «нет данных»). Если нет ни того, ни другого —
-            # простая карта покажет заглушку.
-            if not raw_preclusters:
-                logger.warning(
-                    f"Task {task.id}: raw_clusters and raw_preclusters empty, "
-                    f"fallback to simple map"
-                )
-            else:
-                logger.info(
-                    f"Task {task.id}: raw_clusters empty, "
-                    f"showing {len(raw_preclusters)} preclusters on simple map"
-                )
+        if not raw_clusters and not raw_preclusters:
+            # Нет ни очагов, ни предочагов — простая карта покажет заглушку
+            logger.warning(
+                f"Task {task.id}: raw_clusters and raw_preclusters empty, "
+                f"fallback to simple map"
+            )
             return _build_clusters_map_html(task)
+
+        # Если есть хотя бы что-то одно (очаги или предочаги) —
+        # используем продвинутую карту через ReportGenerator.
+        # Раньше при пустом raw_clusters всегда включался fallback на простую
+        # карту — это приводило к тому, что для малых регионов (например,
+        # Севастополь с 0 очагов и 8 предочагами) показывалась простая карта
+        # без слоёв, попапов, линейки и т.д. ReportGenerator.generate_cluster_map
+        # умеет работать с пустым списком clusters и непустыми preclusters.
 
         # Разделяем: текущие очаги + исчезнувшие (отдельно)
         current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
