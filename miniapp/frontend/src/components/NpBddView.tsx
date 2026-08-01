@@ -1,5 +1,5 @@
 /**
- * NpBddView — вкладка «НП БДД» (Национальный проект «Безопасные дорожные движения»).
+ * NpBddView — вкладка «НП БДД» (Национальный проект «Безопасные качественные дороги»).
  *
  * Показывает:
  *  1. Селектор региона + переключатель linear/horizontal для линии плана.
@@ -39,6 +39,35 @@ const STATUS_LABELS: Record<string, string> = {
   ok: 'Выполняется',
   warning: 'На грани',
   danger: 'Угроза срыва',
+}
+
+// Описание методик прогноза для выпадающего списка и информационной панели.
+// forecast_method (значение в API) → { label, description }
+const FORECAST_METHOD_INFO: Record<NpBddForecastMethod, {
+  label: string
+  short: string
+  description: string
+  formula: string
+}> = {
+  central_only: {
+    label: 'Центр (текущий метод)',
+    short: 'Центр',
+    description:
+      'Прогноз на конец года = deaths_ytd / avg(cum_share[current_month]). ' +
+      'Использует среднюю кумулятивную долю текущего месяца по истории региона ' +
+      '(per-region профиль, при отсутствии — global). Одна линия прогноза, без коридора.',
+    formula: 'прогноз = YTD / средн(cum_share[мес])',
+  },
+  corridor: {
+    label: 'Коридор (min/max per-year)',
+    short: 'Коридор',
+    description:
+      'Центральная линия = текущий метод. Оптимистичная = YTD / max(cum_share_Y[мес]) ' +
+      'по историческим годам (самая «передняя» сезонность → меньший остаток). ' +
+      'Пессимистичная = YTD / min(cum_share_Y[мес]) (самая «задняя» сезонность → больший остаток). ' +
+      'Коридор сужается к декабрю. Требует ≥ 2 лет истории, иначе отключается.',
+    formula: 'оптимист = YTD / max(cum_share_Y[мес])  •  пессимист = YTD / min(cum_share_Y[мес])',
+  },
 }
 
 interface NpBddViewProps {
@@ -162,15 +191,6 @@ export function NpBddView(_: NpBddViewProps = {}) {
     })
   }
 
-  const handleToggleForecastMethod = () => {
-    const newMethod: NpBddForecastMethod =
-      forecastMethod === 'central_only' ? 'corridor' : 'central_only'
-    updateSettingsMutation.mutate({
-      plan_line_mode: planLineMode,
-      forecast_method: newMethod,
-    })
-  }
-
   const handleFreeze = async (year: number) => {
     const ok = await showConfirm(
       `Заморозить ${year} год?\n\nПосле заморозки данные за этот год не будут пересчитываться. ` +
@@ -212,9 +232,18 @@ export function NpBddView(_: NpBddViewProps = {}) {
   }, [dataQuery.data])
 
   // График 2: кумулятивный Тр по месяцам.
+  //
+  // ВАЖНО: чтобы линии прогноза/коридора шли ОТ последней фактической точки
+  // (без разрыва), мы дублируем последнее фактическое значение в первый
+  // прогнозный месяц для всех линий прогноза (forecast / optimistic /
+  // pessimistic). Тогда recharts соединит их в одну непрерывную линию.
   const chart2Data = useMemo(() => {
     if (!dataQuery.data) return []
     const mc = dataQuery.data.current_year.monthly_chart
+    const lastActualMonth = mc.current_month
+    const lastActualKey = String(lastActualMonth)
+    const lastActualValue = mc.tr_actual_cumulative?.[lastActualKey]
+
     return mc.months.map((m) => {
       const key = String(m)
       const actual = mc.tr_actual_cumulative[key]
@@ -222,13 +251,25 @@ export function NpBddView(_: NpBddViewProps = {}) {
       const optimistic = mc.tr_optimistic_cumulative?.[key]
       const pessimistic = mc.tr_pessimistic_cumulative?.[key]
       const plan = mc.plan_cumulative[key]
+
+      // Для первого прогнозного месяца (m === lastActualMonth + 1) подставляем
+      // последнее фактическое значение во все прогнозные линии — это точка
+      // «состыковки», чтобы линия прогноза выходила из конца линии факта.
+      const isJointPoint = m === lastActualMonth + 1 && lastActualValue !== undefined
+
       return {
         month: MONTH_SHORT[m - 1] || `М${m}`,
         // Используем null для отсутствующих значений (recharts пропустит их)
         fact: actual !== undefined ? actual : null,
-        forecast: forecast !== undefined ? forecast : null,
-        optimistic: optimistic !== undefined ? optimistic : null,
-        pessimistic: pessimistic !== undefined ? pessimistic : null,
+        forecast: forecast !== undefined
+          ? forecast
+          : (isJointPoint ? lastActualValue! : null),
+        optimistic: optimistic !== undefined
+          ? optimistic
+          : (isJointPoint ? lastActualValue! : null),
+        pessimistic: pessimistic !== undefined
+          ? pessimistic
+          : (isJointPoint ? lastActualValue! : null),
         plan,
       }
     })
@@ -261,7 +302,7 @@ export function NpBddView(_: NpBddViewProps = {}) {
         <h2 className="text-lg font-semibold mb-1">НП БДД</h2>
         <p className="text-sm text-tg-hint">
           Мониторинг показателя Тр (погибших на 10 000 ТС) в рамках
-          национального проекта «Безопасные дорожные движения».
+          национального проекта «Безопасные качественные дороги».
         </p>
       </div>
 
@@ -298,22 +339,42 @@ export function NpBddView(_: NpBddViewProps = {}) {
           </button>
         </div>
 
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="tg-section-header text-xs">Метод прогноза (график 2)</div>
-            <div className="text-sm text-tg-hint mt-0.5">
-              {forecastMethod === 'corridor'
-                ? 'Коридор: центр + оптимистичный/пессимистичный (min/max по 3 годам)'
-                : 'Одна линия прогноза (текущий метод)'}
-            </div>
-          </div>
-          <button
-            className="tg-button !py-2 !px-3 text-sm"
-            onClick={handleToggleForecastMethod}
+        <div className="space-y-1">
+          <div className="tg-section-header text-xs">Метод прогноза (график 2)</div>
+          <select
+            className="tg-input w-full !py-2 text-sm"
+            value={forecastMethod}
+            onChange={(e) => {
+              haptic('light')
+              const newMethod = e.target.value as NpBddForecastMethod
+              updateSettingsMutation.mutate({
+                plan_line_mode: planLineMode,
+                forecast_method: newMethod,
+              })
+            }}
             disabled={updateSettingsMutation.isPending}
           >
-            {forecastMethod === 'corridor' ? 'Коридор' : 'Центр'}
-          </button>
+            {(Object.keys(FORECAST_METHOD_INFO) as NpBddForecastMethod[]).map((method) => (
+              <option key={method} value={method}>
+                {FORECAST_METHOD_INFO[method].label}
+              </option>
+            ))}
+          </select>
+          <div className="text-xs text-tg-hint mt-1 leading-snug">
+            <span className="font-medium">
+              {FORECAST_METHOD_INFO[forecastMethod].label}:
+            </span>{' '}
+            {FORECAST_METHOD_INFO[forecastMethod].description}
+          </div>
+          <div className="text-xs text-tg-hint mt-1 font-mono bg-tg-secondary-bg px-2 py-1 rounded">
+            {FORECAST_METHOD_INFO[forecastMethod].formula}
+          </div>
+          {forecastMethod === 'corridor' && dataQuery.data && !dataQuery.data.corridor_available && (
+            <div className="text-xs text-yellow-600 dark:text-yellow-400 mt-1">
+              ⚠ Коридор недоступен для этого региона (нужно ≥ 2 лет истории).
+              Используется центральная линия.
+            </div>
+          )}
         </div>
       </div>
 
