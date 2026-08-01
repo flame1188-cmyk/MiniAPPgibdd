@@ -116,7 +116,8 @@ export function initTelegram(): void {
 
   // Сигналим Telegram, что приложение готово к отображению
   wa.ready()
-  // Разворачиваем на весь экран (доступно на всех платформах)
+  // Разворачиваем на максимально доступную высоту (maximized, не fullscreen).
+  // Это аналог «Развернуть» в браузере — панель задач остаётся видимой.
   wa.expand()
   // Запрашиваем подтверждение перед закрытием (если есть активная задача)
   // wa.enableClosingConfirmation()
@@ -131,28 +132,10 @@ export function initTelegram(): void {
     // Метод доступен не на всех версиях SDK
   }
 
-  // Пробуем перейти в полноэкранный режим (SDK 8.0+, Telegram Desktop 5.x+).
-  // На десктопе обычно срабатывает сразу при загрузке.
-  // На iOS/Android иногда требует user gesture — для этого случая
-  // в UI есть кнопка «Развернуть» (см. App.tsx).
-  try {
-    if (isFullscreenSupported() && !isFullscreenActive()) {
-      const p = wa.requestFullscreen?.()
-      // Если вернулся Promise — ловим ошибки тихо (кнопка-фолбэк сработает)
-      if (p && typeof p.catch === 'function') {
-        p.catch((err: unknown) => {
-          console.warn(
-            '[telegram] requestFullscreen() не сработал при загрузке. ' +
-            'Пользователь может развернуть вручную кнопкой в шапке.',
-            err
-          )
-        })
-      }
-    }
-  } catch (err) {
-    // На старых клиентах метод может отсутствовать — игнорируем
-    console.warn('[telegram] requestFullscreen error:', err)
-  }
+  // ВАЖНО: настоящий fullscreen (requestFullscreen) НЕ вызываем автоматически
+  // при загрузке — он прячет панель задач и системные элементы управления,
+  // что неудобно для десктопа. Пользователь может включить его кнопкой
+  // «⛶ Развернуть» в шапке приложения, если нужен режим «кино/презентация».
 
   initialized = true
   console.info(
