@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from ..services.np_bdd_service import (
     freeze_year as svc_freeze_year,
     get_data as svc_get_data,
+    get_debug_info as svc_get_debug_info,
     get_settings as svc_get_settings,
     list_frozen_years as svc_list_frozen_years,
     list_regions as svc_list_regions,
@@ -157,3 +158,17 @@ async def unfreeze_year_endpoint(
 ):
     """Разморозить год для региона."""
     return await svc_unfreeze_year(payload.region_code, payload.year)
+
+
+# --- Диагностический эндпоинт (без авторизации) ---------------------------
+# Временный эндпоинт для отладки проблемы «Нет данных по регионам».
+# Можно удалить после настройки. Возвращает пути и наличие файлов.
+
+@router.get("/_debug")
+async def debug_info():
+    """
+    Диагностика: показывает NPBDD_ROOT, кандидатов путей, наличие файлов
+    data/vehicles/, data/plans/ и т.д.
+    Без авторизации — для удобства отладки на сервере.
+    """
+    return svc_get_debug_info()
