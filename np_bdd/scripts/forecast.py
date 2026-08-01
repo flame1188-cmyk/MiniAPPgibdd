@@ -83,7 +83,7 @@ TODAY = date.today()
 # Если per-year истории нет (только global/uniform) — коридор не строится,
 # возвращаются None, центр = avg.
 ForecastMethod = Literal["central_only", "corridor"]
-DEFAULT_FORECAST_METHOD: ForecastMethod = "central_only"
+DEFAULT_FORECAST_METHOD: ForecastMethod = "corridor"
 
 
 # --- Сезонные коэффициенты (per-region с фолбэком на global) ------------------
@@ -422,14 +422,17 @@ def build_monthly_cumulative_tr(
 
     # Фактические месяцы: считаем кумулятивный Тр нарастающим итогом.
     tr_actual_cum: dict[str, float] = {}
+    deaths_actual_cum: dict[str, int] = {}
     deaths_cum = 0
     for m in range(1, current_month + 1):
         deaths_cum += int(deaths_by_month_actual.get(str(m), 0))
+        deaths_actual_cum[str(m)] = deaths_cum
         tr_actual_cum[str(m)] = round((deaths_cum * 10000) / vehicles_year, 3)
 
     # Прогнозные месяцы: если forecast_full_year задан, распределить
     # остаток по seasonal_share оставшихся месяцев.
     tr_forecast_cum: dict[str, float] = {}
+    deaths_forecast_cum: dict[str, int] = {}
     if current_month < 12 and deaths_forecast_full_year > 0:
         # Сколько погибших "уже в факте".
         deaths_actual_total = sum(
@@ -461,6 +464,7 @@ def build_monthly_cumulative_tr(
         running_deaths = deaths_actual_total
         for m in range(current_month + 1, 13):
             running_deaths += remaining_breakdown[str(m)]
+            deaths_forecast_cum[str(m)] = int(round(running_deaths))
             tr_forecast_cum[str(m)] = round((running_deaths * 10000) / vehicles_year, 3)
 
     # --- Коридор (optimistic / pessimistic) --------------------------------
@@ -483,6 +487,8 @@ def build_monthly_cumulative_tr(
     # и tr_optimistic_cum[12] == tr_forecast_optimistic (согласованность с KPI).
     tr_optimistic_cum: dict[str, float] = {}
     tr_pessimistic_cum: dict[str, float] = {}
+    deaths_optimistic_cum: dict[str, int] = {}
+    deaths_pessimistic_cum: dict[str, int] = {}
     corridor_available = bool(corridor and corridor.get("available"))
     if (corridor_available
             and current_month < 12
@@ -531,6 +537,8 @@ def build_monthly_cumulative_tr(
                         frac_pess = 0.0
                     cum_deaths_opt = deaths_actual_total + deaths_remaining_opt * frac_opt
                     cum_deaths_pess = deaths_actual_total + deaths_remaining_pess * frac_pess
+                    deaths_optimistic_cum[str(m)] = int(round(cum_deaths_opt))
+                    deaths_pessimistic_cum[str(m)] = int(round(cum_deaths_pess))
                     tr_optimistic_cum[str(m)] = round(
                         (cum_deaths_opt * 10000) / vehicles_year, 3
                     )
@@ -552,6 +560,10 @@ def build_monthly_cumulative_tr(
         "tr_forecast_cumulative": tr_forecast_cum,
         "tr_optimistic_cumulative": tr_optimistic_cum,
         "tr_pessimistic_cumulative": tr_pessimistic_cum,
+        "deaths_actual_cumulative": deaths_actual_cum,
+        "deaths_forecast_cumulative": deaths_forecast_cum,
+        "deaths_optimistic_cumulative": deaths_optimistic_cum,
+        "deaths_pessimistic_cumulative": deaths_pessimistic_cum,
         "plan_cumulative": plan_cum,
         "current_month": current_month,
         "plan_line_mode": plan_line_mode,
