@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import analyze, cameras, dtp, parse, regions
+from .routers import analyze, cameras, dtp, np_bdd, parse, regions
 
 
 app = FastAPI(
@@ -28,6 +28,7 @@ app.include_router(parse.router)
 app.include_router(dtp.router)
 app.include_router(analyze.router)
 app.include_router(cameras.router)
+app.include_router(np_bdd.router)
 
 
 @app.get("/miniapp/health")

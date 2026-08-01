@@ -2,11 +2,14 @@
  * Главный компонент Mini App.
  *
  * Layout:
- *  - Шапка с приветствием пользователя (имя из Telegram)
- *  - Форма запроса
- *  - Прогресс активной задачи (если есть)
- *  - Результаты (карта, аналитика, файлы) — когда задача выполнена
- *  - История последних запросов
+ *  - Шапка с переключателем вкладок: «ДТП» / «НП БДД»
+ *  - Вкладка «ДТП»:
+ *      - Форма запроса
+ *      - Прогресс активной задачи
+ *      - Результаты (карта, аналитика, файлы)
+ *      - История последних запросов
+ *  - Вкладка «НП БДД»:
+ *      - NpBddView (KPI + 2 графика + заморозка)
  */
 import { useState } from 'react'
 import { StructuredForm } from '@/components/StructuredForm'
@@ -14,7 +17,9 @@ import { CamerasWidget } from '@/components/CamerasWidget'
 import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
+import { NpBddView } from '@/components/NpBddView'
 import { useTaskPolling } from '@/hooks/useTaskPolling'
+import { haptic } from '@/lib/telegram'
 import {
   getCurrentUser,
   getContainerMaxWidth,
@@ -22,8 +27,11 @@ import {
   isTelegramDesktop,
 } from '@/lib/telegram'
 
+type Tab = 'dtp' | 'np-bdd'
+
 export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
+  const [tab, setTab] = useState<Tab>('dtp')
 
   const { data: task, isError } = useTaskPolling(activeTaskId)
 
@@ -35,6 +43,13 @@ export default function App() {
   const handleSelectTask = (taskId: string) => {
     setActiveTaskId(taskId)
     // Прокрутка вверх при выборе задачи из истории
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  const handleTabChange = (newTab: Tab) => {
+    if (newTab === tab) return
+    haptic('light')
+    setTab(newTab)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
@@ -55,8 +70,32 @@ export default function App() {
           )}
         </header>
 
+        {/* Переключатель вкладок */}
+        <div className="flex gap-1 p-1 rounded-xl bg-tg-secondary-bg">
+          <button
+            className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
+              tab === 'dtp'
+                ? 'bg-tg-section-bg text-tg-text shadow-sm'
+                : 'text-tg-hint'
+            }`}
+            onClick={() => handleTabChange('dtp')}
+          >
+            ДТП
+          </button>
+          <button
+            className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
+              tab === 'np-bdd'
+                ? 'bg-tg-section-bg text-tg-text shadow-sm'
+                : 'text-tg-hint'
+            }`}
+            onClick={() => handleTabChange('np-bdd')}
+          >
+            НП БДД
+          </button>
+        </div>
+
         {/* Подсказка для desktop-пользователей */}
-        {isDesktop && (
+        {isDesktop && tab === 'dtp' && (
           <div
             className="rounded-xl p-2.5 text-xs"
             style={{
@@ -83,49 +122,57 @@ export default function App() {
           </div>
         )}
 
-        {/* Форма запроса */}
-        <StructuredForm onTaskCreated={setActiveTaskId} />
-
-        {/* Загрузка камер фотовидеофиксации */}
-        <CamerasWidget />
-
-        {/* Активная задача */}
-        {activeTaskId && task && (
+        {/* --- Вкладка «ДТП» --- */}
+        {tab === 'dtp' && (
           <>
-            {task.status !== 'done' && task.status !== 'failed' && (
-              <ProgressIndicator task={task} />
+            {/* Форма запроса */}
+            <StructuredForm onTaskCreated={setActiveTaskId} />
+
+            {/* Загрузка камер фотовидеофиксации */}
+            <CamerasWidget />
+
+            {/* Активная задача */}
+            {activeTaskId && task && (
+              <>
+                {task.status !== 'done' && task.status !== 'failed' && (
+                  <ProgressIndicator task={task} />
+                )}
+
+                {task.status === 'done' && <ResultsPanel task={task} />}
+
+                {task.status === 'failed' && (
+                  <div
+                    className="tg-card"
+                    style={{
+                      color: 'var(--tg-color-destructive, #ff3b30)',
+                    }}
+                  >
+                    <div className="font-medium mb-1">Задача завершилась с ошибкой</div>
+                    <div className="text-xs opacity-80">
+                      {task.error ?? 'Неизвестная ошибка'}
+                    </div>
+                  </div>
+                )}
+
+                {isError && (
+                  <div className="tg-card text-center text-sm opacity-60">
+                    Не удалось получить статус задачи. Попробуйте обновить.
+                  </div>
+                )}
+              </>
             )}
 
-            {task.status === 'done' && <ResultsPanel task={task} />}
-
-            {task.status === 'failed' && (
-              <div
-                className="tg-card"
-                style={{
-                  color: 'var(--tg-color-destructive, #ff3b30)',
-                }}
-              >
-                <div className="font-medium mb-1">Задача завершилась с ошибкой</div>
-                <div className="text-xs opacity-80">
-                  {task.error ?? 'Неизвестная ошибка'}
-                </div>
-              </div>
-            )}
-
-            {isError && (
-              <div className="tg-card text-center text-sm opacity-60">
-                Не удалось получить статус задачи. Попробуйте обновить.
-              </div>
-            )}
+            {/* История */}
+            <HistoryList onSelectTask={handleSelectTask} />
           </>
         )}
 
-        {/* История */}
-        <HistoryList onSelectTask={handleSelectTask} />
+        {/* --- Вкладка «НП БДД» --- */}
+        {tab === 'np-bdd' && <NpBddView />}
 
         {/* Подвал */}
         <footer className="text-center text-xs opacity-40 pt-4">
-          GIBDD Stat Mini App · v0.1.0
+          GIBDD Stat Mini App · v0.2.0
         </footer>
       </div>
     </div>

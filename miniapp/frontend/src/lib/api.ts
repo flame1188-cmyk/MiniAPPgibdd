@@ -331,6 +331,77 @@ export interface QAHistoryItem {
 }
 
 // ============================================================
+// НП БДД (Национальный проект «Безопасные дорожные движения»)
+// ============================================================
+
+export interface NpBddRegion {
+  code: string
+  name: string
+}
+
+export interface NpBddYearRecord {
+  deaths: number
+  vehicles: number
+  tr: number
+  frozen?: boolean
+  frozen_at?: string
+  source?: string
+}
+
+export interface NpBddMonthlyChart {
+  months: number[]
+  tr_actual_cumulative: Record<string, number>
+  tr_forecast_cumulative: Record<string, number>
+  plan_cumulative: Record<string, number>
+  current_month: number
+  plan_line_mode: 'linear' | 'horizontal'
+}
+
+export interface NpBddCurrentYear {
+  year: number
+  months_actual: number[]
+  months_forecast: number[]
+  deaths_by_month_actual: Record<string, number>
+  deaths_ytd: number
+  deaths_forecast_full_year: number
+  tr_actual_ytd: number
+  tr_forecast_full_year: number
+  tr_plan: number
+  monthly_chart: NpBddMonthlyChart
+}
+
+export interface NpBddKpi {
+  tr_actual_ytd: number
+  tr_forecast_full_year: number
+  tr_plan: number
+  deviation_pct: number
+  status: 'ok' | 'warning' | 'danger'
+}
+
+export interface NpBddData {
+  region: { code: string; name: string }
+  history: Record<string, NpBddYearRecord>
+  current_year: NpBddCurrentYear
+  plan_series: Record<string, number>
+  kpi: NpBddKpi
+  calculated_at: string
+}
+
+export interface NpBddSettings {
+  plan_line_mode: 'linear' | 'horizontal'
+}
+
+export interface NpBddFrozenYear {
+  year: number
+  tr: number
+  deaths: number
+  vehicles: number
+  frozen_at?: string
+  frozen_by?: string
+  note?: string
+}
+
+// ============================================================
 // API methods
 // ============================================================
 export const api = {
@@ -486,4 +557,44 @@ export const api = {
 
   getQAHistory: (taskId: string) =>
     request<QAHistoryItem[]>(`/api/dtp/tasks/${taskId}/llm/qa-history`),
+
+  // ============================================================
+  // НП БДД
+  // ============================================================
+  npBddListRegions: () =>
+    request<NpBddRegion[]>('/api/np-bdd/regions'),
+
+  npBddGetData: (regionCode: string, planLineMode: 'linear' | 'horizontal' = 'linear') =>
+    request<NpBddData>(
+      `/api/np-bdd/data?region_code=${encodeURIComponent(regionCode)}` +
+      `&plan_line_mode=${planLineMode}`
+    ),
+
+  npBddGetSettings: (regionCode: string) =>
+    request<NpBddSettings>(
+      `/api/np-bdd/settings?region_code=${encodeURIComponent(regionCode)}`
+    ),
+
+  npBddUpdateSettings: (regionCode: string, planLineMode: 'linear' | 'horizontal') =>
+    request<NpBddSettings>('/api/np-bdd/settings', {
+      method: 'PATCH',
+      body: JSON.stringify({ region_code: regionCode, plan_line_mode: planLineMode }),
+    }),
+
+  npBddListFrozen: (regionCode: string) =>
+    request<NpBddFrozenYear[]>(
+      `/api/np-bdd/frozen?region_code=${encodeURIComponent(regionCode)}`
+    ),
+
+  npBddFreezeYear: (regionCode: string, year: number, note?: string) =>
+    request<{ ok: boolean; region_code: string; year: number; record: NpBddFrozenYear }>(
+      '/api/np-bdd/freeze',
+      { method: 'POST', body: JSON.stringify({ region_code: regionCode, year, note }) }
+    ),
+
+  npBddUnfreezeYear: (regionCode: string, year: number) =>
+    request<{ ok: boolean; region_code: string; year: number }>(
+      '/api/np-bdd/unfreeze',
+      { method: 'POST', body: JSON.stringify({ region_code: regionCode, year }) }
+    ),
 }
