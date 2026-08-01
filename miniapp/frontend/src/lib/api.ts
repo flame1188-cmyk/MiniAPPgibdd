@@ -355,6 +355,9 @@ export interface NpBddMonthlyChart {
   plan_cumulative: Record<string, number>
   current_month: number
   plan_line_mode: 'linear' | 'horizontal'
+  seasonal_source?: 'per-region' | 'global' | 'legacy' | 'uniform' | 'unknown'
+  seasonal_region_code?: string | null
+  seasonal_samples_used?: number
 }
 
 export interface NpBddCurrentYear {
@@ -378,12 +381,19 @@ export interface NpBddKpi {
   status: 'ok' | 'warning' | 'danger'
 }
 
+export interface NpBddSeasonalInfo {
+  source: 'per-region' | 'global' | 'legacy' | 'uniform' | 'unknown'
+  region_code: string | null
+  samples_used: number
+}
+
 export interface NpBddData {
   region: { code: string; name: string }
   history: Record<string, NpBddYearRecord>
   current_year: NpBddCurrentYear
   plan_series: Record<string, number>
   kpi: NpBddKpi
+  seasonal?: NpBddSeasonalInfo
   calculated_at: string
 }
 

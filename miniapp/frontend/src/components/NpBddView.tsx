@@ -311,7 +311,7 @@ function NpBddContent({
   data, chart1Data, chart2Data, frozenYears,
   onFreeze, onUnfreeze, freezePending, unfreezePending,
 }: NpBddContentProps) {
-  const { kpi, region, current_year } = data
+  const { kpi, region, current_year, seasonal } = data
 
   // Замороженные годы как Set для быстрой проверки
   const frozenSet = useMemo(() => new Set(frozenYears.map((f) => f.year)), [frozenYears])
@@ -323,6 +323,21 @@ function NpBddContent({
     for (let y = 2023; y < currentYear; y++) years.push(y)
     return years
   }, [current_year.year])
+
+  // Человекочитаемая подпись источника сезонности.
+  const seasonalHint = useMemo(() => {
+    if (!seasonal) return undefined
+    if (seasonal.source === 'per-region') {
+      return `Per-region профиль (${seasonal.samples_used} года истории)`
+    }
+    if (seasonal.source === 'global') {
+      return `Глобальный профиль (${seasonal.samples_used} регион-лет)`
+    }
+    if (seasonal.source === 'uniform') {
+      return 'Uniform 1/12 (нет истории)'
+    }
+    return undefined
+  }, [seasonal])
 
   return (
     <>
@@ -351,6 +366,13 @@ function NpBddContent({
           highlight={kpi.status}
         />
       </div>
+
+      {/* Подпись об источнике сезонности */}
+      {seasonalHint && (
+        <div className="text-xs opacity-60 -mt-1 mb-1 px-1">
+          📊 Сезонность: {seasonalHint}
+        </div>
+      )}
 
       {/* График 1: динамика 2023→2030 */}
       <div className="tg-card">
