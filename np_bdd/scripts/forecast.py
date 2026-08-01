@@ -70,6 +70,22 @@ MIN_SAMPLES_FOR_PER_REGION = 2
 TODAY = date.today()
 
 
+# --- Метод прогноза --------------------------------------------------------
+#
+# forecast_method = "central_only"  — текущий метод: deaths_ytd / avg(cum_share).
+#                                     Одна линия прогноза (без коридора).
+# forecast_method = "corridor"      — центр = текущий метод, плюс две границы
+#                                     (optimistic / pessimistic), построенные
+#                                     через min/max кумулятивных долей по
+#                                     историческим годам региона.
+#
+# Для "corridor" нужен per-year кумулятивный профиль (см. compute_per_year_cum_shares).
+# Если per-year истории нет (только global/uniform) — коридор не строится,
+# возвращаются None, центр = avg.
+ForecastMethod = Literal["central_only", "corridor"]
+DEFAULT_FORECAST_METHOD: ForecastMethod = "central_only"
+
+
 # --- Сезонные коэффициенты (per-region с фолбэком на global) ------------------
 
 
@@ -198,6 +214,162 @@ def forecast_full_year_deaths(deaths_ytd: int, current_month: int,
     return int(round(deaths_ytd / cum_share))
 
 
+# --- Per-year кумулятивные доли (для коридора прогноза) --------------------
+
+
+def compute_per_year_cum_shares(
+    region_code: str,
+) -> dict[str, dict[str, float]]:
+    """
+    Для каждого исторического года региона считает кумулятивную долю
+    по месяцам: cum_share_Y[m] = sum(deaths[1..m]) / sum(deaths[1..12]).
+
+    Используется для построения коридора прогноза:
+    - optimistic_forecast = deaths_ytd / max(cum_share_Y[current_month])
+    - pessimistic_forecast = deaths_ytd / min(cum_share_Y[current_month])
+
+    Returns:
+        {"2023": {"1": 0.125, "2": 0.250, ..., "12": 1.0},
+         "2024": {...}, "2025": {...}}
+
+        Пустой словарь, если:
+        - файла history/{region_code}.json нет
+        - ни одного года с deaths_by_month и total > 0
+    """
+    hist_file = DATA_HIST_DIR / f"{region_code}.json"
+    if not hist_file.exists():
+        return {}
+
+    try:
+        hist = json.loads(hist_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[forecast] Ошибка чтения {hist_file}: {exc}", file=sys.stderr)
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for year_str, rec in hist.get("years", {}).items():
+        dbm = rec.get("deaths_by_month")
+        if not dbm:
+            continue
+        # Сумма по 12 месяцам (берём именно sum(dbm), а не rec["deaths"],
+        # потому что rec["deaths"] может быть замороженным/внешним значением,
+        # а нам нужно распределение именно из deaths_by_month).
+        dbm_full = {str(m): int(dbm.get(str(m), 0)) for m in range(1, 13)}
+        total = sum(dbm_full.values())
+        if total <= 0:
+            continue
+        running = 0
+        cum = {}
+        for m in range(1, 13):
+            running += dbm_full[str(m)]
+            cum[str(m)] = round(running / total, 6)
+        result[year_str] = cum
+    return result
+
+
+def forecast_with_corridor(
+    deaths_ytd: int,
+    current_month: int,
+    region_code: str | None = None,
+    seasonal: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Возвращает прогноз с коридором неопределённости.
+
+    Логика:
+        central     = deaths_ytd / avg(cum_share_Y[current_month])
+                       (== текущий метод, avg = среднее по историческим годам)
+        optimistic  = deaths_ytd / max(cum_share_Y[current_month])
+                       (минимальный прогноз: в этом году самая «передняя»
+                       сезонность — много ДТП накопилось рано, значит остаток
+                       года будет относительно лёгким)
+        pessimistic = deaths_ytd / min(cum_share_Y[current_month])
+                       (максимальный прогноз: самая «задняя» сезонность —
+                       пик ещё впереди)
+
+    Если per-year истории нет (region_code=None или файл пустой) —
+    optimistic/pessimistic = None, возвращается только central.
+
+    Returns:
+        {
+            "central": int,
+            "optimistic": int | None,
+            "pessimistic": int | None,
+            "per_year_cum_at_current": {"2023": 0.510, "2024": 0.541, ...} | {},
+            "years_used": list[str],
+            "available": bool,  # True, если коридор посчитан
+        }
+    """
+    if current_month < 0 or current_month > 12:
+        raise ValueError(f"current_month must be 0..12, got {current_month}")
+    if current_month == 0 or current_month == 12 or deaths_ytd == 0:
+        # Года ещё нет или уже закончился — коридор не имеет смысла.
+        return {
+            "central": int(deaths_ytd),
+            "optimistic": None,
+            "pessimistic": None,
+            "per_year_cum_at_current": {},
+            "years_used": [],
+            "available": False,
+        }
+
+    if seasonal is None:
+        seasonal = load_seasonal_coefficients(region_code)
+
+    # Central = текущий метод (avg cum_share).
+    avg_cum = float(seasonal["cumulative_share"][str(current_month)])
+    if avg_cum <= 0:
+        central = int(deaths_ytd)
+    else:
+        central = int(round(deaths_ytd / avg_cum))
+
+    # Per-year cum_share — только если есть region_code.
+    per_year: dict[str, dict[str, float]] = (
+        compute_per_year_cum_shares(region_code) if region_code else {}
+    )
+    if not per_year:
+        return {
+            "central": central,
+            "optimistic": None,
+            "pessimistic": None,
+            "per_year_cum_at_current": {},
+            "years_used": [],
+            "available": False,
+        }
+
+    # Берём cum_share[current_month] для каждого года.
+    cum_at_current = {
+        year: float(cum[str(current_month)])
+        for year, cum in per_year.items()
+        if str(current_month) in cum and float(cum[str(current_month)]) > 0
+    }
+    if not cum_at_current:
+        # Все годы вернули 0 в этом месяце — не из чего строить коридор.
+        return {
+            "central": central,
+            "optimistic": None,
+            "pessimistic": None,
+            "per_year_cum_at_current": {},
+            "years_used": [],
+            "available": False,
+        }
+
+    max_cum = max(cum_at_current.values())  # самая «передняя» сезонность
+    min_cum = min(cum_at_current.values())  # самая «задняя» сезонность
+
+    optimistic = int(round(deaths_ytd / max_cum))  # минимальный прогноз
+    pessimistic = int(round(deaths_ytd / min_cum))  # максимальный прогноз
+
+    return {
+        "central": central,
+        "optimistic": optimistic,
+        "pessimistic": pessimistic,
+        "per_year_cum_at_current": cum_at_current,
+        "years_used": sorted(cum_at_current.keys()),
+        "available": True,
+    }
+
+
 # --- Кумулятивный Тр по месяцам (для графика 2) ----------------------------
 
 
@@ -209,6 +381,7 @@ def build_monthly_cumulative_tr(
     plan_line_mode: Literal["linear", "horizontal"] = "linear",
     current_month: int | None = None,
     region_code: str | None = None,
+    corridor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Формирует структуру для графика 2.
@@ -217,11 +390,15 @@ def build_monthly_cumulative_tr(
     {
       "months": [1..12],
       "tr_actual_cumulative": {"1": 0.31, "2": 0.62, ...},   # сплошная
-      "tr_forecast_cumulative": {"7": ..., "8": ..., ...},    # пунктир
+      "tr_forecast_cumulative": {"7": ..., "8": ..., ...},    # пунктир (центр)
+      "tr_optimistic_cumulative": {"7": ..., "8": ..., ...},  # нижняя граница
+      "tr_pessimistic_cumulative": {"7": ..., "8": ..., ...}, # верхняя граница
       "plan_cumulative": {"1": plan/12, "2": 2*plan/12, ...}  # линейный
                     OR {"1": plan, "2": plan, ...}            # горизонтальный
       "current_month": 6,
       "plan_line_mode": "linear",
+      "forecast_method": "central_only" | "corridor",
+      "corridor_available": bool,
       "seasonal_source": "per-region" | "global" | "legacy" | "uniform"
     }
 
@@ -229,6 +406,10 @@ def build_monthly_cumulative_tr(
 
     Args:
         region_code: код региона — для выбора per-region сезонного профиля.
+        corridor: опционально, результат forecast_with_corridor(). Если передан
+            и corridor["available"] == True — строятся линии optimistic/
+            pessimistic для прогнозных месяцев. Если None или not available —
+            поля tr_optimistic_cumulative / tr_pessimistic_cumulative = {}.
     """
     if current_month is None:
         current_month = TODAY.month
@@ -282,6 +463,81 @@ def build_monthly_cumulative_tr(
             running_deaths += remaining_breakdown[str(m)]
             tr_forecast_cum[str(m)] = round((running_deaths * 10000) / vehicles_year, 3)
 
+    # --- Коридор (optimistic / pessimistic) --------------------------------
+    # Метод B: для каждого сценария (optimistic/pessimistic) берётся ОДИН
+    # исторический год, чья seasonal-форма даёт экстремальный прогноз, и
+    # его форма применяется ко всему остатку года.
+    #
+    #   year_optimistic  = год с MAX cum_share[current_month]  → самая
+    #                       «передняя» сезонность → меньший прогноз.
+    #   year_pessimistic = год с MIN cum_share[current_month]  → самая
+    #                       «задняя» сезонность → больший прогноз.
+    #
+    # Траектория для сценария S (с годом Y_S):
+    #   cum_deaths_at_m = deaths_ytd + (year_total_S - deaths_ytd) *
+    #                     (cum_share_Y_S[m] - cum_share_Y_S[current_month]) /
+    #                     (1 - cum_share_Y_S[current_month])
+    #
+    # где year_total_S = округлённый deaths_forecast_S (из corridor dict),
+    # already an int. Это гарантирует, что cum_deaths_at_12 = year_total_S,
+    # и tr_optimistic_cum[12] == tr_forecast_optimistic (согласованность с KPI).
+    tr_optimistic_cum: dict[str, float] = {}
+    tr_pessimistic_cum: dict[str, float] = {}
+    corridor_available = bool(corridor and corridor.get("available"))
+    if (corridor_available
+            and current_month < 12
+            and 0 < current_month <= 12
+            and region_code
+            and corridor.get("optimistic") is not None
+            and corridor.get("pessimistic") is not None):
+        deaths_actual_total = sum(
+            int(deaths_by_month_actual.get(str(m), 0))
+            for m in range(1, current_month + 1)
+        )
+        if deaths_actual_total > 0:
+            per_year = compute_per_year_cum_shares(region_code)
+            # cum_share[current_month] для каждого года — из corridor dict.
+            cum_at_current: dict[str, float] = corridor.get(
+                "per_year_cum_at_current", {}
+            )
+            # Найти год с max/min cum_at_current.
+            if cum_at_current:
+                year_optimistic = max(cum_at_current, key=cum_at_current.get)
+                year_pessimistic = min(cum_at_current, key=cum_at_current.get)
+                cum_opt = per_year.get(year_optimistic, {})
+                cum_pess = per_year.get(year_pessimistic, {})
+
+                deaths_total_opt = int(corridor["optimistic"])
+                deaths_total_pess = int(corridor["pessimistic"])
+                deaths_remaining_opt = max(0, deaths_total_opt - deaths_actual_total)
+                deaths_remaining_pess = max(0, deaths_total_pess - deaths_actual_total)
+
+                cum_opt_curr = float(cum_opt.get(str(current_month), 0))
+                cum_pess_curr = float(cum_pess.get(str(current_month), 0))
+                denom_opt = 1.0 - cum_opt_curr  # = cum_share[12] - cum_share[current_month]
+                denom_pess = 1.0 - cum_pess_curr
+
+                for m in range(current_month + 1, 13):
+                    cum_opt_m = float(cum_opt.get(str(m), 0))
+                    cum_pess_m = float(cum_pess.get(str(m), 0))
+                    # Прирост от current_month к m, в долях от остатка года.
+                    if denom_opt > 0:
+                        frac_opt = (cum_opt_m - cum_opt_curr) / denom_opt
+                    else:
+                        frac_opt = 0.0
+                    if denom_pess > 0:
+                        frac_pess = (cum_pess_m - cum_pess_curr) / denom_pess
+                    else:
+                        frac_pess = 0.0
+                    cum_deaths_opt = deaths_actual_total + deaths_remaining_opt * frac_opt
+                    cum_deaths_pess = deaths_actual_total + deaths_remaining_pess * frac_pess
+                    tr_optimistic_cum[str(m)] = round(
+                        (cum_deaths_opt * 10000) / vehicles_year, 3
+                    )
+                    tr_pessimistic_cum[str(m)] = round(
+                        (cum_deaths_pess * 10000) / vehicles_year, 3
+                    )
+
     # План: линейный рост или горизонтальная линия.
     plan_cum: dict[str, float] = {}
     for m in range(1, 13):
@@ -294,9 +550,13 @@ def build_monthly_cumulative_tr(
         "months": list(range(1, 13)),
         "tr_actual_cumulative": tr_actual_cum,
         "tr_forecast_cumulative": tr_forecast_cum,
+        "tr_optimistic_cumulative": tr_optimistic_cum,
+        "tr_pessimistic_cumulative": tr_pessimistic_cum,
         "plan_cumulative": plan_cum,
         "current_month": current_month,
         "plan_line_mode": plan_line_mode,
+        "forecast_method": "corridor" if corridor_available else "central_only",
+        "corridor_available": corridor_available,
         "seasonal_source": seasonal.get("source", "unknown"),
         "seasonal_region_code": seasonal.get("region_code"),
         "seasonal_samples_used": seasonal.get("samples_used", 0),
@@ -448,6 +708,7 @@ def _build_runtime_payload(
     region_code: str,
     deaths_by_month_actual: dict[str, int],
     plan_line_mode: Literal["linear", "horizontal"] = "linear",
+    forecast_method: ForecastMethod = DEFAULT_FORECAST_METHOD,
 ) -> dict[str, Any]:
     """
     Сборка итогового payload для UI по уже полученным deaths_by_month_actual.
@@ -458,6 +719,12 @@ def _build_runtime_payload(
     а по max месяцу, для которого GIBDD вернул данные. Это корректно,
     потому что сайт ГИБДД может отставать на 1-2 месяца: если сегодня
     1 августа, а данные есть только по июнь — current_month = 6, а не 8.
+
+    Args:
+        forecast_method: "central_only" — одна линия прогноза (текущий метод);
+            "corridor" — центр + optimistic/pessimistic через min/max
+            per-year cum_share. Если per-year истории нет — коридор
+            молча отключается (corridor_available=False).
     """
     current_year = TODAY.year
     # current_month = max месяц с фактическими данными (не TODAY.month!).
@@ -485,14 +752,41 @@ def _build_runtime_payload(
         raise RuntimeError(f"Нет плана за {current_year} для региона {region_code}")
 
     deaths_ytd = sum(deaths_by_month_actual.values())
-    # Передаём region_code, чтобы forecast_full_year_deaths использовал
-    # per-region сезонный профиль (если есть).
-    deaths_forecast_full = forecast_full_year_deaths(
+
+    # --- Прогноз: central_only или corridor -------------------------------
+    # corridor_result всегда считаем (дёшево), используем по необходимости.
+    corridor_result = forecast_with_corridor(
         deaths_ytd, current_month, region_code=region_code,
     )
 
+    if forecast_method == "corridor" and corridor_result["available"]:
+        # Центр = central (он же текущий метод).
+        deaths_forecast_full = corridor_result["central"]
+        deaths_forecast_optimistic = corridor_result["optimistic"]
+        deaths_forecast_pessimistic = corridor_result["pessimistic"]
+        corridor_applied = True
+    else:
+        # central_only или коридор недоступен — используем текущий метод.
+        # deaths_forecast_full = corridor_result["central"] тоже работает
+        # (central там считается той же формулой), но для гарантии
+        # детерминированности вызовем каноническую функцию.
+        deaths_forecast_full = forecast_full_year_deaths(
+            deaths_ytd, current_month, region_code=region_code,
+        )
+        deaths_forecast_optimistic = None
+        deaths_forecast_pessimistic = None
+        corridor_applied = False
+
     tr_actual_ytd = round((deaths_ytd * 10000) / vehicles_year, 3) if deaths_ytd else 0.0
     tr_forecast_full = round((deaths_forecast_full * 10000) / vehicles_year, 3)
+    tr_forecast_optimistic = (
+        round((deaths_forecast_optimistic * 10000) / vehicles_year, 3)
+        if deaths_forecast_optimistic is not None else None
+    )
+    tr_forecast_pessimistic = (
+        round((deaths_forecast_pessimistic * 10000) / vehicles_year, 3)
+        if deaths_forecast_pessimistic is not None else None
+    )
 
     monthly_chart = build_monthly_cumulative_tr(
         deaths_by_month_actual=deaths_by_month_actual,
@@ -502,6 +796,7 @@ def _build_runtime_payload(
         plan_line_mode=plan_line_mode,
         current_month=current_month,
         region_code=region_code,
+        corridor=corridor_result if corridor_applied else None,
     )
 
     # --- Серия плана 2023..2030 ---
@@ -533,8 +828,12 @@ def _build_runtime_payload(
             "deaths_by_month_actual": deaths_by_month_actual,
             "deaths_ytd": deaths_ytd,
             "deaths_forecast_full_year": deaths_forecast_full,
+            "deaths_forecast_optimistic": deaths_forecast_optimistic,
+            "deaths_forecast_pessimistic": deaths_forecast_pessimistic,
             "tr_actual_ytd": tr_actual_ytd,
             "tr_forecast_full_year": tr_forecast_full,
+            "tr_forecast_optimistic": tr_forecast_optimistic,
+            "tr_forecast_pessimistic": tr_forecast_pessimistic,
             "tr_plan": plan_tr_year,
             "monthly_chart": monthly_chart,
         },
@@ -542,10 +841,15 @@ def _build_runtime_payload(
         "kpi": {
             "tr_actual_ytd": tr_actual_ytd,
             "tr_forecast_full_year": tr_forecast_full,
+            "tr_forecast_optimistic": tr_forecast_optimistic,
+            "tr_forecast_pessimistic": tr_forecast_pessimistic,
             "tr_plan": plan_tr_year,
             "deviation_pct": deviation_pct,
             "status": status,
         },
+        "forecast_method": "corridor" if corridor_applied else "central_only",
+        "corridor_available": corridor_result["available"],
+        "corridor_years_used": corridor_result["years_used"],
         "seasonal": {
             "source": monthly_chart.get("seasonal_source", "unknown"),
             "region_code": monthly_chart.get("seasonal_region_code"),
@@ -557,6 +861,7 @@ def _build_runtime_payload(
 
 def runtime_calc(region_code: str,
                  plan_line_mode: Literal["linear", "horizontal"] = "linear",
+                 forecast_method: ForecastMethod = DEFAULT_FORECAST_METHOD,
                  ) -> dict[str, Any]:
     """
     Синхронная версия runtime_calc для CLI и тестов.
@@ -566,11 +871,14 @@ def runtime_calc(region_code: str,
     `await runtime_calc_async(...)`.
     """
     deaths_by_month_actual = fetch_actual_deaths_from_web(region_code, TODAY.year)
-    return _build_runtime_payload(region_code, deaths_by_month_actual, plan_line_mode)
+    return _build_runtime_payload(
+        region_code, deaths_by_month_actual, plan_line_mode, forecast_method,
+    )
 
 
 async def runtime_calc_async(region_code: str,
                              plan_line_mode: Literal["linear", "horizontal"] = "linear",
+                             forecast_method: ForecastMethod = DEFAULT_FORECAST_METHOD,
                              ) -> dict[str, Any]:
     """
     Асинхронная версия runtime_calc для использования в боте.
@@ -578,7 +886,9 @@ async def runtime_calc_async(region_code: str,
     deaths_by_month_actual = await fetch_actual_deaths_from_web_async(
         region_code, TODAY.year
     )
-    return _build_runtime_payload(region_code, deaths_by_month_actual, plan_line_mode)
+    return _build_runtime_payload(
+        region_code, deaths_by_month_actual, plan_line_mode, forecast_method,
+    )
 
 
 # --- Административная команда: пересчёт сезонных коэффициентов ------------
@@ -787,6 +1097,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--plan-line", choices=["linear", "horizontal"],
                         default="linear",
                         help="Режим линии плана на графике 2")
+    parser.add_argument("--forecast-method", choices=["central_only", "corridor"],
+                        default=DEFAULT_FORECAST_METHOD,
+                        help="Метод прогноза: central_only (одна линия) или "
+                             "corridor (центр + optimistic/pessimistic)")
     args = parser.parse_args(argv[1:])
 
     if args.recalc_seasonal:
@@ -794,7 +1108,11 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args.region:
-        payload = runtime_calc(args.region, plan_line_mode=args.plan_line)
+        payload = runtime_calc(
+            args.region,
+            plan_line_mode=args.plan_line,
+            forecast_method=args.forecast_method,
+        )
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
