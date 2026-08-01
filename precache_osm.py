@@ -424,21 +424,34 @@ async def precache_region(
 
         result["tiles_ok"] += 1
 
-        # Дедуплицируем по OSM ID (тайлы имеют перехлёст)
+        # Дедуплицируем по OSM ID (тайлы имеют перехлёст).
+        # ВАЖНО: _parse_overpass_elements_with_ids возвращает tile_ids только
+        # для успешно разобранных полигонов — длина может быть МЕНЬШЕ len(elements).
+        # Поэтому строим map ID→element и ищем уникальные через него,
+        # а НЕ через zip(elements, tile_ids) — тот ломается при рассинхроне длин.
         tile_polys, tile_is_bbox, tile_ids = _parse_overpass_elements_with_ids(
             elements
         )
-        new_polys, new_ids = cp._dedup_polygons_by_id(
-            tile_polys, tile_ids, seen_ids,
-        )
 
-        # Добавляем только уникальные элементы
-        # (по OSM ID — type+id)
-        unique_elements = []
-        for el, eid in zip(elements, tile_ids):
+        # Map: (type, id) → исходный element из Overpass
+        id_to_element: dict[tuple[str, int], dict] = {}
+        for el in elements:
+            eid = (el.get("type", ""), el.get("id", 0))
+            if eid not in id_to_element:
+                id_to_element[eid] = el
+
+        # Единственная дедупликация: проверяем seen_ids и добавляем новые ID.
+        # Раньше тут был вызов _dedup_polygons_by_id, который ПОРТИЛ seen_ids
+        # до цикла ниже — из-за этого unique_elements всегда был пустым.
+        unique_elements: list[dict] = []
+        new_polys: list = []
+        for poly, eid in zip(tile_polys, tile_ids):
             if eid not in seen_ids:
                 seen_ids.add(eid)
-                unique_elements.append(el)
+                el = id_to_element.get(eid)
+                if el is not None:
+                    unique_elements.append(el)
+                    new_polys.append(poly)
 
         all_elements.extend(unique_elements)
         total_polygons += len(new_polys)
