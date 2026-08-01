@@ -21,6 +21,11 @@ python-dotenv==1.0.1
 # --- Geo (для concentration_points.py) ---
 shapely==2.0.6
 
+# --- НП БДД module ---
+# jsonschema — для валидации freeze/history/plans/vehicles JSON.
+# openpyxl — уже выше (для converter.py, читает Excel).
+jsonschema==4.23.0
+
 # ====================================
 # Mini App dependencies
 # ====================================
