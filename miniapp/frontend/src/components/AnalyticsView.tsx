@@ -126,6 +126,15 @@ function getMetricValue(
   return bucket.injured ?? 0
 }
 
+// Форматирование абсолютного значения динамики:
+// для целых чисел — без дробной части, для дробных — 1 знак после запятой.
+// Округление убирает артефакты плавающей точки вида -1.700000000000001.
+function formatAbsValue(abs: number): string {
+  if (Number.isInteger(abs)) return String(abs)
+  const rounded = Math.round(abs * 10) / 10
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
+}
+
 // Форматирование динамики для KPI
 function formatDelta(
   current: number,
@@ -142,7 +151,7 @@ function formatDelta(
   const color = abs > 0 ? '#ff3b30' : abs < 0 ? '#34c759' : '#8e8e93'
   const sign = abs > 0 ? '+' : ''
   return {
-    text: `${sign}${abs} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) ${arrow}`,
+    text: `${sign}${formatAbsValue(abs)} (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%) ${arrow}`,
     color,
   }
 }
@@ -289,38 +298,6 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
 
   return (
     <div className="space-y-3">
-      {/* === Переключатель метрики — применяется ко всем графикам === */}
-      <div className="tg-card">
-        <div className="tg-section-header mb-2">Метрика визуализаций</div>
-        <div className="grid grid-cols-3 gap-1.5">
-          {METRICS.map((m) => (
-            <button
-              key={m.id}
-              onClick={() => {
-                setMetric(m.id)
-                haptic('light')
-              }}
-              className="py-2 px-2 rounded-lg text-xs font-medium transition-colors"
-              style={{
-                backgroundColor:
-                  metric === m.id
-                    ? m.color
-                    : 'var(--tg-color-secondary-bg, #f1f1f1)',
-                color:
-                  metric === m.id
-                    ? '#ffffff'
-                    : 'var(--tg-color-text, #000000)',
-              }}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
-        <div className="text-[10px] opacity-60 mt-1.5 text-center">
-          Все графики ниже отображают выбранную метрику
-        </div>
-      </div>
-
       {/* === KPI-сводка с динамикой === */}
       <div className="tg-card">
         <div className="tg-section-header mb-3">
@@ -384,6 +361,38 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
             )}
           </div>
         )}
+      </div>
+
+      {/* === Переключатель метрики — применяется ко всем графикам ниже === */}
+      <div className="tg-card">
+        <div className="tg-section-header mb-2">Метрика визуализаций</div>
+        <div className="grid grid-cols-3 gap-1.5">
+          {METRICS.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => {
+                setMetric(m.id)
+                haptic('light')
+              }}
+              className="py-2 px-2 rounded-lg text-xs font-medium transition-colors"
+              style={{
+                backgroundColor:
+                  metric === m.id
+                    ? m.color
+                    : 'var(--tg-color-secondary-bg, #f1f1f1)',
+                color:
+                  metric === m.id
+                    ? '#ffffff'
+                    : 'var(--tg-color-text, #000000)',
+              }}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+        <div className="text-[10px] opacity-60 mt-1.5 text-center">
+          Все графики ниже отображают выбранную метрику
+        </div>
       </div>
 
       {/* === Динамика по месяцам vs АППГ === */}
