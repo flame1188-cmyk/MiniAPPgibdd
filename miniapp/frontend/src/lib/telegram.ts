@@ -345,3 +345,41 @@ export function onFullscreenChange(cb: (isFullscreen: boolean) => void): () => v
     wa.offEvent('fullscreenChanged', handler)
   }
 }
+
+/**
+ * Развернуть Mini App на максимальную высоту внутри окна Telegram.
+ *
+ * На мобильных — раскрывает MiniApp на весь экран (поведение по умолчанию).
+ *
+ * На десктопе — раскрывает по высоте внутри текущего окна Telegram,
+ * но НЕ меняет размер самого окна. Чтобы изменить размер окна Telegram,
+ * пользователь должен растянуть его вручную (Telegram запомнит размер).
+ *
+ * Этот метод НЕ прячет панель задач — для настоящего fullscreen
+ * используйте requestAppFullscreen().
+ */
+export function expandApp(): void {
+  getWebApp()?.expand()
+}
+
+/**
+ * Текущее состояние expand (MiniApp развёрнут по высоте).
+ */
+export function isExpandedActive(): boolean {
+  return !!getWebApp()?.isExpanded
+}
+
+/**
+ * Подписка на изменение expand-режима.
+ * Возвращает функцию отписки.
+ */
+export function onExpandedChange(cb: (isExpanded: boolean) => void): () => void {
+  const wa = getWebApp()
+  if (!wa) return () => {}
+
+  const handler = () => cb(!!wa.isExpanded)
+  wa.onEvent('viewportChanged', handler)
+  return () => {
+    wa.offEvent('viewportChanged', handler)
+  }
+}
