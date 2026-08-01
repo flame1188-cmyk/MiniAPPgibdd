@@ -357,6 +357,11 @@ export interface NpBddMonthlyChart {
   // Коридор прогноза (только для прогнозных месяцев; пусто, если corridor недоступен).
   tr_optimistic_cumulative?: Record<string, number>
   tr_pessimistic_cumulative?: Record<string, number>
+  // Кумулятивные погибшие (для tooltip)
+  deaths_actual_cumulative?: Record<string, number>
+  deaths_forecast_cumulative?: Record<string, number>
+  deaths_optimistic_cumulative?: Record<string, number>
+  deaths_pessimistic_cumulative?: Record<string, number>
   plan_cumulative: Record<string, number>
   current_month: number
   plan_line_mode: 'linear' | 'horizontal'
@@ -595,7 +600,7 @@ export const api = {
   npBddGetData: (
     regionCode: string,
     planLineMode: 'linear' | 'horizontal' = 'linear',
-    forecastMethod: NpBddForecastMethod = 'central_only',
+    forecastMethod: NpBddForecastMethod = 'corridor',
   ) =>
     request<NpBddData>(
       `/api/np-bdd/data?region_code=${encodeURIComponent(regionCode)}` +

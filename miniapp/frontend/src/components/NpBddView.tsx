@@ -50,7 +50,7 @@ const FORECAST_METHOD_INFO: Record<NpBddForecastMethod, {
   formula: string
 }> = {
   central_only: {
-    label: 'Центр (текущий метод)',
+    label: 'Центр (avg per-year)',
     short: 'Центр',
     description:
       'Прогноз на конец года = deaths_ytd / avg(cum_share[current_month]). ' +
@@ -74,11 +74,70 @@ interface NpBddViewProps {
   // placeholder для будущей интеграции, пока нет
 }
 
+// ============================================================
+// i-иконка с popover: показывает описание метода прогноза
+// ============================================================
+function ForecastMethodInfo({
+  method,
+  corridorAvailable,
+}: {
+  method: NpBddForecastMethod
+  corridorAvailable?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const info = FORECAST_METHOD_INFO[method]
+
+  // Закрытие по клику вне popover
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      const target = e.target as HTMLElement
+      if (!target.closest('[data-method-info]')) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  return (
+    <div className="relative" data-method-info>
+      <button
+        type="button"
+        onClick={() => { haptic('light'); setOpen((v) => !v) }}
+        className="inline-flex items-center justify-center w-5 h-5 rounded-full border border-current opacity-60 hover:opacity-100 text-xs font-bold"
+        style={{ lineHeight: 1 }}
+        aria-label="Описание метода прогноза"
+      >
+        i
+      </button>
+      {open && (
+        <div
+          className="absolute right-0 top-6 z-50 w-72 max-w-[80vw] p-3 rounded-xl shadow-lg text-xs leading-relaxed"
+          style={{
+            background: 'var(--tg-color-section-bg, #fff)',
+            border: '1px solid var(--tg-color-hint, #ccc)',
+            color: 'var(--tg-color-text, #000)',
+          }}
+        >
+          <div className="font-semibold mb-1">{info.label}</div>
+          <div className="opacity-80 mb-2">{info.description}</div>
+          <div className="font-mono bg-tg-secondary-bg px-2 py-1 rounded mb-2">{info.formula}</div>
+          {method === 'corridor' && corridorAvailable === false && (
+            <div className="text-yellow-600 dark:text-yellow-400">
+              ⚠ Для текущего региона коридор недоступен (нужно ≥ 2 лет истории).
+            </div>
+          )}
+          <div className="text-[10px] opacity-50 mt-2 text-right">Клик вне области — закрыть</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function NpBddView(_: NpBddViewProps = {}) {
   const queryClient = useQueryClient()
   const [selectedRegion, setSelectedRegion] = useState<string>('')
   const [planLineMode, setPlanLineMode] = useState<'linear' | 'horizontal'>('linear')
-  const [forecastMethod, setForecastMethod] = useState<NpBddForecastMethod>('central_only')
+  const [forecastMethod, setForecastMethod] = useState<NpBddForecastMethod>('corridor')
 
   // --- Список регионов ---
   const regionsQuery = useQuery({
@@ -234,15 +293,21 @@ export function NpBddView(_: NpBddViewProps = {}) {
   // График 2: кумулятивный Тр по месяцам.
   //
   // ВАЖНО: чтобы линии прогноза/коридора шли ОТ последней фактической точки
-  // (без разрыва), мы дублируем последнее фактическое значение в первый
-  // прогнозный месяц для всех линий прогноза (forecast / optimistic /
-  // pessimistic). Тогда recharts соединит их в одну непрерывную линию.
+  // (без разрыва по оси X), мы:
+  //   1) продлеваем fact на один месяц вперёд (m = current_month + 1) —
+  //      дублируем последнее фактическое значение. Точка (m+1, lastActual)
+  //      становится общей для fact и forecast.
+  //   2) во все прогнозные линии на этот же месяц ставим lastActual —
+  //      они стартуют из той же точки.
+  // Recharts соединит fact (1..m+1) и forecast (m+1..12) в одну непрерывную
+  // кривую, проходящую через последнюю фактическую точку.
   const chart2Data = useMemo(() => {
     if (!dataQuery.data) return []
     const mc = dataQuery.data.current_year.monthly_chart
     const lastActualMonth = mc.current_month
     const lastActualKey = String(lastActualMonth)
     const lastActualValue = mc.tr_actual_cumulative?.[lastActualKey]
+    const lastActualDeaths = mc.deaths_actual_cumulative?.[lastActualKey]
 
     return mc.months.map((m) => {
       const key = String(m)
@@ -250,17 +315,22 @@ export function NpBddView(_: NpBddViewProps = {}) {
       const forecast = mc.tr_forecast_cumulative[key]
       const optimistic = mc.tr_optimistic_cumulative?.[key]
       const pessimistic = mc.tr_pessimistic_cumulative?.[key]
+      const actualDeaths = mc.deaths_actual_cumulative?.[key]
+      const forecastDeaths = mc.deaths_forecast_cumulative?.[key]
+      const optimisticDeaths = mc.deaths_optimistic_cumulative?.[key]
+      const pessimisticDeaths = mc.deaths_pessimistic_cumulative?.[key]
       const plan = mc.plan_cumulative[key]
 
-      // Для первого прогнозного месяца (m === lastActualMonth + 1) подставляем
-      // последнее фактическое значение во все прогнозные линии — это точка
-      // «состыковки», чтобы линия прогноза выходила из конца линии факта.
+      // Точка состыковки: первый прогнозный месяц.
       const isJointPoint = m === lastActualMonth + 1 && lastActualValue !== undefined
 
       return {
         month: MONTH_SHORT[m - 1] || `М${m}`,
-        // Используем null для отсутствующих значений (recharts пропустит их)
-        fact: actual !== undefined ? actual : null,
+        // fact продлеваем на один месяц вперёд = lastActual (точка состыковки)
+        fact: actual !== undefined
+          ? actual
+          : (isJointPoint ? lastActualValue! : null),
+        // Все прогнозные линии на точке состыковки = lastActual
         forecast: forecast !== undefined
           ? forecast
           : (isJointPoint ? lastActualValue! : null),
@@ -271,6 +341,19 @@ export function NpBddView(_: NpBddViewProps = {}) {
           ? pessimistic
           : (isJointPoint ? lastActualValue! : null),
         plan,
+        // То же самое для погибших (для tooltip)
+        factDeaths: actualDeaths !== undefined
+          ? actualDeaths
+          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
+        forecastDeaths: forecastDeaths !== undefined
+          ? forecastDeaths
+          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
+        optimisticDeaths: optimisticDeaths !== undefined
+          ? optimisticDeaths
+          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
+        pessimisticDeaths: pessimisticDeaths !== undefined
+          ? pessimisticDeaths
+          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
       }
     })
   }, [dataQuery.data])
@@ -340,7 +423,10 @@ export function NpBddView(_: NpBddViewProps = {}) {
         </div>
 
         <div className="space-y-1">
-          <div className="tg-section-header text-xs">Метод прогноза (график 2)</div>
+          <div className="flex items-center gap-2">
+            <div className="tg-section-header text-xs flex-1">Метод прогноза (график 2)</div>
+            <ForecastMethodInfo method={forecastMethod} corridorAvailable={dataQuery.data?.corridor_available} />
+          </div>
           <select
             className="tg-input w-full !py-2 text-sm"
             value={forecastMethod}
@@ -360,15 +446,6 @@ export function NpBddView(_: NpBddViewProps = {}) {
               </option>
             ))}
           </select>
-          <div className="text-xs text-tg-hint mt-1 leading-snug">
-            <span className="font-medium">
-              {FORECAST_METHOD_INFO[forecastMethod].label}:
-            </span>{' '}
-            {FORECAST_METHOD_INFO[forecastMethod].description}
-          </div>
-          <div className="text-xs text-tg-hint mt-1 font-mono bg-tg-secondary-bg px-2 py-1 rounded">
-            {FORECAST_METHOD_INFO[forecastMethod].formula}
-          </div>
           {forecastMethod === 'corridor' && dataQuery.data && !dataQuery.data.corridor_available && (
             <div className="text-xs text-yellow-600 dark:text-yellow-400 mt-1">
               ⚠ Коридор недоступен для этого региона (нужно ≥ 2 лет истории).
@@ -415,6 +492,10 @@ interface NpBddContentProps {
     optimistic: number | null
     pessimistic: number | null
     plan: number
+    factDeaths: number | null
+    forecastDeaths: number | null
+    optimisticDeaths: number | null
+    pessimisticDeaths: number | null
   }>
   frozenYears: Array<{ year: number; tr: number; deaths: number; frozen_at?: string; note?: string }>
   onFreeze: (year: number) => void
@@ -475,17 +556,39 @@ function NpBddContent({
           }
           highlight={kpi.status}
         />
-        <KpiCard
-          label={`План ${current_year.year}`}
-          value={kpi.tr_plan.toFixed(3)}
-          hint="Из паспорта НП БДД"
-        />
-        <KpiCard
-          label="Отклонение от плана"
-          value={`${kpi.deviation_pct > 0 ? '+' : ''}${kpi.deviation_pct}%`}
-          hint={STATUS_LABELS[kpi.status]}
-          highlight={kpi.status}
-        />
+        {(() => {
+          // Плановое количество погибших = tr_plan * Ктс / 10000.
+          // Ктс вычисляем обратно из факта: Ктс = deaths_ytd * 10000 / tr_actual_ytd.
+          // Если факта ещё нет (tr_actual_ytd = 0), плановые погибшие не определены.
+          const trActual = kpi.tr_actual_ytd
+          const deathsYtd = current_year.deaths_ytd
+          const trPlan = kpi.tr_plan
+          const planDeaths = trActual > 0
+            ? Math.round(trPlan * deathsYtd / trActual)
+            : null
+          const forecastDeaths = current_year.deaths_forecast_full_year
+          const delta = planDeaths !== null ? forecastDeaths - planDeaths : null
+          const deltaSign = delta !== null && delta > 0 ? '+' : ''
+          return (
+            <>
+              <KpiCard
+                label={`План ${current_year.year}`}
+                value={trPlan.toFixed(3)}
+                hint={planDeaths !== null ? `Цель: ≤ ${planDeaths} погибших` : 'Из паспорта НП БДД'}
+              />
+              <KpiCard
+                label="Отклонение от плана"
+                value={`${kpi.deviation_pct > 0 ? '+' : ''}${kpi.deviation_pct}%`}
+                hint={
+                  delta !== null
+                    ? `${STATUS_LABELS[kpi.status]} • Δ = ${deltaSign}${delta} погибших от плана`
+                    : STATUS_LABELS[kpi.status]
+                }
+                highlight={kpi.status}
+              />
+            </>
+          )
+        })()}
       </div>
 
       {/* Подпись об источнике сезонности */}
@@ -566,6 +669,7 @@ function NpBddContent({
         </h3>
         <p className="text-xs text-tg-hint mb-3">
           Сплошная — факт (прошедшие месяцы), пунктир — прогноз (будущие), линия плана — {data.current_year.monthly_chart.plan_line_mode === 'linear' ? 'линейный рост' : 'горизонталь'}.
+          Наведите на точку — увидите Тр и кумулятивное число погибших.
           {corridorOn && ' Коридор (зелёный/оранжевый) — min/max по историческим годам.'}
         </p>
         <div className="h-64">
@@ -575,15 +679,72 @@ function NpBddContent({
               <XAxis dataKey="month" tick={{ fontSize: 11 }} />
               <YAxis tick={{ fontSize: 11 }} />
               <Tooltip
-                contentStyle={{
-                  background: 'var(--tg-color-section-bg, #fff)',
-                  border: '1px solid var(--tg-color-hint, #ccc)',
-                  borderRadius: '8px',
-                  fontSize: '12px',
+                content={({ active, payload, label }) => {
+                  if (!active || !payload || payload.length === 0) return null
+                  const deathsKeyMap: Record<string, string> = {
+                    fact: 'factDeaths',
+                    forecast: 'forecastDeaths',
+                    optimistic: 'optimisticDeaths',
+                    pessimistic: 'pessimisticDeaths',
+                  }
+                  const colorMap: Record<string, string> = {
+                    fact: 'var(--tg-color-destructive, #ff3b30)',
+                    forecast: 'var(--tg-color-link, #2481cc)',
+                    optimistic: '#34c759',
+                    pessimistic: '#ff9500',
+                    plan: 'var(--tg-color-hint, #999)',
+                  }
+                  const labelMap: Record<string, string> = {
+                    fact: 'Факт',
+                    forecast: 'Прогноз',
+                    optimistic: 'Оптимист.',
+                    pessimistic: 'Пессимист.',
+                    plan: 'План',
+                  }
+                  const pointRecord = payload[0]?.payload as Record<string, number | null> | undefined
+                  return (
+                    <div
+                      style={{
+                        background: 'var(--tg-color-section-bg, #fff)',
+                        border: '1px solid var(--tg-color-hint, #ccc)',
+                        borderRadius: '8px',
+                        fontSize: '12px',
+                        padding: '8px 10px',
+                        color: 'var(--tg-color-text, #000)',
+                      }}
+                    >
+                      <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
+                      {payload.map((entry) => {
+                        const dk = String(entry.dataKey ?? '')
+                        const deathsField = deathsKeyMap[dk]
+                        const deathsVal = deathsField && pointRecord
+                          ? pointRecord[deathsField]
+                          : null
+                        const trVal = typeof entry.value === 'number' ? entry.value : null
+                        return (
+                          <div key={dk} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                            <span style={{
+                              display: 'inline-block',
+                              width: 10, height: 10,
+                              background: colorMap[dk] ?? '#999',
+                              borderRadius: 2,
+                              flexShrink: 0,
+                            }} />
+                            <span style={{ minWidth: 70 }}>{labelMap[dk] ?? dk}:</span>
+                            <span style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
+                              {trVal !== null ? trVal.toFixed(3) : '—'}
+                            </span>
+                            {deathsVal !== null && deathsVal !== undefined && (
+                              <span style={{ opacity: 0.7, fontSize: '11px' }}>
+                                ({deathsVal} погибш.)
+                              </span>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )
                 }}
-                formatter={(v: unknown) =>
-                  typeof v === 'number' ? v.toFixed(3) : (v != null ? String(v) : '—')
-                }
               />
               <Legend wrapperStyle={{ fontSize: '11px' }} />
               <Line

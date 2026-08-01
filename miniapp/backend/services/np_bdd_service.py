@@ -269,7 +269,7 @@ async def list_regions() -> list[dict[str, Any]]:
 async def get_data(
     region_code: str,
     plan_line_mode: Literal["linear", "horizontal"] = "linear",
-    forecast_method: Literal["central_only", "corridor"] = "central_only",
+    forecast_method: Literal["central_only", "corridor"] = "corridor",
     use_cache: bool = True,
 ) -> dict[str, Any]:
     """
@@ -278,9 +278,9 @@ async def get_data(
     Кэшируется на 10 минут по ключу (region_code, plan_line_mode, forecast_method).
 
     Args:
-        forecast_method: "central_only" — одна линия прогноза (по умолчанию);
-            "corridor" — центр + optimistic/pessimistic через min/max
-            per-year cum_share. Если per-year истории нет — коридор
+        forecast_method: "central_only" — одна линия прогноза;
+            "corridor" (по умолчанию) — центр + optimistic/pessimistic через
+            min/max per-year cum_share. Если per-year истории нет — коридор
             молча отключается (corridor_available=False в payload).
     """
     cache_key = (region_code, plan_line_mode, forecast_method)
@@ -414,13 +414,13 @@ async def get_settings(region_code: str) -> dict[str, Any]:
     """
     Возвращает настройки региона. По умолчанию:
     - plan_line_mode = 'linear'
-    - forecast_method = 'central_only'
+    - forecast_method = 'corridor'
     """
     all_settings = _load_all_settings()
     region_settings = all_settings.get(region_code, {})
     return {
         "plan_line_mode": region_settings.get("plan_line_mode", "linear"),
-        "forecast_method": region_settings.get("forecast_method", "central_only"),
+        "forecast_method": region_settings.get("forecast_method", "corridor"),
     }
 
 
@@ -434,7 +434,7 @@ async def update_settings(region_code: str,
     Args:
         plan_line_mode: 'linear' или 'horizontal' — режим линии плана на графике 2.
         forecast_method: 'central_only' (одна линия прогноза) или 'corridor'
-            (центр + optimistic/pessimistic через min/max per-year cum_share).
+            (по умолчанию; центр + optimistic/pessimistic через min/max per-year cum_share).
     """
     all_settings = _load_all_settings()
     region_settings = all_settings.get(region_code, {})
@@ -447,5 +447,5 @@ async def update_settings(region_code: str,
     invalidate_cache(region_code)
     return {
         "plan_line_mode": region_settings.get("plan_line_mode", "linear"),
-        "forecast_method": region_settings.get("forecast_method", "central_only"),
+        "forecast_method": region_settings.get("forecast_method", "corridor"),
     }

@@ -70,7 +70,7 @@ async def regions_list(user: TelegramUser = Depends(get_current_user)):
 async def get_npbdd_data(
     region_code: str = Query(..., examples=["1106"]),
     plan_line_mode: Literal["linear", "horizontal"] = Query("linear"),
-    forecast_method: Literal["central_only", "corridor"] = Query("central_only"),
+    forecast_method: Literal["central_only", "corridor"] = Query("corridor"),
     user: TelegramUser = Depends(get_current_user),
 ):
     """
