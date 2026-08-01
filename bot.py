@@ -777,6 +777,180 @@ async def cmd_miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=keyboard,
     )
 
+async def cmd_precache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /precache — управление кэшем OSM-границ.
+
+    Использование:
+        /precache                      — статус кэша + список готовых регионов
+        /precache 1145                 — закэшировать Москву
+        /precache 1145,1146,1147       — несколько регионов
+        /precache all                  — все 23 региона из DEFAULT_REGIONS
+        /precache list                 — список всех 82 регионов с кодами
+        /precache 1145 force           — принудительно обновить (даже если есть)
+    """
+    if not is_user_allowed(update.effective_user.id):
+        return
+
+    import os
+    import json
+    import subprocess
+    import asyncio
+    from pathlib import Path
+
+    args = context.args or []
+    REGIONS_CACHE_DIR = os.environ.get(
+        "CAMERA_DATA_DIR",
+        str(Path(__file__).parent / "data"),
+    ) + "/osm_cache"
+
+    # /precache без аргументов — статус
+    if not args:
+        try:
+            files = []
+            if os.path.exists(REGIONS_CACHE_DIR):
+                files = sorted(
+                    f for f in os.listdir(REGIONS_CACHE_DIR)
+                    if f.startswith("region_") and f.endswith(".json")
+                )
+            lines = [f"<b>🗂 Кэш OSM-границ</b>\n"]
+            lines.append(f"Папка: <code>{REGIONS_CACHE_DIR}</code>")
+            lines.append(f"Регионов в кэше: <b>{len(files)}</b>\n")
+            total_mb = 0.0
+            for f in files:
+                path = os.path.join(REGIONS_CACHE_DIR, f)
+                size_mb = os.path.getsize(path) / (1024 * 1024)
+                total_mb += size_mb
+                try:
+                    with open(path, "r", encoding="utf-8") as fp:
+                        data = json.load(fp)
+                    code = data.get("region_code", "?")
+                    name = data.get("region_name", "?")
+                    count = data.get("count", 0)
+                    age_days = (31536000 - (31536000)) / 86400  # placeholder
+                    import time as _t
+                    age_days = (_t.time() - data.get("timestamp", 0)) / 86400
+                    ttl_days = data.get("ttl_seconds", 7776000) / 86400
+                    remaining = max(0, ttl_days - age_days)
+                    lines.append(
+                        f"<code>{code}</code> — {name} "
+                        f"({count} НП, {size_mb:.1f} МБ, осталось {remaining:.0f}д)"
+                    )
+                except Exception:
+                    lines.append(f"<code>{f}</code> ({size_mb:.1f} МБ)")
+            lines.append(f"\n<b>Итого: {total_mb:.1f} МБ</b>")
+            lines.append("\nКоманды:")
+            lines.append("• <code>/precache 1145</code> — закэшировать регион")
+            lines.append("• <code>/precache all</code> — все 23 топ-региона")
+            lines.append("• <code>/precache list</code> — все 82 региона с кодами")
+            lines.append("• <code>/precache 1145 force</code> — обновить принудительно")
+            text = "\n".join(lines)
+            # Делим на части по 4000 символов
+            for i in range(0, len(text), 4000):
+                await update.message.reply_text(text[i:i+4000], parse_mode="HTML")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка чтения кэша: {e}")
+        return
+
+    # /precache list — список всех 82 регионов
+    if args[0].lower() == "list":
+        regions = await _load_regions_if_needed(context)
+        if not regions:
+            await update.message.reply_text("Не удалось загрузить список регионов.")
+            return
+        lines = [f"<b>Все регионы РФ ({len(regions)})</b>\n"]
+        for r in regions:
+            lines.append(f"<code>{r['code']}</code> — {r['name']}")
+        text = "\n".join(lines)
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(text[i:i+4000], parse_mode="HTML")
+        return
+
+    # /precache all — все 23 топ-региона
+    if args[0].lower() == "all":
+        cmd = ["python", "precache_osm.py"]
+        await _run_precache(update, cmd, label="23 топ-региона")
+        return
+
+    # /precache 1145[,1146,...] [force]
+    codes_arg = args[0]
+    force = len(args) > 1 and args[1].lower() == "force"
+    if not all(c.isdigit() for c in codes_arg.split(",")):
+        await update.message.reply_text(
+            "❌ Неверный формат. Пример:\n"
+            "<code>/precache 1145</code>\n"
+            "<code>/precache 1145,1146,1147 force</code>",
+            parse_mode="HTML",
+        )
+        return
+    cmd = ["python", "precache_osm.py", "--codes", codes_arg]
+    if force:
+        cmd.append("--force")
+    await _run_precache(update, cmd, label=f"регион(ы) {codes_arg}")
+
+
+async def _run_precache(update: Update, cmd: list, label: str) -> None:
+    """Запускает precache_osm.py как subprocess и стримит вывод в чат."""
+    await update.message.reply_text(
+        f"🔄 Запуск precache для: {label}\n"
+        f"Команда: <code>{' '.join(cmd)}</code>\n\n"
+        f"⏳ Это может занять от 1 до 30 минут в зависимости от региона.\n"
+        f"Вывод будет приходить сообщениями.",
+        parse_mode="HTML",
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+
+        # Накапливаем строки и шлём батчами (по ~3500 символов)
+        buffer = []
+        buffer_size = 0
+        last_send = asyncio.get_event_loop().time()
+
+        async for raw_line in proc.stdout:
+            line = raw_line.decode("utf-8", errors="replace").rstrip()
+            if not line:
+                continue
+            buffer.append(line)
+            buffer_size += len(line) + 1
+
+            now = asyncio.get_event_loop().time()
+            if buffer_size >= 3500 or (now - last_send) >= 10:
+                text = "\n".join(buffer)
+                try:
+                    await update.message.reply_text(
+                        f"<pre>{html_mod.escape(text)}</pre>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass  # не роняем процесс из-за ошибки отправки
+                buffer = []
+                buffer_size = 0
+                last_send = now
+
+        # Финальный остаток
+        if buffer:
+            text = "\n".join(buffer)
+            try:
+                await update.message.reply_text(
+                    f"<pre>{html_mod.escape(text)}</pre>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        await proc.wait()
+        await update.message.reply_text(
+            f"✅ precache завершён (код {proc.returncode}).\n"
+            f"Используйте <code>/precache</code> для проверки статуса.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка запуска: {e}")
 
 # ========================
 # Обработчики callback (нажатия кнопок)
@@ -3819,6 +3993,7 @@ def _build_app(token: str) -> "Application":
     app.add_handler(CommandHandler("dtp", cmd_dtp))
     app.add_handler(CommandHandler("regions", cmd_regions))
     app.add_handler(CommandHandler("miniapp", cmd_miniapp))
+    app.add_handler(CommandHandler("precache", cmd_precache))
     # Callback-кнопки
     app.add_handler(CallbackQueryHandler(on_callback_query))
     # Текстовые сообщения
