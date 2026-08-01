@@ -11,7 +11,7 @@
  *  - Вкладка «НП БДД»:
  *      - NpBddView (KPI + 2 графика + заморозка)
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { StructuredForm } from '@/components/StructuredForm'
 import { CamerasWidget } from '@/components/CamerasWidget'
 import { ProgressIndicator } from '@/components/ProgressIndicator'
@@ -25,6 +25,11 @@ import {
   getContainerMaxWidth,
   isInsideTelegram,
   isTelegramDesktop,
+  isFullscreenSupported,
+  isFullscreenActive,
+  requestAppFullscreen,
+  exitAppFullscreen,
+  onFullscreenChange,
 } from '@/lib/telegram'
 
 type Tab = 'dtp' | 'np-bdd'
@@ -32,6 +37,7 @@ type Tab = 'dtp' | 'np-bdd'
 export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('dtp')
+  const [fullscreen, setFullscreen] = useState<boolean>(isFullscreenActive())
 
   const { data: task, isError } = useTaskPolling(activeTaskId)
 
@@ -39,6 +45,7 @@ export default function App() {
   const showDevWarning = !isInsideTelegram()
   const isDesktop = isTelegramDesktop()
   const containerMaxWidth = getContainerMaxWidth()
+  const fullscreenSupported = isFullscreenSupported()
 
   const handleSelectTask = (taskId: string) => {
     setActiveTaskId(taskId)
@@ -53,20 +60,57 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
+  // Подписка на смену fullscreen-режима (пользователь мог сам выйти через ESC/свайп)
+  useEffect(() => {
+    const unsubscribe = onFullscreenChange((isFs) => setFullscreen(isFs))
+    return unsubscribe
+  }, [])
+
+  const toggleFullscreen = async () => {
+    haptic('light')
+    try {
+      if (fullscreen) {
+        await exitAppFullscreen()
+      } else {
+        await requestAppFullscreen()
+      }
+    } catch (err) {
+      // Тихая ошибка — пользователь увидит, что состояние не поменялось
+      console.warn('[App] fullscreen toggle failed:', err)
+    }
+  }
+
   return (
     <div className="min-h-screen pb-8">
       <div className={`${containerMaxWidth} mx-auto px-4 py-4 space-y-4`}>
         {/* Шапка */}
-        <header className="text-center pb-2">
-          <h1 className="text-xl font-bold mb-0.5">ДТП Статистика</h1>
-          {user ? (
-            <p className="text-xs opacity-60">
-              Привет, {user.first_name}! 👋
-            </p>
-          ) : (
-            <p className="text-xs opacity-60">
-              Данные ГИБДД · stat.gibdd.ru
-            </p>
+        <header className="flex items-center justify-between gap-2 pb-2">
+          <div className="text-left">
+            <h1 className="text-xl font-bold mb-0.5">ДТП Статистика</h1>
+            {user ? (
+              <p className="text-xs opacity-60">
+                Привет, {user.first_name}! 👋
+              </p>
+            ) : (
+              <p className="text-xs opacity-60">
+                Данные ГИБДД · stat.gibdd.ru
+              </p>
+            )}
+          </div>
+          {/* Кнопка полноэкранного режима — только если поддерживается клиентом */}
+          {fullscreenSupported && (
+            <button
+              onClick={toggleFullscreen}
+              className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
+              style={{
+                backgroundColor: 'var(--tg-color-section-bg, #ffffff)',
+                color: 'var(--tg-color-link, #2481cc)',
+                border: '1px solid var(--tg-color-link, #2481cc)',
+              }}
+              title={fullscreen ? 'Выйти из полноэкранного режима' : 'Развернуть на весь экран'}
+            >
+              {fullscreen ? '🗙 Свернуть' : '⛶ Развернуть'}
+            </button>
           )}
         </header>
 
@@ -94,8 +138,8 @@ export default function App() {
           </button>
         </div>
 
-        {/* Подсказка для desktop-пользователей */}
-        {isDesktop && tab === 'dtp' && (
+        {/* Подсказка для desktop-пользователей — только если не в fullscreen */}
+        {isDesktop && !fullscreen && (
           <div
             className="rounded-xl p-2.5 text-xs"
             style={{
@@ -103,8 +147,8 @@ export default function App() {
               color: 'var(--tg-color-link, #2481cc)',
             }}
           >
-            💻 Desktop-режим: потяните за левый край окна, чтобы
-            растянуть приложение на весь экран.
+            💻 Desktop-режим: нажмите «⛶ Развернуть» в шапке, чтобы
+            открыть приложение на весь экран.
           </div>
         )}
 
