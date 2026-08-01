@@ -70,6 +70,17 @@ async def list_regions() -> list[dict[str, Any]]:
     """
     vehicles_dir = NPBDD_ROOT / "data" / "vehicles"
     plans_dir = NPBDD_ROOT / "data" / "plans"
+
+    # Диагностика: если директории нет или пусты — логируем, чтобы было видно
+    # в логах сервера (иначе glob() молча возвращает []).
+    import sys
+    if not vehicles_dir.exists():
+        print(f"[np_bdd] ВНИМАНИЕ: директория не найдена: {vehicles_dir} "
+              f"(NPBDD_ROOT={NPBDD_ROOT})", file=sys.stderr)
+    if not plans_dir.exists():
+        print(f"[np_bdd] ВНИМАНИЕ: директория не найдена: {plans_dir} "
+              f"(NPBDD_ROOT={NPBDD_ROOT})", file=sys.stderr)
+
     result: list[dict[str, Any]] = []
     for veh_file in vehicles_dir.glob("*.json"):
         code = veh_file.stem
