@@ -30,8 +30,6 @@ import {
   requestAppFullscreen,
   exitAppFullscreen,
   onFullscreenChange,
-  expandApp,
-  isExpandedActive,
 } from '@/lib/telegram'
 
 type Tab = 'dtp' | 'np-bdd'
@@ -40,7 +38,6 @@ export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('dtp')
   const [fullscreen, setFullscreen] = useState<boolean>(isFullscreenActive())
-  const [expanded, setExpanded] = useState<boolean>(isExpandedActive())
 
   const { data: task, isError } = useTaskPolling(activeTaskId)
 
@@ -48,7 +45,9 @@ export default function App() {
   const showDevWarning = !isInsideTelegram()
   const isDesktop = isTelegramDesktop()
   const containerMaxWidth = getContainerMaxWidth()
-  const fullscreenSupported = isFullscreenSupported()
+  // Кнопка fullscreen имеет смысл только на десктопе: на мобильных
+  // MiniApp и так открывается на весь экран.
+  const showFullscreenButton = isDesktop && isFullscreenSupported()
 
   const handleSelectTask = (taskId: string) => {
     setActiveTaskId(taskId)
@@ -63,19 +62,11 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
-  // Подписка на смену fullscreen-режима (пользователь мог сам выйти через ESC/свайп)
+  // Подписка на смену fullscreen-режима (пользователь мог сам выйти через ESC)
   useEffect(() => {
     const unsubscribeFs = onFullscreenChange((isFs) => setFullscreen(isFs))
     return unsubscribeFs
   }, [])
-
-  const handleExpand = () => {
-    haptic('light')
-    expandApp()
-    // expand() не возвращает Promise и не вызывает событие немедленно,
-    // поэтому обновляем локальное состояние вручную.
-    setExpanded(true)
-  }
 
   const toggleFullscreen = async () => {
     haptic('light')
@@ -86,7 +77,6 @@ export default function App() {
         await requestAppFullscreen()
       }
     } catch (err) {
-      // Тихая ошибка — пользователь увидит, что состояние не поменялось
       console.warn('[App] fullscreen toggle failed:', err)
     }
   }
@@ -108,49 +98,26 @@ export default function App() {
               </p>
             )}
           </div>
-          {/* Две кнопки управления размером окна */}
-          <div className="flex gap-1.5 shrink-0">
-            {/* «Развернуть» — expand(): разворачивает MiniApp по высоте внутри
-                текущего окна Telegram. На десктопе НЕ меняет размер самого окна.
-                Не прячет панель задач. */}
+          {/* Кнопка полноэкранного режима — только на десктопе,
+              если клиент поддерживает requestFullscreen() */}
+          {showFullscreenButton && (
             <button
-              onClick={handleExpand}
-              className="rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
+              onClick={toggleFullscreen}
+              className="shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
               style={{
-                backgroundColor: expanded
+                backgroundColor: fullscreen
                   ? 'var(--tg-color-link, #2481cc)'
                   : 'var(--tg-color-section-bg, #ffffff)',
-                color: expanded
+                color: fullscreen
                   ? '#ffffff'
                   : 'var(--tg-color-link, #2481cc)',
                 border: '1px solid var(--tg-color-link, #2481cc)',
               }}
-              title="Развернуть окно приложения на максимальную высоту (панель задач остаётся видимой)"
-              disabled={expanded}
+              title={fullscreen ? 'Выйти из полноэкранного режима' : 'Открыть в полноэкранном режиме (без панели задач)'}
             >
-              ⛶ Развернуть
+              {fullscreen ? '🗙 Выйти' : '⤢ Полный экран'}
             </button>
-            {/* «Полный экран» — requestFullscreen(): настоящий fullscreen,
-                прячет панель задач и системные элементы. Только если поддерживается клиентом. */}
-            {fullscreenSupported && (
-              <button
-                onClick={toggleFullscreen}
-                className="rounded-lg px-3 py-1.5 text-xs font-medium transition-colors"
-                style={{
-                  backgroundColor: fullscreen
-                    ? 'var(--tg-color-link, #2481cc)'
-                    : 'var(--tg-color-section-bg, #ffffff)',
-                  color: fullscreen
-                    ? '#ffffff'
-                    : 'var(--tg-color-link, #2481cc)',
-                  border: '1px solid var(--tg-color-link, #2481cc)',
-                }}
-                title={fullscreen ? 'Выйти из полноэкранного режима' : 'Открыть в полноэкранном режиме (без панели задач)'}
-              >
-                {fullscreen ? '🗙 Выйти' : '⤢ Полный экран'}
-              </button>
-            )}
-          </div>
+          )}
         </header>
 
         {/* Переключатель вкладок */}
@@ -178,7 +145,7 @@ export default function App() {
         </div>
 
         {/* Подсказка для desktop-пользователей — только если не в fullscreen */}
-        {isDesktop && !fullscreen && (
+        {isDesktop && !fullscreen && showFullscreenButton && (
           <div
             className="rounded-xl p-2.5 text-xs leading-relaxed"
             style={{
@@ -186,10 +153,8 @@ export default function App() {
               color: 'var(--tg-color-link, #2481cc)',
             }}
           >
-            💻 <b>Desktop-режим:</b> растяните окно Telegram за правый нижний
-            угол мышью — Telegram запомнит размер для следующих запусков.
-            Для полноэкранного режима (без панели задач) нажмите
-            «⤢ Полный экран» в шапке.
+            💻 <b>Desktop-режим:</b> нажмите «⤢ Полный экран» в шапке,
+            чтобы развернуть приложение на весь экран без панели задач.
           </div>
         )}
 
