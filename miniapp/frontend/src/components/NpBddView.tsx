@@ -8,7 +8,7 @@
  *  4. График 2: кумулятивный Тр по месяцам текущего года (факт + прогноз + план).
  *  5. Кнопка «Заморозить год» для админ-действий.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   CartesianGrid,
@@ -276,31 +276,46 @@ export function NpBddView(_: NpBddViewProps = {}) {
     return years.map((year) => {
       const planVal = d.plan_series[year]
       let factVal: number | null = null
+      let factDeaths: number | null = null
+      let isForecast = false
       if (d.history[year]) {
         factVal = d.history[year].tr
+        factDeaths = d.history[year].deaths
       } else if (d.current_year.year.toString() === year) {
         factVal = d.current_year.tr_forecast_full_year
+        // Для текущего года — прогноз погибших на конец года (может быть коридор)
+        factDeaths = d.current_year.deaths_forecast_full_year
+        isForecast = true
       }
+      // Плановых погибших у нас нет (есть только tr_plan); оставляем null
       return {
         year,
         plan: planVal,
         fact: factVal,
-        isForecast: d.current_year.year.toString() === year,
+        isForecast,
+        // Для tooltip: кумулятивные погибшие за год
+        factDeaths,
+        // Оптимист/пессимист для текущего года (для tooltip в коридоре)
+        optimisticDeaths: isForecast ? d.current_year.deaths_forecast_optimistic ?? null : null,
+        pessimisticDeaths: isForecast ? d.current_year.deaths_forecast_pessimistic ?? null : null,
       }
     })
   }, [dataQuery.data])
 
   // График 2: кумулятивный Тр по месяцам.
   //
-  // ВАЖНО: чтобы линии прогноза/коридора шли ОТ последней фактической точки
-  // (без разрыва по оси X), мы:
-  //   1) продлеваем fact на один месяц вперёд (m = current_month + 1) —
-  //      дублируем последнее фактическое значение. Точка (m+1, lastActual)
-  //      становится общей для fact и forecast.
-  //   2) во все прогнозные линии на этот же месяц ставим lastActual —
-  //      они стартуют из той же точки.
-  // Recharts соединит fact (1..m+1) и forecast (m+1..12) в одну непрерывную
-  // кривую, проходящую через последнюю фактическую точку.
+  // ВАЖНО: линии прогноза/коридора должны РАЗВЕТВЛЯТЬСЯ от последней
+  // фактической точки — без разрыва по оси X и без «хвоста» факта.
+  //
+  // Логика:
+  //   - На последнем фактическом месяце (m = current_month) рисуем fact,
+  //     и в этой же точке стартуют все прогнозные линии — все равны lastActual.
+  //   - На следующих месяцах (m > current_month) fact = null (не продлеваем!),
+  //     прогнозные линии = своим значениям.
+  //   - На прошлых месяцах (m < current_month) fact = actual, прогнозы = null.
+  //
+  // В итоге Recharts рисует: fact (1..m) ── точка ветвления ── три прогнозные
+  // линии (m..12), расходящиеся из последней фактической точки.
   const chart2Data = useMemo(() => {
     if (!dataQuery.data) return []
     const mc = dataQuery.data.current_year.monthly_chart
@@ -321,39 +336,41 @@ export function NpBddView(_: NpBddViewProps = {}) {
       const pessimisticDeaths = mc.deaths_pessimistic_cumulative?.[key]
       const plan = mc.plan_cumulative[key]
 
-      // Точка состыковки: первый прогнозный месяц.
-      const isJointPoint = m === lastActualMonth + 1 && lastActualValue !== undefined
+      // Точка ветвления: последний фактический месяц.
+      // В ней fact и все прогнозные линии равны lastActual.
+      const isJointPoint = m === lastActualMonth && lastActualValue !== undefined
+
+      // Для прогнозных линий: на точке ветвления = lastActual,
+      // иначе = своё значение (если определено).
+      const joinTr = isJointPoint ? lastActualValue! : null
+      const joinDeaths = isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null
 
       return {
         month: MONTH_SHORT[m - 1] || `М${m}`,
-        // fact продлеваем на один месяц вперёд = lastActual (точка состыковки)
-        fact: actual !== undefined
-          ? actual
-          : (isJointPoint ? lastActualValue! : null),
-        // Все прогнозные линии на точке состыковки = lastActual
-        forecast: forecast !== undefined
-          ? forecast
-          : (isJointPoint ? lastActualValue! : null),
-        optimistic: optimistic !== undefined
-          ? optimistic
-          : (isJointPoint ? lastActualValue! : null),
-        pessimistic: pessimistic !== undefined
-          ? pessimistic
-          : (isJointPoint ? lastActualValue! : null),
+        // fact: только actual, НЕ продлеваем на будущие месяцы
+        fact: actual !== undefined ? actual : null,
+        // Прогнозные линии: на точке ветвления = lastActual, дальше = своим значениям
+        forecast: isJointPoint
+          ? joinTr
+          : (forecast !== undefined ? forecast : null),
+        optimistic: isJointPoint
+          ? joinTr
+          : (optimistic !== undefined ? optimistic : null),
+        pessimistic: isJointPoint
+          ? joinTr
+          : (pessimistic !== undefined ? pessimistic : null),
         plan,
         // То же самое для погибших (для tooltip)
-        factDeaths: actualDeaths !== undefined
-          ? actualDeaths
-          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
-        forecastDeaths: forecastDeaths !== undefined
-          ? forecastDeaths
-          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
-        optimisticDeaths: optimisticDeaths !== undefined
-          ? optimisticDeaths
-          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
-        pessimisticDeaths: pessimisticDeaths !== undefined
-          ? pessimisticDeaths
-          : (isJointPoint && lastActualDeaths !== undefined ? lastActualDeaths : null),
+        factDeaths: actualDeaths !== undefined ? actualDeaths : null,
+        forecastDeaths: isJointPoint
+          ? joinDeaths
+          : (forecastDeaths !== undefined ? forecastDeaths : null),
+        optimisticDeaths: isJointPoint
+          ? joinDeaths
+          : (optimisticDeaths !== undefined ? optimisticDeaths : null),
+        pessimisticDeaths: isJointPoint
+          ? joinDeaths
+          : (pessimisticDeaths !== undefined ? pessimisticDeaths : null),
       }
     })
   }, [dataQuery.data])
@@ -484,7 +501,15 @@ export function NpBddView(_: NpBddViewProps = {}) {
 
 interface NpBddContentProps {
   data: NpBddData
-  chart1Data: Array<{ year: string; plan: number; fact: number | null; isForecast: boolean }>
+  chart1Data: Array<{
+    year: string
+    plan: number
+    fact: number | null
+    isForecast: boolean
+    factDeaths: number | null
+    optimisticDeaths: number | null
+    pessimisticDeaths: number | null
+  }>
   chart2Data: Array<{
     month: string
     fact: number | null
@@ -569,6 +594,69 @@ function NpBddContent({
           const forecastDeaths = current_year.deaths_forecast_full_year
           const delta = planDeaths !== null ? forecastDeaths - planDeaths : null
           const deltaSign = delta !== null && delta > 0 ? '+' : ''
+
+          // === Логика для варианта B (с коридором) ===
+          // Цвет плашки = по центральному прогнозу (kpi.status).
+          // Если центр ok и пессимист не выполняет → ⚠ предупреждение о риске.
+          // Если центр danger и оптимист выполняет → ✓ указание на возможность.
+          const optDeaths = current_year.deaths_forecast_optimistic ?? null
+          const pessDeaths = current_year.deaths_forecast_pessimistic ?? null
+          const corridorHas = corridorOn && optDeaths !== null && pessDeaths !== null
+
+          // План выполняется = deaths <= planDeaths (т.е. delta <= 0)
+          const centralAchieved = delta !== null ? delta <= 0 : null
+          const optimistAchieved =
+            planDeaths !== null && optDeaths !== null ? optDeaths <= planDeaths : null
+          const pessimistAchieved =
+            planDeaths !== null && pessDeaths !== null ? pessDeaths <= planDeaths : null
+
+          // Дельты по коридору (для hint)
+          const deltaOpt =
+            planDeaths !== null && optDeaths !== null ? optDeaths - planDeaths : null
+          const deltaPess =
+            planDeaths !== null && pessDeaths !== null ? pessDeaths - planDeaths : null
+          const fmtDelta = (d: number | null): string =>
+            d === null ? '—' : `${d > 0 ? '+' : ''}${d}`
+
+          // Формируем hint в зависимости от сценария
+          let deviationHint: ReactNode
+          if (corridorHas && centralAchieved !== null && optimistAchieved !== null && pessimistAchieved !== null) {
+            // Коридор: показываем оптим./пессим. + индикатор риска
+            const lines: ReactNode[] = []
+            lines.push(
+              <div key="opt" style={{ color: optimistAchieved ? '#34c759' : '#ff9500' }}>
+                {optimistAchieved ? '✓' : '⚠'} Оптим.: {fmtDelta(deltaOpt)} погибших
+              </div>
+            )
+            lines.push(
+              <div key="pess" style={{ color: pessimistAchieved ? '#34c759' : '#ff9500' }}>
+                {pessimistAchieved ? '✓' : '⚠'} Пессим.: {fmtDelta(deltaPess)} погибших
+              </div>
+            )
+
+            if (centralAchieved && !pessimistAchieved) {
+              // Центр выполняется, но пессимист не выполняет → предупреждение о риске
+              lines.push(
+                <div key="warn" style={{ marginTop: 2, color: '#ff9500', fontWeight: 600 }}>
+                  ⚠ Внимание: при негативном сценарии план не выполняется
+                </div>
+              )
+            } else if (!centralAchieved && optimistAchieved) {
+              // Центр не выполняется, но оптимист выполняет → указание на возможность
+              lines.push(
+                <div key="opt-note" style={{ marginTop: 2, color: '#34c759', fontWeight: 600 }}>
+                  ✓ Возможен позитивный сценарий: план выполняется
+                </div>
+              )
+            }
+            deviationHint = <>{lines.map((l, i) => <div key={i}>{l}</div>)}</>
+          } else if (delta !== null) {
+            // Центральный метод или коридор недоступен — старый формат
+            deviationHint = `${STATUS_LABELS[kpi.status]} • Δ = ${deltaSign}${delta} погибших от плана`
+          } else {
+            deviationHint = STATUS_LABELS[kpi.status]
+          }
+
           return (
             <>
               <KpiCard
@@ -579,11 +667,7 @@ function NpBddContent({
               <KpiCard
                 label="Отклонение от плана"
                 value={`${kpi.deviation_pct > 0 ? '+' : ''}${kpi.deviation_pct}%`}
-                hint={
-                  delta !== null
-                    ? `${STATUS_LABELS[kpi.status]} • Δ = ${deltaSign}${delta} погибших от плана`
-                    : STATUS_LABELS[kpi.status]
-                }
+                hint={deviationHint}
                 highlight={kpi.status}
               />
             </>
@@ -611,15 +695,107 @@ function NpBddContent({
               <XAxis dataKey="year" tick={{ fontSize: 11 }} />
               <YAxis tick={{ fontSize: 11 }} />
               <Tooltip
-                contentStyle={{
-                  background: 'var(--tg-color-section-bg, #fff)',
-                  border: '1px solid var(--tg-color-hint, #ccc)',
-                  borderRadius: '8px',
-                  fontSize: '12px',
+                content={({ active, payload, label }) => {
+                  if (!active || !payload || payload.length === 0) return null
+                  const pointRecord = payload[0]?.payload as
+                    | {
+                        year: string
+                        isForecast?: boolean
+                        factDeaths?: number | null
+                        optimisticDeaths?: number | null
+                        pessimisticDeaths?: number | null
+                      }
+                    | undefined
+                  const isForecast = pointRecord?.isForecast === true
+                  const factDeaths = pointRecord?.factDeaths ?? null
+                  const optDeaths = pointRecord?.optimisticDeaths ?? null
+                  const pessDeaths = pointRecord?.pessimisticDeaths ?? null
+
+                  const colorMap: Record<string, string> = {
+                    plan: 'var(--tg-color-link, #2481cc)',
+                    fact: 'var(--tg-color-destructive, #ff3b30)',
+                  }
+                  const labelMap: Record<string, string> = {
+                    plan: 'План',
+                    fact: isForecast ? 'Прогноз' : 'Факт',
+                  }
+
+                  return (
+                    <div
+                      style={{
+                        background: 'var(--tg-color-section-bg, #fff)',
+                        border: '1px solid var(--tg-color-hint, #ccc)',
+                        borderRadius: '8px',
+                        fontSize: '12px',
+                        padding: '8px 10px',
+                        color: 'var(--tg-color-text, #000)',
+                      }}
+                    >
+                      <div style={{ fontWeight: 600, marginBottom: 4 }}>{label}</div>
+                      {payload.map((entry) => {
+                        const dk = String(entry.dataKey ?? '')
+                        const trVal = typeof entry.value === 'number' ? entry.value : null
+                        // Для fact показываем погибших (факт или прогноз на конец года)
+                        const deaths = dk === 'fact' ? factDeaths : null
+                        return (
+                          <div
+                            key={dk}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              marginTop: 2,
+                            }}
+                          >
+                            <span
+                              style={{
+                                display: 'inline-block',
+                                width: 10,
+                                height: 10,
+                                borderRadius: 2,
+                                background: colorMap[dk] ?? '#999',
+                                flexShrink: 0,
+                              }}
+                            />
+                            <span>
+                              {labelMap[dk] ?? dk}:{' '}
+                              <span style={{ fontWeight: 600 }}>
+                                {trVal !== null ? trVal.toFixed(3) : '—'}
+                              </span>
+                              {deaths !== null && deaths !== undefined && (
+                                <span style={{ opacity: 0.7 }}>
+                                  {' '}({deaths} погибш.)
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                        )
+                      })}
+                      {isForecast && (optDeaths !== null || pessDeaths !== null) && (
+                        <div
+                          style={{
+                            marginTop: 4,
+                            paddingTop: 4,
+                            borderTop: '1px solid var(--tg-color-hint, #ccc)',
+                            opacity: 0.85,
+                            fontSize: '11px',
+                          }}
+                        >
+                          {optDeaths !== null && (
+                            <div>
+                              <span style={{ color: '#34c759' }}>●</span> Оптим.: {optDeaths} погибш.
+                            </div>
+                          )}
+                          {pessDeaths !== null && (
+                            <div>
+                              <span style={{ color: '#ff9500' }}>●</span> Пессим.: {pessDeaths} погибш.
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
                 }}
-                formatter={(v: unknown) =>
-                  typeof v === 'number' ? v.toFixed(3) : (v != null ? String(v) : '—')
-                }
               />
               <Legend wrapperStyle={{ fontSize: '11px' }} />
               <Line
@@ -881,7 +1057,7 @@ function NpBddContent({
 interface KpiCardProps {
   label: string
   value: string
-  hint?: string
+  hint?: ReactNode
   highlight?: 'ok' | 'warning' | 'danger'
 }
 
@@ -906,7 +1082,7 @@ function KpiCard({ label, value, hint, highlight }: KpiCardProps) {
           {value}
         </div>
       </div>
-      {hint && <div className="text-xs text-tg-hint mt-1">{hint}</div>}
+      {hint && <div className="text-xs text-tg-hint mt-1 leading-snug">{hint}</div>}
     </div>
   )
 }
