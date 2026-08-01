@@ -882,13 +882,52 @@ async def cmd_precache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         # /precache 1145[,1146,...] [force]
+        # Поддерживаем 2 формата:
+        #   /precache 1145              — только коды (имя подгрузится из regions_builtin.json)
+        #   /precache 1145,Имя региона  — код + имя (через запятую, если регион нестандартный)
         codes_arg = args[0]
         force = len(args) > 1 and args[1].lower() == "force"
-        if not all(c.isdigit() for c in codes_arg.split(",")):
+
+        # Проверяем формат: либо все части — коды (4 цифры), либо код,Имя
+        parts = codes_arg.split(",")
+        all_codes = all(p.strip().isdigit() for p in parts)
+        has_named = any(not p.strip().isdigit() and p.strip() for p in parts[1:]) if len(parts) > 1 else False
+        # Формат "code,Name" — одна пара
+        is_code_name_pair = (
+            len(parts) == 2
+            and parts[0].strip().isdigit()
+            and parts[1].strip()
+            and not parts[1].strip().isdigit()
+        )
+
+        if is_code_name_pair:
+            # /precache 1182,Республика Дагестан
+            code = parts[0].strip()
+            name = parts[1].strip()
+            # Используем --regions-file через временный файл (так умеет precache_osm.py)
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", delete=False, encoding="utf-8"
+            )
+            tmp.write(f"{code},{name}\n")
+            tmp.close()
+            cmd = ["python", "precache_osm.py", "--regions-file", tmp.name]
+            if force:
+                cmd.append("--force")
+            await _run_precache(update, cmd, f"{name} ({code})")
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+            return
+
+        if not all_codes:
             await update.message.reply_text(
-                "❌ Неверный формат. Пример:\n"
-                "<code>/precache 1145</code>\n"
-                "<code>/precache 1145,1146,1147 force</code>",
+                "❌ Неверный формат. Примеры:\n"
+                "<code>/precache 1145</code> — по коду (имя подгрузится автоматически)\n"
+                "<code>/precache 1145,1146,1147</code> — несколько регионов\n"
+                "<code>/precache 1182,Республика Дагестан</code> — код + имя\n"
+                "<code>/precache 1145 force</code> — обновить принудительно",
                 parse_mode="HTML",
             )
             return

@@ -204,53 +204,78 @@ async def fetch_region_bbox(
         logger.info(f"  {reg_name} ({reg_code}): hardcoded bbox {bbox}")
         return bbox
 
-    # Иначе — запрос к Nominatim
-    # Используем формат "Россия, <название региона>" для точности
-    # Убираем префикс "гор. " и "(Татарстан)" для Nominatim
+    # Защита от мусорного имени "Регион XXX" — Nominatim его не поймёт.
+    # Если такое пришло — пробуем подгрузить правильное имя из regions_builtin.json.
+    if reg_name.startswith("Регион ") and reg_name.split()[-1] == reg_code:
+        names_map = _load_all_region_names()
+        if reg_code in names_map:
+            reg_name = names_map[reg_code]
+            logger.info(f"  {reg_code}: имя подгружено из regions_builtin.json → {reg_name}")
+        else:
+            logger.error(
+                f"  {reg_code}: имя не передано и в regions_builtin.json не найдено. "
+                f"Nominatim запрос невозможен. "
+                f"Укажите имя явно: /precache {reg_code},<Название региона>"
+            )
+            return None
+
+    # Запрос к Nominatim: пробуем разные форматы имени
+    # Убираем префикс "гор. " и суффиксы "(Татарстан)" для Nominatim
     clean_name = reg_name.replace("гор. ", "").split(" (")[0]
-    query = f"{clean_name}, Россия"
+    queries_to_try = [
+        f"{clean_name}, Россия",
+        clean_name,  # упрощённый запрос без страны
+    ]
 
-    await _nominatim_rate_limit()
-    try:
-        logger.info(f"  {reg_name} ({reg_code}): Nominatim запрос: {query}")
-        resp = await client.get(
-            NOMINATIM_URL,
-            params={
-                "q": query,
-                "format": "json",
-                "limit": 1,
-                "countrycodes": "ru",
-                "featureType": "state",
-            },
-            headers=NOMINATIM_HEADERS,
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data:
-            logger.warning(f"  {reg_name} ({reg_code}): Nominatim пустой ответ")
-            return None
+    for qi, query in enumerate(queries_to_try):
+        await _nominatim_rate_limit()
+        try:
+            logger.info(
+                f"  {reg_name} ({reg_code}): Nominatim запрос {qi+1}/{len(queries_to_try)}: {query}"
+            )
+            resp = await client.get(
+                NOMINATIM_URL,
+                params={
+                    "q": query,
+                    "format": "json",
+                    "limit": 1,
+                    "countrycodes": "ru",
+                    "featureType": "state",
+                },
+                headers=NOMINATIM_HEADERS,
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                logger.warning(
+                    f"  {reg_name} ({reg_code}): Nominatim пустой ответ для запроса '{query}'"
+                )
+                continue
 
-        bbox_str = data[0].get("boundingbox", [])
-        if len(bbox_str) != 4:
-            logger.warning(f"  {reg_name} ({reg_code}): Nominatim bbox некорректный")
-            return None
+            bbox_str = data[0].get("boundingbox", [])
+            if len(bbox_str) != 4:
+                logger.warning(f"  {reg_name} ({reg_code}): Nominatim bbox некорректный")
+                continue
 
-        # Nominatim возвращает: [south, north, west, east]
-        # Переводим в (lat_min, lon_min, lat_max, lon_max)
-        lat_min = float(bbox_str[0])
-        lat_max = float(bbox_str[1])
-        lon_min = float(bbox_str[2])
-        lon_max = float(bbox_str[3])
-        bbox = (lat_min, lon_min, lat_max, lon_max)
-        logger.info(
-            f"  {reg_name} ({reg_code}): Nominatim bbox "
-            f"({lat_min:.2f}, {lon_min:.2f}, {lat_max:.2f}, {lon_max:.2f})"
-        )
-        return bbox
-    except Exception as e:
-        logger.error(f"  {reg_name} ({reg_code}): Nominatim ошибка: {e}")
-        return None
+            # Nominatim возвращает: [south, north, west, east]
+            # Переводим в (lat_min, lon_min, lat_max, lon_max)
+            lat_min = float(bbox_str[0])
+            lat_max = float(bbox_str[1])
+            lon_min = float(bbox_str[2])
+            lon_max = float(bbox_str[3])
+            bbox = (lat_min, lon_min, lat_max, lon_max)
+            logger.info(
+                f"  {reg_name} ({reg_code}): Nominatim bbox "
+                f"({lat_min:.2f}, {lon_min:.2f}, {lat_max:.2f}, {lon_max:.2f})"
+            )
+            return bbox
+        except Exception as e:
+            logger.error(f"  {reg_name} ({reg_code}): Nominatim ошибка для '{query}': {e}")
+            continue
+
+    logger.error(f"  {reg_name} ({reg_code}): все варианты Nominatim запросов не удались")
+    return None
 
 
 # ========================
@@ -495,6 +520,34 @@ async def precache_region(
 # ========================
 # CLI
 # ========================
+def _load_all_region_names() -> dict[str, str]:
+    """
+    Загружает полный справочник регионов из regions_builtin.json.
+    Возвращает {code: name} для всех 82 регионов РФ.
+
+    Используется как fallback при --codes: если регион не в DEFAULT_REGIONS,
+    но есть в regions_builtin — берём правильное имя для Nominatim.
+    """
+    try:
+        # Ищем regions_builtin.json рядом с репозиторием
+        path = Path(__file__).resolve().parent / "regions_builtin.json"
+        if not path.exists():
+            logger.warning(f"regions_builtin.json не найден: {path}")
+            return {}
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return {str(r.get("code", "")): r.get("name", "") for r in data}
+        elif isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+        return {}
+    except Exception as e:
+        logger.warning(f"Ошибка загрузки regions_builtin.json: {e}")
+        return {}
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Предкэширование OSM-границ для топ-N регионов РФ",
@@ -533,9 +586,9 @@ def parse_args() -> argparse.Namespace:
 def load_regions(args: argparse.Namespace) -> list[tuple[str, str]]:
     """Возвращает список (code, name) для предкэширования."""
     if args.codes:
-        # Парсим коды, имена берём из DEFAULT_REGIONS если есть
+        # Парсим коды, имена берём из полного справочника regions_builtin.json
         codes = [c.strip() for c in args.codes.split(",") if c.strip()]
-        names_map = dict(DEFAULT_REGIONS)
+        names_map = _load_all_region_names()
         return [(c, names_map.get(c, f"Регион {c}")) for c in codes]
 
     if args.regions_file:
