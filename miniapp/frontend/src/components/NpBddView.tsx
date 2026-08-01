@@ -20,7 +20,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { api, type NpBddData, type NpBddRegion } from '@/lib/api'
+import { api, type NpBddData, type NpBddForecastMethod, type NpBddRegion } from '@/lib/api'
 import { haptic, showAlert, showConfirm } from '@/lib/telegram'
 import { cn } from '@/lib/utils'
 
@@ -49,6 +49,7 @@ export function NpBddView(_: NpBddViewProps = {}) {
   const queryClient = useQueryClient()
   const [selectedRegion, setSelectedRegion] = useState<string>('')
   const [planLineMode, setPlanLineMode] = useState<'linear' | 'horizontal'>('linear')
+  const [forecastMethod, setForecastMethod] = useState<NpBddForecastMethod>('central_only')
 
   // --- Список регионов ---
   const regionsQuery = useQuery({
@@ -76,12 +77,15 @@ export function NpBddView(_: NpBddViewProps = {}) {
     if (settingsQuery.data?.plan_line_mode) {
       setPlanLineMode(settingsQuery.data.plan_line_mode)
     }
+    if (settingsQuery.data?.forecast_method) {
+      setForecastMethod(settingsQuery.data.forecast_method)
+    }
   }, [settingsQuery.data])
 
   // --- Главный payload ---
   const dataQuery = useQuery({
-    queryKey: ['np-bdd-data', selectedRegion, planLineMode],
-    queryFn: () => api.npBddGetData(selectedRegion, planLineMode),
+    queryKey: ['np-bdd-data', selectedRegion, planLineMode, forecastMethod],
+    queryFn: () => api.npBddGetData(selectedRegion, planLineMode, forecastMethod),
     enabled: !!selectedRegion,
     staleTime: 5 * 60 * 1000, // 5 минут на клиенте
     retry: 1,
@@ -95,13 +99,23 @@ export function NpBddView(_: NpBddViewProps = {}) {
     staleTime: 60 * 1000,
   })
 
-  // --- Мутация: переключение plan_line_mode ---
+  // --- Мутация: переключение plan_line_mode / forecast_method ---
   const updateSettingsMutation = useMutation({
-    mutationFn: (mode: 'linear' | 'horizontal') =>
-      api.npBddUpdateSettings(selectedRegion, mode),
+    mutationFn: (params: {
+      plan_line_mode: 'linear' | 'horizontal'
+      forecast_method?: NpBddForecastMethod
+    }) =>
+      api.npBddUpdateSettings(
+        selectedRegion,
+        params.plan_line_mode,
+        params.forecast_method,
+      ),
     onSuccess: (data) => {
       haptic('light')
       setPlanLineMode(data.plan_line_mode)
+      if (data.forecast_method) {
+        setForecastMethod(data.forecast_method)
+      }
       // Инвалидируем data, чтобы перетянуть с новым режимом
       queryClient.invalidateQueries({ queryKey: ['np-bdd-data', selectedRegion] })
     },
@@ -142,7 +156,19 @@ export function NpBddView(_: NpBddViewProps = {}) {
 
   const handleTogglePlanLine = () => {
     const newMode = planLineMode === 'linear' ? 'horizontal' : 'linear'
-    updateSettingsMutation.mutate(newMode)
+    updateSettingsMutation.mutate({
+      plan_line_mode: newMode,
+      forecast_method: forecastMethod,
+    })
+  }
+
+  const handleToggleForecastMethod = () => {
+    const newMethod: NpBddForecastMethod =
+      forecastMethod === 'central_only' ? 'corridor' : 'central_only'
+    updateSettingsMutation.mutate({
+      plan_line_mode: planLineMode,
+      forecast_method: newMethod,
+    })
   }
 
   const handleFreeze = async (year: number) => {
@@ -193,12 +219,16 @@ export function NpBddView(_: NpBddViewProps = {}) {
       const key = String(m)
       const actual = mc.tr_actual_cumulative[key]
       const forecast = mc.tr_forecast_cumulative[key]
+      const optimistic = mc.tr_optimistic_cumulative?.[key]
+      const pessimistic = mc.tr_pessimistic_cumulative?.[key]
       const plan = mc.plan_cumulative[key]
       return {
         month: MONTH_SHORT[m - 1] || `М${m}`,
         // Используем null для отсутствующих значений (recharts пропустит их)
         fact: actual !== undefined ? actual : null,
         forecast: forecast !== undefined ? forecast : null,
+        optimistic: optimistic !== undefined ? optimistic : null,
+        pessimistic: pessimistic !== undefined ? pessimistic : null,
         plan,
       }
     })
@@ -267,6 +297,24 @@ export function NpBddView(_: NpBddViewProps = {}) {
             {planLineMode === 'linear' ? 'Линейный' : 'Горизонтальный'}
           </button>
         </div>
+
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="tg-section-header text-xs">Метод прогноза (график 2)</div>
+            <div className="text-sm text-tg-hint mt-0.5">
+              {forecastMethod === 'corridor'
+                ? 'Коридор: центр + оптимистичный/пессимистичный (min/max по 3 годам)'
+                : 'Одна линия прогноза (текущий метод)'}
+            </div>
+          </div>
+          <button
+            className="tg-button !py-2 !px-3 text-sm"
+            onClick={handleToggleForecastMethod}
+            disabled={updateSettingsMutation.isPending}
+          >
+            {forecastMethod === 'corridor' ? 'Коридор' : 'Центр'}
+          </button>
+        </div>
       </div>
 
       {/* KPI-карточки + графики */}
@@ -299,7 +347,14 @@ export function NpBddView(_: NpBddViewProps = {}) {
 interface NpBddContentProps {
   data: NpBddData
   chart1Data: Array<{ year: string; plan: number; fact: number | null; isForecast: boolean }>
-  chart2Data: Array<{ month: string; fact: number | null; forecast: number | null; plan: number }>
+  chart2Data: Array<{
+    month: string
+    fact: number | null
+    forecast: number | null
+    optimistic: number | null
+    pessimistic: number | null
+    plan: number
+  }>
   frozenYears: Array<{ year: number; tr: number; deaths: number; frozen_at?: string; note?: string }>
   onFreeze: (year: number) => void
   onUnfreeze: (year: number) => void
@@ -312,6 +367,7 @@ function NpBddContent({
   onFreeze, onUnfreeze, freezePending, unfreezePending,
 }: NpBddContentProps) {
   const { kpi, region, current_year, seasonal } = data
+  const corridorOn = data.forecast_method === 'corridor' && data.corridor_available === true
 
   // Замороженные годы как Set для быстрой проверки
   const frozenSet = useMemo(() => new Set(frozenYears.map((f) => f.year)), [frozenYears])
@@ -351,7 +407,11 @@ function NpBddContent({
         <KpiCard
           label="Тр прогноз (конец года)"
           value={kpi.tr_forecast_full_year.toFixed(3)}
-          hint={`≈ ${current_year.deaths_forecast_full_year} погибших`}
+          hint={
+            corridorOn && kpi.tr_forecast_optimistic != null && kpi.tr_forecast_pessimistic != null
+              ? `Коридор: ${kpi.tr_forecast_optimistic.toFixed(3)} – ${kpi.tr_forecast_pessimistic.toFixed(3)} (≈ ${current_year.deaths_forecast_optimistic ?? '—'} – ${current_year.deaths_forecast_pessimistic ?? '—'} погибших)`
+              : `≈ ${current_year.deaths_forecast_full_year} погибших`
+          }
           highlight={kpi.status}
         />
         <KpiCard
@@ -445,6 +505,7 @@ function NpBddContent({
         </h3>
         <p className="text-xs text-tg-hint mb-3">
           Сплошная — факт (прошедшие месяцы), пунктир — прогноз (будущие), линия плана — {data.current_year.monthly_chart.plan_line_mode === 'linear' ? 'линейный рост' : 'горизонталь'}.
+          {corridorOn && ' Коридор (зелёный/оранжевый) — min/max по историческим годам.'}
         </p>
         <div className="h-64">
           <ResponsiveContainer width="100%" height="100%">
@@ -483,6 +544,30 @@ function NpBddContent({
                 dot={{ r: 3 }}
                 connectNulls
               />
+              {corridorOn && (
+                <>
+                  <Line
+                    type="monotone"
+                    dataKey="optimistic"
+                    name="Оптимист. (min)"
+                    stroke="#34c759"
+                    strokeWidth={1.5}
+                    strokeDasharray="3 3"
+                    dot={false}
+                    connectNulls
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="pessimistic"
+                    name="Пессимист. (max)"
+                    stroke="#ff9500"
+                    strokeWidth={1.5}
+                    strokeDasharray="3 3"
+                    dot={false}
+                    connectNulls
+                  />
+                </>
+              )}
               <Line
                 type="monotone"
                 dataKey="plan"

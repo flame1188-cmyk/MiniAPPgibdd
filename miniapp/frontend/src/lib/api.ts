@@ -348,13 +348,20 @@ export interface NpBddYearRecord {
   source?: string
 }
 
+export type NpBddForecastMethod = 'central_only' | 'corridor'
+
 export interface NpBddMonthlyChart {
   months: number[]
   tr_actual_cumulative: Record<string, number>
   tr_forecast_cumulative: Record<string, number>
+  // Коридор прогноза (только для прогнозных месяцев; пусто, если corridor недоступен).
+  tr_optimistic_cumulative?: Record<string, number>
+  tr_pessimistic_cumulative?: Record<string, number>
   plan_cumulative: Record<string, number>
   current_month: number
   plan_line_mode: 'linear' | 'horizontal'
+  forecast_method?: NpBddForecastMethod
+  corridor_available?: boolean
   seasonal_source?: 'per-region' | 'global' | 'legacy' | 'uniform' | 'unknown'
   seasonal_region_code?: string | null
   seasonal_samples_used?: number
@@ -367,8 +374,13 @@ export interface NpBddCurrentYear {
   deaths_by_month_actual: Record<string, number>
   deaths_ytd: number
   deaths_forecast_full_year: number
+  // Коридор (null, если forecast_method='central_only' или corridor недоступен).
+  deaths_forecast_optimistic?: number | null
+  deaths_forecast_pessimistic?: number | null
   tr_actual_ytd: number
   tr_forecast_full_year: number
+  tr_forecast_optimistic?: number | null
+  tr_forecast_pessimistic?: number | null
   tr_plan: number
   monthly_chart: NpBddMonthlyChart
 }
@@ -376,6 +388,8 @@ export interface NpBddCurrentYear {
 export interface NpBddKpi {
   tr_actual_ytd: number
   tr_forecast_full_year: number
+  tr_forecast_optimistic?: number | null
+  tr_forecast_pessimistic?: number | null
   tr_plan: number
   deviation_pct: number
   status: 'ok' | 'warning' | 'danger'
@@ -393,12 +407,16 @@ export interface NpBddData {
   current_year: NpBddCurrentYear
   plan_series: Record<string, number>
   kpi: NpBddKpi
+  forecast_method?: NpBddForecastMethod
+  corridor_available?: boolean
+  corridor_years_used?: string[]
   seasonal?: NpBddSeasonalInfo
   calculated_at: string
 }
 
 export interface NpBddSettings {
   plan_line_mode: 'linear' | 'horizontal'
+  forecast_method: NpBddForecastMethod
 }
 
 export interface NpBddFrozenYear {
@@ -574,10 +592,15 @@ export const api = {
   npBddListRegions: () =>
     request<NpBddRegion[]>('/api/np-bdd/regions'),
 
-  npBddGetData: (regionCode: string, planLineMode: 'linear' | 'horizontal' = 'linear') =>
+  npBddGetData: (
+    regionCode: string,
+    planLineMode: 'linear' | 'horizontal' = 'linear',
+    forecastMethod: NpBddForecastMethod = 'central_only',
+  ) =>
     request<NpBddData>(
       `/api/np-bdd/data?region_code=${encodeURIComponent(regionCode)}` +
-      `&plan_line_mode=${planLineMode}`
+      `&plan_line_mode=${planLineMode}` +
+      `&forecast_method=${forecastMethod}`
     ),
 
   npBddGetSettings: (regionCode: string) =>
@@ -585,10 +608,18 @@ export const api = {
       `/api/np-bdd/settings?region_code=${encodeURIComponent(regionCode)}`
     ),
 
-  npBddUpdateSettings: (regionCode: string, planLineMode: 'linear' | 'horizontal') =>
+  npBddUpdateSettings: (
+    regionCode: string,
+    planLineMode: 'linear' | 'horizontal',
+    forecastMethod?: NpBddForecastMethod,
+  ) =>
     request<NpBddSettings>('/api/np-bdd/settings', {
       method: 'PATCH',
-      body: JSON.stringify({ region_code: regionCode, plan_line_mode: planLineMode }),
+      body: JSON.stringify({
+        region_code: regionCode,
+        plan_line_mode: planLineMode,
+        forecast_method: forecastMethod,
+      }),
     }),
 
   npBddListFrozen: (regionCode: string) =>

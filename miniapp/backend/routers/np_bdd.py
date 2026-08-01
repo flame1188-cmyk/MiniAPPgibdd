@@ -54,6 +54,7 @@ class UnfreezeRequest(BaseModel):
 class SettingsUpdate(BaseModel):
     region_code: str
     plan_line_mode: Optional[Literal["linear", "horizontal"]] = None
+    forecast_method: Optional[Literal["central_only", "corridor"]] = None
 
 
 # --- Эндпоинты -------------------------------------------------------------
@@ -69,6 +70,7 @@ async def regions_list(user: TelegramUser = Depends(get_current_user)):
 async def get_npbdd_data(
     region_code: str = Query(..., examples=["1106"]),
     plan_line_mode: Literal["linear", "horizontal"] = Query("linear"),
+    forecast_method: Literal["central_only", "corridor"] = Query("central_only"),
     user: TelegramUser = Depends(get_current_user),
 ):
     """
@@ -78,16 +80,25 @@ async def get_npbdd_data(
     - region: {code, name}
     - history: {"2023": {deaths, vehicles, tr, frozen?, source}, ...}
     - current_year: {year, months_actual, months_forecast, deaths_by_month_actual,
-                     deaths_ytd, deaths_forecast_full_year, tr_actual_ytd,
-                     tr_forecast_full_year, tr_plan, monthly_chart}
+                     deaths_ytd, deaths_forecast_full_year, deaths_forecast_optimistic?,
+                     deaths_forecast_pessimistic?, tr_actual_ytd,
+                     tr_forecast_full_year, tr_forecast_optimistic?,
+                     tr_forecast_pessimistic?, tr_plan, monthly_chart}
     - plan_series: {"2023": 2.03, ..., "2030": 0.91}
-    - kpi: {tr_actual_ytd, tr_forecast_full_year, tr_plan, deviation_pct, status}
+    - kpi: {tr_actual_ytd, tr_forecast_full_year, tr_forecast_optimistic?,
+            tr_forecast_pessimistic?, tr_plan, deviation_pct, status}
+    - forecast_method: "central_only" | "corridor"
+    - corridor_available: bool
     - calculated_at
 
     Кэшируется на 10 минут на бэкенде.
     """
     try:
-        return await svc_get_data(region_code, plan_line_mode=plan_line_mode)
+        return await svc_get_data(
+            region_code,
+            plan_line_mode=plan_line_mode,
+            forecast_method=forecast_method,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -99,7 +110,7 @@ async def get_npbdd_settings(
     region_code: str = Query(...),
     user: TelegramUser = Depends(get_current_user),
 ):
-    """Настройки региона (пока только plan_line_mode)."""
+    """Настройки региона (plan_line_mode и forecast_method)."""
     return await svc_get_settings(region_code)
 
 
@@ -112,6 +123,7 @@ async def update_npbdd_settings(
     return await svc_update_settings(
         region_code=payload.region_code,
         plan_line_mode=payload.plan_line_mode,
+        forecast_method=payload.forecast_method,
     )
 
 

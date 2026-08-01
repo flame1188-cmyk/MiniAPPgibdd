@@ -108,9 +108,9 @@ logger.info("[np_bdd] CWD = %s", Path.cwd())
 logger.info("[np_bdd] __file__ = %s", _SERVICE_FILE)
 logger.info("[np_bdd] Candidates checked: %s", [str(p) for p in _CANDIDATE_ROOTS])
 
-# Кэш: (region_code, plan_line_mode) → (payload, timestamp)
+# Кэш: (region_code, plan_line_mode, forecast_method) → (payload, timestamp)
 # TTL = 10 минут.
-_CACHE: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
+_CACHE: dict[tuple[str, str, str], tuple[dict[str, Any], float]] = {}
 _CACHE_TTL_SEC = 600  # 10 минут
 
 
@@ -269,21 +269,32 @@ async def list_regions() -> list[dict[str, Any]]:
 async def get_data(
     region_code: str,
     plan_line_mode: Literal["linear", "horizontal"] = "linear",
+    forecast_method: Literal["central_only", "corridor"] = "central_only",
     use_cache: bool = True,
 ) -> dict[str, Any]:
     """
     Возвращает runtime-расчёт для UI: история + текущий год + прогноз + KPI.
 
-    Кэшируется на 10 минут по ключу (region_code, plan_line_mode).
+    Кэшируется на 10 минут по ключу (region_code, plan_line_mode, forecast_method).
+
+    Args:
+        forecast_method: "central_only" — одна линия прогноза (по умолчанию);
+            "corridor" — центр + optimistic/pessimistic через min/max
+            per-year cum_share. Если per-year истории нет — коридор
+            молча отключается (corridor_available=False в payload).
     """
-    cache_key = (region_code, plan_line_mode)
+    cache_key = (region_code, plan_line_mode, forecast_method)
     if use_cache and cache_key in _CACHE:
         payload, ts = _CACHE[cache_key]
         if time.time() - ts < _CACHE_TTL_SEC:
             return payload
 
     forecast = _get_forecast()
-    payload = await forecast.runtime_calc_async(region_code, plan_line_mode=plan_line_mode)
+    payload = await forecast.runtime_calc_async(
+        region_code,
+        plan_line_mode=plan_line_mode,
+        forecast_method=forecast_method,
+    )
 
     if use_cache:
         _CACHE[cache_key] = (payload, time.time())
@@ -400,25 +411,41 @@ def _save_all_settings(data: dict[str, Any]) -> None:
 
 
 async def get_settings(region_code: str) -> dict[str, Any]:
-    """Возвращает настройки региона. По умолчанию plan_line_mode='linear'."""
+    """
+    Возвращает настройки региона. По умолчанию:
+    - plan_line_mode = 'linear'
+    - forecast_method = 'central_only'
+    """
     all_settings = _load_all_settings()
     region_settings = all_settings.get(region_code, {})
     return {
         "plan_line_mode": region_settings.get("plan_line_mode", "linear"),
+        "forecast_method": region_settings.get("forecast_method", "central_only"),
     }
 
 
 async def update_settings(region_code: str,
                           plan_line_mode: Literal["linear", "horizontal"] | None = None,
+                          forecast_method: Literal["central_only", "corridor"] | None = None,
                           ) -> dict[str, Any]:
-    """Обновляет настройки региона. None-поля не меняются."""
+    """
+    Обновляет настройки региона. None-поля не меняются.
+
+    Args:
+        plan_line_mode: 'linear' или 'horizontal' — режим линии плана на графике 2.
+        forecast_method: 'central_only' (одна линия прогноза) или 'corridor'
+            (центр + optimistic/pessimistic через min/max per-year cum_share).
+    """
     all_settings = _load_all_settings()
     region_settings = all_settings.get(region_code, {})
     if plan_line_mode is not None:
         region_settings["plan_line_mode"] = plan_line_mode
+    if forecast_method is not None:
+        region_settings["forecast_method"] = forecast_method
     all_settings[region_code] = region_settings
     _save_all_settings(all_settings)
     invalidate_cache(region_code)
     return {
         "plan_line_mode": region_settings.get("plan_line_mode", "linear"),
+        "forecast_method": region_settings.get("forecast_method", "central_only"),
     }
