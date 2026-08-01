@@ -899,64 +899,36 @@ async def cmd_precache(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def _run_precache(update: Update, cmd: list, label: str) -> None:
-    """Запускает precache_osm.py как subprocess и стримит вывод в чат."""
+    """Запускает precache_osm.py как subprocess.
+
+    Все логи subprocess идут в stdout/stderr → автоматически попадают в
+    `docker logs` (видны через «Показать логи» на bothost).
+    В Telegram отправляем только 2 уведомления: старт и финиш.
+    """
     await update.message.reply_text(
-        f"🔄 Запуск precache для: {label}\n"
-        f"Команда: <code>{' '.join(cmd)}</code>\n\n"
-        f"⏳ Это может занять от 1 до 30 минут в зависимости от региона.\n"
-        f"Вывод будет приходить сообщениями.",
-        parse_mode="HTML",
+        f"🔄 Запуск precache: {label}\n"
+        f"⏳ Процесс идёт в фоне. Полные логи — «Показать логи» на bothost.\n"
+        f"Сообщу о завершении.",
     )
 
     try:
+        # stdout/stderr не перехватываем — вывод идёт напрямую в docker logs.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
             cwd=os.path.dirname(os.path.abspath(__file__)),
         )
-
-        buffer: list[str] = []
-        buffer_size = 0
-        last_send = asyncio.get_event_loop().time()
-
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").rstrip()
-            if not line:
-                continue
-            buffer.append(line)
-            buffer_size += len(line) + 1
-
-            now = asyncio.get_event_loop().time()
-            if buffer_size >= 3500 or (now - last_send) >= 10:
-                text = "\n".join(buffer)
-                try:
-                    await update.message.reply_text(
-                        f"<pre>{html_mod.escape(text)}</pre>",
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass  # не роняем процесс из-за ошибки отправки
-                buffer = []
-                buffer_size = 0
-                last_send = now
-
-        if buffer:
-            text = "\n".join(buffer)
-            try:
-                await update.message.reply_text(
-                    f"<pre>{html_mod.escape(text)}</pre>",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                pass
-
         await proc.wait()
-        await update.message.reply_text(
-            f"✅ precache завершён (код {proc.returncode}).\n"
-            f"Используйте <code>/precache</code> для проверки статуса.",
-            parse_mode="HTML",
-        )
+
+        if proc.returncode == 0:
+            await update.message.reply_text(
+                "✅ precache завершён успешно.\n"
+                "Используйте /precache для проверки статуса кэша."
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ precache завершился с ошибкой (код {proc.returncode}).\n"
+                f"Подробности — в «Показать логи» на bothost."
+            )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка запуска: {e}")
 
