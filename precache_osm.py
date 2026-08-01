@@ -174,6 +174,11 @@ HARDCODED_BBOXES: dict[str, tuple[float, float, float, float]] = {
     "1147": (66.00, 28.20, 70.10, 41.50),   # Мурманская область
     "1133": (56.00, 47.20, 60.70, 54.40),   # Кировская область
     "1119": (58.20, 34.20, 60.90, 43.10),   # Вологодская область
+    # --- Городовые регионы (гор. фед. значения) ---
+    # Nominatim не отдаёт их с countrycodes=ru + featureType=state
+    # (Севастополь — спорная территория в OSM), поэтому зашиваем напрямую.
+    "1167": (44.39, 33.30, 44.85, 33.85),   # гор. Севастополь
+    "1199": (43.40, 39.85, 44.20, 40.50),   # гор. Сочи (не регион ГИБДД, но используется)
 }
 
 
@@ -219,29 +224,56 @@ async def fetch_region_bbox(
             )
             return None
 
-    # Запрос к Nominatim: пробуем разные форматы имени
-    # Убираем префикс "гор. " и суффиксы "(Татарстан)" для Nominatim
+    # Запрос к Nominatim: пробуем разные комбинации имени и параметров.
+    # Для городовых регионов (гор. Москва, гор. Санкт-Петербург, гор. Севастополь)
+    # featureType=state НЕ работает — нужен featureType=city или без него.
+    # countrycodes=ru тоже мешает для Севастополя (OSM считает его Украиной).
+    # Поэтому пробуем 4 комбинации: с/без countrycodes + с/без featureType.
     clean_name = reg_name.replace("гор. ", "").split(" (")[0]
-    queries_to_try = [
-        f"{clean_name}, Россия",
-        clean_name,  # упрощённый запрос без страны
-    ]
+    is_city = reg_name.startswith("гор. ")
 
-    for qi, query in enumerate(queries_to_try):
+    queries_to_try: list[tuple[str, dict]] = []
+    # Для городовых — сначала без countrycodes, featureType=city
+    if is_city:
+        queries_to_try.append((
+            f"{clean_name}, Россия",
+            {"q": f"{clean_name}, Россия", "format": "json", "limit": 1, "featureType": "city"},
+        ))
+        queries_to_try.append((
+            clean_name,
+            {"q": clean_name, "format": "json", "limit": 1, "featureType": "city"},
+        ))
+        queries_to_try.append((
+            f"{clean_name}, Россия",
+            {"q": f"{clean_name}, Россия", "format": "json", "limit": 1},
+        ))
+    # Для областей/краёв/республик — featureType=state + countrycodes=ru
+    else:
+        queries_to_try.append((
+            f"{clean_name}, Россия",
+            {"q": f"{clean_name}, Россия", "format": "json", "limit": 1,
+             "countrycodes": "ru", "featureType": "state"},
+        ))
+        queries_to_try.append((
+            f"{clean_name}, Россия",
+            {"q": f"{clean_name}, Россия", "format": "json", "limit": 1,
+             "countrycodes": "ru"},
+        ))
+        queries_to_try.append((
+            clean_name,
+            {"q": clean_name, "format": "json", "limit": 1},
+        ))
+
+    for qi, (query_desc, params) in enumerate(queries_to_try):
         await _nominatim_rate_limit()
         try:
             logger.info(
-                f"  {reg_name} ({reg_code}): Nominatim запрос {qi+1}/{len(queries_to_try)}: {query}"
+                f"  {reg_name} ({reg_code}): Nominatim запрос {qi+1}/{len(queries_to_try)}: "
+                f"'{query_desc}' params={{{', '.join(f'{k}={v}' for k, v in params.items() if k != 'q' and k != 'format')}}}"
             )
             resp = await client.get(
                 NOMINATIM_URL,
-                params={
-                    "q": query,
-                    "format": "json",
-                    "limit": 1,
-                    "countrycodes": "ru",
-                    "featureType": "state",
-                },
+                params=params,
                 headers=NOMINATIM_HEADERS,
                 timeout=15.0,
             )
@@ -249,7 +281,7 @@ async def fetch_region_bbox(
             data = resp.json()
             if not data:
                 logger.warning(
-                    f"  {reg_name} ({reg_code}): Nominatim пустой ответ для запроса '{query}'"
+                    f"  {reg_name} ({reg_code}): Nominatim пустой ответ для запроса '{query_desc}'"
                 )
                 continue
 
@@ -265,13 +297,15 @@ async def fetch_region_bbox(
             lon_min = float(bbox_str[2])
             lon_max = float(bbox_str[3])
             bbox = (lat_min, lon_min, lat_max, lon_max)
+            display_name = data[0].get("display_name", "")[:60]
             logger.info(
                 f"  {reg_name} ({reg_code}): Nominatim bbox "
-                f"({lat_min:.2f}, {lon_min:.2f}, {lat_max:.2f}, {lon_max:.2f})"
+                f"({lat_min:.2f}, {lon_min:.2f}, {lat_max:.2f}, {lon_max:.2f}) "
+                f"→ {display_name}"
             )
             return bbox
         except Exception as e:
-            logger.error(f"  {reg_name} ({reg_code}): Nominatim ошибка для '{query}': {e}")
+            logger.error(f"  {reg_name} ({reg_code}): Nominatim ошибка для '{query_desc}': {e}")
             continue
 
     logger.error(f"  {reg_name} ({reg_code}): все варианты Nominatim запросов не удались")
