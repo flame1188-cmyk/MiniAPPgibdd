@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 #   3. Текущая рабочая директория + np_bdd/
 #   4. /app/np_bdd/ (путь на Bothost при Docker-деплое)
 #
+# Папка с данными называется `datasets` (НЕ `data`), потому что Bothost
+# «съедает»/монтирует пустой volume поверх любых папок с именем `data/`.
+#
 # Все кандидаты логируются при первом обращении, чтобы в логах сервера
 # было видно, какой путь выбран и почему.
 
@@ -51,7 +54,7 @@ if _env_root:
 
 NPBDD_ROOT: Path | None = None
 for _cand in _CANDIDATE_ROOTS:
-    if (_cand / "data" / "vehicles").is_dir():
+    if (_cand / "datasets" / "vehicles").is_dir():
         NPBDD_ROOT = _cand
         break
 
@@ -59,11 +62,44 @@ if NPBDD_ROOT is None:
     # fallback на дефолтный путь — даже если не существует, чтобы ошибки были осмысленные
     NPBDD_ROOT = _CANDIDATE_ROOTS[0]
     logger.error(
-        "[np_bdd] НЕ НАЙДЕНА папка np_bdd/data/vehicles/ ни в одном из кандидатов: %s",
+        "[np_bdd] НЕ НАЙДЕНА папка np_bdd/datasets/vehicles/ ни в одном из кандидатов: %s",
         [str(p) for p in _CANDIDATE_ROOTS],
     )
 
 NPBDD_SCRIPTS = NPBDD_ROOT / "scripts"
+
+
+# --- Fallback: распаковка встроенных данных -------------------------------
+# Если на сервере папка np_bdd/datasets/ пустая (маловероятно после переименования,
+# но оставим как страховку), распаковываем встроенные JSON-файлы
+# из модуля embedded_data.py.
+
+def _ensure_data_files() -> None:
+    """
+    Проверяет наличие datasets/vehicles/*.json. Если их нет — распаковывает
+    встроенные данные из embedded_data.py в NPBDD_ROOT/datasets/.
+    """
+    vehicles_dir = NPBDD_ROOT / "datasets" / "vehicles"
+    if vehicles_dir.is_dir() and any(vehicles_dir.glob("*.json")):
+        return  # данные уже на месте
+
+    logger.warning(
+        "[np_bdd] datasets/vehicles/ пустая или отсутствует. Пробуем распаковать встроенные данные..."
+    )
+    try:
+        if str(NPBDD_SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(NPBDD_SCRIPTS))
+        import embedded_data
+        if not embedded_data.has_any_data():
+            logger.error("[np_bdd] embedded_data.py пустой — fallback невозможен")
+            return
+        embedded_data.extract_to_disk(NPBDD_ROOT / "datasets")
+        logger.info("[np_bdd] ✓ Встроенные данные распакованы в %s/datasets", NPBDD_ROOT)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[np_bdd] Не удалось распаковать встроенные данные: %s", exc)
+
+
+_ensure_data_files()
 
 # Логируем выбор пути (один раз при импорте)
 logger.info("[np_bdd] NPBDD_ROOT resolved to: %s", NPBDD_ROOT)
@@ -109,15 +145,44 @@ def get_debug_info() -> dict[str, Any]:
     Возвращает диагностическую информацию о путях и наличии файлов.
     Используется эндпоинтом /api/np-bdd/_debug для отладки на сервере.
     """
-    vehicles_dir = NPBDD_ROOT / "data" / "vehicles"
-    plans_dir = NPBDD_ROOT / "data" / "plans"
-    history_dir = NPBDD_ROOT / "data" / "history"
-    freeze_dir = NPBDD_ROOT / "data" / "freeze"
+    # Перепроверяем после возможной распаковки
+    vehicles_dir = NPBDD_ROOT / "datasets" / "vehicles"
+    plans_dir = NPBDD_ROOT / "datasets" / "plans"
+    history_dir = NPBDD_ROOT / "datasets" / "history"
+    freeze_dir = NPBDD_ROOT / "datasets" / "freeze"
 
     def _list_json(d: Path) -> list[str]:
         if not d.exists():
             return []
         return sorted(p.name for p in d.glob("*.json"))
+
+    def _list_all(d: Path, limit: int = 100) -> list[str]:
+        """Все файлы и папки (рекурсивно, до limit), чтобы понять структуру."""
+        if not d.exists():
+            return []
+        result = []
+        try:
+            for p in sorted(d.rglob("*")):
+                if len(result) >= limit:
+                    result.append("... (truncated)")
+                    break
+                rel = p.relative_to(d)
+                kind = "DIR " if p.is_dir() else "FILE"
+                size = p.stat().st_size if p.is_file() else 0
+                result.append(f"{kind} {size:>8} {rel}")
+        except Exception as exc:  # noqa: BLE001
+            result.append(f"<error listing: {exc}>")
+        return result
+
+    # Проверяем наличие embedded_data
+    embedded_status = "unknown"
+    try:
+        if str(NPBDD_SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(NPBDD_SCRIPTS))
+        import embedded_data
+        embedded_status = f"loaded: {len(embedded_data._RAW)} files"
+    except Exception as exc:  # noqa: BLE001
+        embedded_status = f"error: {exc}"
 
     return {
         "service_file": str(_SERVICE_FILE),
@@ -125,8 +190,16 @@ def get_debug_info() -> dict[str, Any]:
         "npbdd_root": str(NPBDD_ROOT),
         "npbdd_root_exists": NPBDD_ROOT.exists(),
         "npbdd_scripts": str(NPBDD_SCRIPTS),
+        "npbdd_scripts_exists": NPBDD_SCRIPTS.exists(),
         "candidates_checked": [str(p) for p in _CANDIDATE_ROOTS],
         "env_npbdd_root": _env_root,
+        "embedded_data_status": embedded_status,
+        # Содержимое /app/np_bdd/ — рекурсивно
+        "npbdd_root_listing": _list_all(NPBDD_ROOT) if NPBDD_ROOT.exists() else [],
+        # Содержимое /app/np_bdd/scripts/
+        "npbdd_scripts_listing": _list_all(NPBDD_SCRIPTS) if NPBDD_SCRIPTS.exists() else [],
+        # Содержимое /app/ — верхний уровень
+        "app_dir_listing": sorted(p.name for p in NPBDD_ROOT.parent.iterdir()) if NPBDD_ROOT.parent.exists() else [],
         "data": {
             "vehicles_dir": str(vehicles_dir),
             "vehicles_exists": vehicles_dir.exists(),
@@ -140,12 +213,10 @@ def get_debug_info() -> dict[str, Any]:
             "freeze_dir": str(freeze_dir),
             "freeze_exists": freeze_dir.exists(),
             "freeze_files": _list_json(freeze_dir),
-            "seasonal_coefficients_exists": (NPBDD_ROOT / "data" / "seasonal_coefficients.json").exists(),
-            "region_mapping_exists": (NPBDD_ROOT / "data" / "region_mapping.json").exists(),
-            "user_settings_exists": (NPBDD_ROOT / "data" / "user_settings.json").exists(),
+            "seasonal_coefficients_exists": (NPBDD_ROOT / "datasets" / "seasonal_coefficients.json").exists(),
+            "region_mapping_exists": (NPBDD_ROOT / "datasets" / "region_mapping.json").exists(),
+            "user_settings_exists": (NPBDD_ROOT / "datasets" / "user_settings.json").exists(),
         },
-        # Содержимое /app/ — верхний уровень, чтобы понять структуру
-        "app_dir_listing": sorted(p.name for p in NPBDD_ROOT.parent.iterdir()) if NPBDD_ROOT.parent.exists() else [],
     }
 
 
@@ -160,8 +231,8 @@ async def list_regions() -> list[dict[str, Any]]:
       {"code": "1106", "name": "г. Севастополь"}
     Сортировка по имени.
     """
-    vehicles_dir = NPBDD_ROOT / "data" / "vehicles"
-    plans_dir = NPBDD_ROOT / "data" / "plans"
+    vehicles_dir = NPBDD_ROOT / "datasets" / "vehicles"
+    plans_dir = NPBDD_ROOT / "datasets" / "plans"
 
     # Диагностика: если директории нет или пусты — логируем
     if not vehicles_dir.exists():
@@ -310,7 +381,7 @@ async def list_frozen_years(region_code: str) -> list[dict[str, Any]]:
 # --- Настройки пользователя (для toggle linear/horizontal) ---------------
 
 
-SETTINGS_FILE = NPBDD_ROOT / "data" / "user_settings.json"
+SETTINGS_FILE = NPBDD_ROOT / "datasets" / "user_settings.json"
 
 
 def _load_all_settings() -> dict[str, Any]:
