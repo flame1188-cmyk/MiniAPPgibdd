@@ -102,14 +102,14 @@ def forecast_full_year_deaths(deaths_ytd: int, current_month: int,
 
     Формула: deaths_ytd / cumulative_share[current_month]
 
-    Если current_month == 12 — возвращаем deaths_ytd без изменений
-    (год закончился, прогноз = факт).
-
-    Если deaths_ytd == 0 — возвращаем 0 (предотвращаем деление 0/0).
+    Особые случаи:
+    - current_month == 0  — данных с ГИБДД ещё нет, возвращаем 0.
+    - current_month == 12 — год закончился, прогноз = факт.
+    - deaths_ytd == 0     — нет погибших YTD, прогноз = 0 (без деления 0/0).
     """
-    if current_month < 1 or current_month > 12:
-        raise ValueError(f"current_month must be 1..12, got {current_month}")
-    if current_month == 12 or deaths_ytd == 0:
+    if current_month < 0 or current_month > 12:
+        raise ValueError(f"current_month must be 0..12, got {current_month}")
+    if current_month == 0 or current_month == 12 or deaths_ytd == 0:
         return int(deaths_ytd)
     if seasonal is None:
         seasonal = load_seasonal_coefficients()
@@ -300,12 +300,12 @@ def fetch_actual_deaths_from_web(region_code: str, year: int) -> dict[str, int]:
               f"({len(errors)} шт.): первые = {errors[:2]}",
               file=_sys.stderr)
 
-    # Добиваем нулями месяцы без ДТП (для единообразия UI).
-    current_month = TODAY.month
-    for m in range(1, current_month + 1):
-        deaths_by_month.setdefault(str(m), 0)
-
-    return deaths_by_month
+    # НЕ добиваем искусственно нулями будущие месяцы — это привело бы к тому,
+    # что current_month в _build_runtime_payload считался бы по TODAY.month,
+    # а не по фактически доступным данным ГИБДД.
+    # Заполняем только «дырки» между 1 и max(месяц с данными), чтобы
+    # месяцы с нулём ДТП в середине года корректно отображались как 0.
+    return _fill_monthly_gaps(deaths_by_month)
 
 
 async def fetch_actual_deaths_from_web_async(region_code: str, year: int) -> dict[str, int]:
@@ -330,11 +330,31 @@ async def fetch_actual_deaths_from_web_async(region_code: str, year: int) -> dic
               f"({len(errors)} шт.): первые = {errors[:2]}",
               file=_sys.stderr)
 
-    current_month = TODAY.month
-    for m in range(1, current_month + 1):
-        deaths_by_month.setdefault(str(m), 0)
+    # См. комментарий в sync-версии: не добавляем будущие месяцы с нулями,
+    # текущий период определяется по факту имеющихся данных.
+    return _fill_monthly_gaps(deaths_by_month)
 
-    return deaths_by_month
+
+def _fill_monthly_gaps(deaths_by_month: dict[str, int]) -> dict[str, int]:
+    """
+    Заполняет «дырки» между январём и максимальным месяцем с данными.
+
+    Если GIBDD вернул карты для месяцев {1, 2, 4, 5}, но не для 3 —
+    функция добавит "3": 0. Это нужно, чтобы месяц без ДТП корректно
+    отображался как 0, а не пропадал с графика.
+
+    ВАЖНО: будущие месяцы (после max месяца с данными) НЕ добавляются —
+    именно это позволяет downstream-коду корректно определить current_month
+    как max месяц с фактическими данными, а не TODAY.month.
+    """
+    if not deaths_by_month:
+        return {}
+    months_present = sorted(int(m) for m in deaths_by_month.keys())
+    max_month = months_present[-1]
+    result = dict(deaths_by_month)
+    for m in range(1, max_month + 1):
+        result.setdefault(str(m), 0)
+    return result
 
 
 def _build_runtime_payload(
@@ -346,9 +366,18 @@ def _build_runtime_payload(
     Сборка итогового payload для UI по уже полученным deaths_by_month_actual.
 
     Эта функция — общий код для sync- и async-версий runtime_calc.
+
+    ВАЖНО: current_month определяется не по TODAY.month (календарный месяц),
+    а по max месяцу, для которого GIBDD вернул данные. Это корректно,
+    потому что сайт ГИБДД может отставать на 1-2 месяца: если сегодня
+    1 августа, а данные есть только по июнь — current_month = 6, а не 8.
     """
     current_year = TODAY.year
-    current_month = TODAY.month
+    # current_month = max месяц с фактическими данными (не TODAY.month!).
+    if deaths_by_month_actual:
+        current_month = max(int(m) for m in deaths_by_month_actual.keys())
+    else:
+        current_month = 0
 
     # --- История (замороженная или из кэша) ---
     history: dict[str, dict[str, Any]] = {}
