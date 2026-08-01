@@ -56,47 +56,119 @@ DATA_HIST_DIR = PROJECT_ROOT / "datasets" / "history"
 DATA_PLANS_DIR = PROJECT_ROOT / "datasets" / "plans"
 DATA_VEHI_DIR = PROJECT_ROOT / "datasets" / "vehicles"
 DATA_FREEZE_DIR = PROJECT_ROOT / "datasets" / "freeze"
-SEASONAL_FILE = PROJECT_ROOT / "datasets" / "seasonal_coefficients.json"
+# Per-region сезонные коэффициенты лежат в datasets/seasonal/{region_code}.json.
+# Глобальный профиль (фолбэк) — в datasets/seasonal/global.json.
+# Legacy-файл datasets/seasonal_coefficients.json читается, если seasonal/global.json нет.
+SEASONAL_DIR = PROJECT_ROOT / "datasets" / "seasonal"
+SEASONAL_GLOBAL_FILE = SEASONAL_DIR / "global.json"
+SEASONAL_LEGACY_FILE = PROJECT_ROOT / "datasets" / "seasonal_coefficients.json"
+
+# Минимальное число регион-лет с deaths_by_month для построения per-region
+# сезонного профиля. Если истории меньше — используем глобальный профиль.
+MIN_SAMPLES_FOR_PER_REGION = 2
 
 TODAY = date.today()
 
 
-# --- Сезонные коэффициенты -------------------------------------------------
+# --- Сезонные коэффициенты (per-region с фолбэком на global) ------------------
 
 
 DEFAULT_MONTHLY_SHARE = {str(m): round(1 / 12, 4) for m in range(1, 13)}
 
 
-def load_seasonal_coefficients() -> dict[str, Any]:
-    """Загружает seasonal_coefficients.json или создаёт дефолтный."""
-    if not SEASONAL_FILE.exists():
-        print(f"[forecast] ВНИМАНИЕ: {SEASONAL_FILE} не найден. "
-              f"Создан дефолтный (равномерное распределение 1/12). "
-              f"Запустите --recalc-seasonal после появления истории.")
-        cumulative = {}
-        running = 0.0
-        for m in range(1, 13):
-            running += DEFAULT_MONTHLY_SHARE[str(m)]
-            cumulative[str(m)] = round(running, 4)
-        payload = {
-            "updated_at": TODAY.isoformat(),
-            "method": "default uniform 1/12 (no history yet)",
-            "monthly_share": DEFAULT_MONTHLY_SHARE,
-            "cumulative_share": cumulative,
-        }
-        SEASONAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with SEASONAL_FILE.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-        return payload
-    with SEASONAL_FILE.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+def _default_uniform_payload(reason: str) -> dict[str, Any]:
+    """Возвращает дефолтный uniform-профиль (1/12 на каждый месяц)."""
+    cumulative = {}
+    running = 0.0
+    for m in range(1, 13):
+        running += DEFAULT_MONTHLY_SHARE[str(m)]
+        cumulative[str(m)] = round(running, 4)
+    return {
+        "updated_at": TODAY.isoformat(),
+        "method": f"default uniform 1/12 ({reason})",
+        "monthly_share": DEFAULT_MONTHLY_SHARE,
+        "cumulative_share": cumulative,
+        "region_code": None,  # признак global/uniform
+        "samples_used": 0,
+    }
+
+
+def load_seasonal_coefficients(region_code: str | None = None) -> dict[str, Any]:
+    """
+    Загружает сезонные коэффициенты с приоритетом:
+
+    1. datasets/seasonal/{region_code}.json (per-region профиль).
+    2. datasets/seasonal/global.json (глобальный профиль).
+    3. datasets/seasonal_coefficients.json (legacy, для обратной совместимости).
+    4. Дефолтный uniform 1/12 (если ничего нет).
+
+    Args:
+        region_code: код региона (напр. "1106"). Если None или не найден —
+            фолбэк на global.
+
+    Returns:
+        dict с ключами:
+            - region_code: str | None (код региона или None для global/uniform)
+            - method: str (описание метода)
+            - monthly_share: {"1": 0.0691, ...}
+            - cumulative_share: {"1": 0.0691, "2": 0.1366, ...}
+            - samples_used: int (сколько регион-лет усреднено)
+            - source: "per-region" | "global" | "legacy" | "uniform"
+    """
+    # 1. Per-region.
+    if region_code is not None:
+        per_region_file = SEASONAL_DIR / f"{region_code}.json"
+        if per_region_file.exists():
+            try:
+                data = json.loads(per_region_file.read_text(encoding="utf-8"))
+                # Проверим, что per-region основан на достаточной истории.
+                if data.get("samples_used", 0) >= MIN_SAMPLES_FOR_PER_REGION:
+                    data.setdefault("source", "per-region")
+                    return data
+                # Иначе per-region есть, но истории мало — логируем и фолбэк.
+                print(f"[forecast] Per-region сезонный профиль для {region_code} "
+                      f"основан на {data.get('samples_used', 0)} регион-лет "
+                      f"(< {MIN_SAMPLES_FOR_PER_REGION}). Фолбэк на global.",
+                      file=sys.stderr)
+            except (json.JSONDecodeError, KeyError) as exc:
+                print(f"[forecast] Ошибка чтения {per_region_file}: {exc}. "
+                      f"Фолбэк на global.", file=sys.stderr)
+
+    # 2. Global (новый путь).
+    if SEASONAL_GLOBAL_FILE.exists():
+        try:
+            data = json.loads(SEASONAL_GLOBAL_FILE.read_text(encoding="utf-8"))
+            data.setdefault("source", "global")
+            return data
+        except (json.JSONDecodeError, KeyError) as exc:
+            print(f"[forecast] Ошибка чтения {SEASONAL_GLOBAL_FILE}: {exc}.",
+                  file=sys.stderr)
+
+    # 3. Legacy (старый путь, для обратной совместимости).
+    if SEASONAL_LEGACY_FILE.exists():
+        try:
+            data = json.loads(SEASONAL_LEGACY_FILE.read_text(encoding="utf-8"))
+            data.setdefault("source", "legacy")
+            return data
+        except (json.JSONDecodeError, KeyError) as exc:
+            print(f"[forecast] Ошибка чтения {SEASONAL_LEGACY_FILE}: {exc}.",
+                  file=sys.stderr)
+
+    # 4. Дефолтный uniform.
+    payload = _default_uniform_payload("no seasonal files found")
+    payload["source"] = "uniform"
+    print(f"[forecast] ВНИМАНИЕ: сезонные файлы не найдены. "
+          f"Использую uniform 1/12. Запустите --recalc-seasonal.",
+          file=sys.stderr)
+    return payload
 
 
 # --- Прогноз ---------------------------------------------------------------
 
 
 def forecast_full_year_deaths(deaths_ytd: int, current_month: int,
-                              seasonal: dict[str, Any] | None = None) -> int:
+                              seasonal: dict[str, Any] | None = None,
+                              region_code: str | None = None) -> int:
     """
     Прогноз погибших на конец года по сезонной корректировке.
 
@@ -106,13 +178,20 @@ def forecast_full_year_deaths(deaths_ytd: int, current_month: int,
     - current_month == 0  — данных с ГИБДД ещё нет, возвращаем 0.
     - current_month == 12 — год закончился, прогноз = факт.
     - deaths_ytd == 0     — нет погибших YTD, прогноз = 0 (без деления 0/0).
+
+    Args:
+        seasonal: предзагруженный профиль (приоритет). Если None —
+            загружается через load_seasonal_coefficients(region_code).
+        region_code: код региона, для которого считается прогноз.
+            Используется для выбора per-region сезонного профиля,
+            если seasonal не передан.
     """
     if current_month < 0 or current_month > 12:
         raise ValueError(f"current_month must be 0..12, got {current_month}")
     if current_month == 0 or current_month == 12 or deaths_ytd == 0:
         return int(deaths_ytd)
     if seasonal is None:
-        seasonal = load_seasonal_coefficients()
+        seasonal = load_seasonal_coefficients(region_code)
     cum_share = float(seasonal["cumulative_share"][str(current_month)])
     if cum_share <= 0:
         return int(deaths_ytd)
@@ -129,6 +208,7 @@ def build_monthly_cumulative_tr(
     plan_tr_year: float,
     plan_line_mode: Literal["linear", "horizontal"] = "linear",
     current_month: int | None = None,
+    region_code: str | None = None,
 ) -> dict[str, Any]:
     """
     Формирует структуру для графика 2.
@@ -141,18 +221,22 @@ def build_monthly_cumulative_tr(
       "plan_cumulative": {"1": plan/12, "2": 2*plan/12, ...}  # линейный
                     OR {"1": plan, "2": plan, ...}            # горизонтальный
       "current_month": 6,
-      "plan_line_mode": "linear"
+      "plan_line_mode": "linear",
+      "seasonal_source": "per-region" | "global" | "legacy" | "uniform"
     }
 
     Если current_month не задан — берётся текущий календарный месяц.
+
+    Args:
+        region_code: код региона — для выбора per-region сезонного профиля.
     """
     if current_month is None:
         current_month = TODAY.month
     if vehicles_year <= 0:
         raise ValueError("vehicles_year must be > 0")
 
-    # Доля прогноза на оставшиеся месяцы.
-    seasonal = load_seasonal_coefficients()
+    # Доля прогноза на оставшиеся месяцы (per-region, если region_code задан).
+    seasonal = load_seasonal_coefficients(region_code)
     monthly_share = seasonal["monthly_share"]
 
     # Фактические месяцы: считаем кумулятивный Тр нарастающим итогом.
@@ -213,6 +297,9 @@ def build_monthly_cumulative_tr(
         "plan_cumulative": plan_cum,
         "current_month": current_month,
         "plan_line_mode": plan_line_mode,
+        "seasonal_source": seasonal.get("source", "unknown"),
+        "seasonal_region_code": seasonal.get("region_code"),
+        "seasonal_samples_used": seasonal.get("samples_used", 0),
     }
 
 
@@ -398,7 +485,11 @@ def _build_runtime_payload(
         raise RuntimeError(f"Нет плана за {current_year} для региона {region_code}")
 
     deaths_ytd = sum(deaths_by_month_actual.values())
-    deaths_forecast_full = forecast_full_year_deaths(deaths_ytd, current_month)
+    # Передаём region_code, чтобы forecast_full_year_deaths использовал
+    # per-region сезонный профиль (если есть).
+    deaths_forecast_full = forecast_full_year_deaths(
+        deaths_ytd, current_month, region_code=region_code,
+    )
 
     tr_actual_ytd = round((deaths_ytd * 10000) / vehicles_year, 3) if deaths_ytd else 0.0
     tr_forecast_full = round((deaths_forecast_full * 10000) / vehicles_year, 3)
@@ -410,6 +501,7 @@ def _build_runtime_payload(
         plan_tr_year=plan_tr_year,
         plan_line_mode=plan_line_mode,
         current_month=current_month,
+        region_code=region_code,
     )
 
     # --- Серия плана 2023..2030 ---
@@ -454,6 +546,11 @@ def _build_runtime_payload(
             "deviation_pct": deviation_pct,
             "status": status,
         },
+        "seasonal": {
+            "source": monthly_chart.get("seasonal_source", "unknown"),
+            "region_code": monthly_chart.get("seasonal_region_code"),
+            "samples_used": monthly_chart.get("seasonal_samples_used", 0),
+        },
         "calculated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
 
@@ -487,47 +584,24 @@ async def runtime_calc_async(region_code: str,
 # --- Административная команда: пересчёт сезонных коэффициентов ------------
 
 
-def recalc_seasonal_coefficients() -> dict[str, Any]:
+def _compute_monthly_share_from_samples(
+    samples: list[tuple[dict[str, int], int]],
+) -> tuple[dict[str, float], dict[str, float]]:
     """
-    Пересчитывает seasonal_coefficients.json по имеющейся истории.
+    По списку (dbm_full, total) считает (monthly_share, cumulative_share).
 
-    Метод: для каждого месяца m берётся средняя доля погибших в этом
-    месяце от годового итога, по всем регионам и годам из data/history/.
-    Для каждого региона-года считается вектор из 12 долей, затем они
-    усредняются по всем регионам-годам.
-
-    Если в history нет записей с deaths_by_month — фолбэк на default uniform.
+    Для каждого сэмпла доля месяца = dbm[m] / total. Усредняем по сэмплам,
+    затем нормализуем к сумме = 1.0.
     """
-    print("[forecast] recalc_seasonal_coefficients: расчёт по истории...")
-
-    # Собираем все записи {region, year, deaths_by_month, deaths_total}.
-    samples: list[tuple[dict[str, int], int]] = []
-    for hist_file in DATA_HIST_DIR.glob("*.json"):
-        with hist_file.open("r", encoding="utf-8") as fh:
-            hist = json.load(fh)
-        for year_str, rec in hist.get("years", {}).items():
-            dbm = rec.get("deaths_by_month")
-            total = rec.get("deaths", 0)
-            if not dbm or total <= 0:
-                continue
-            # Нормализуем: убедиться, что все 12 месяцев присутствуют.
-            dbm_full = {str(m): int(dbm.get(str(m), 0)) for m in range(1, 13)}
-            # Проверим, что сумма по месяцам = годовой итог.
-            sum_check = sum(dbm_full.values())
-            if sum_check != total:
-                # Если расхождение — используем sum_check (он точнее по месяцам).
-                pass
-            samples.append((dbm_full, sum_check))
-
     if not samples:
-        print("[forecast] В history нет записей с deaths_by_month. "
-              "Оставляю текущий файл (default uniform).")
-        return load_seasonal_coefficients()
+        uniform = {str(m): round(1 / 12, 4) for m in range(1, 13)}
+        cum = {}
+        run = 0.0
+        for m in range(1, 13):
+            run += uniform[str(m)]
+            cum[str(m)] = round(run, 4)
+        return uniform, cum
 
-    print(f"[forecast] Найдено {len(samples)} записей "
-          f"(регион × год) с месячной разбивкой.")
-
-    # Для каждого месяца считаем среднюю долю.
     monthly_sum = {str(m): 0.0 for m in range(1, 13)}
     for dbm, total in samples:
         for m in range(1, 13):
@@ -538,7 +612,7 @@ def recalc_seasonal_coefficients() -> dict[str, Any]:
         for m in range(1, 13)
     }
 
-    # Нормализуем: сумма должна = 1.0000.
+    # Нормализация.
     total_share = sum(monthly_share.values())
     if total_share > 0:
         monthly_share = {
@@ -546,32 +620,159 @@ def recalc_seasonal_coefficients() -> dict[str, Any]:
             for m, v in monthly_share.items()
         }
 
-    # Кумулятивные доли.
     cumulative = {}
     running = 0.0
     for m in range(1, 13):
         running += monthly_share[str(m)]
         cumulative[str(m)] = round(running, 4)
 
-    payload = {
-        "updated_at": TODAY.isoformat(),
-        "method": f"среднее по {len(samples)} регион-годам из data/history/",
-        "monthly_share": monthly_share,
-        "cumulative_share": cumulative,
-    }
+    return monthly_share, cumulative
 
-    SEASONAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with SEASONAL_FILE.open("w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
 
-    print(f"[forecast] {SEASONAL_FILE} обновлён.")
-    print(f"[forecast] Сезонный профиль (monthly_share):")
+def _print_seasonal_profile(monthly_share: dict[str, float],
+                            cumulative: dict[str, float]) -> None:
+    """Печатает ASCII-гистограмму для визуального контроля."""
     for m in range(1, 13):
         ms = monthly_share[str(m)]
         cs = cumulative[str(m)]
         bar = "█" * int(ms * 200)
         print(f"  м{m:2d}: {ms:.4f} (cum={cs:.4f}) {bar}")
-    return payload
+
+
+def recalc_seasonal_coefficients() -> dict[str, Any]:
+    """
+    Пересчитывает сезонные коэффициенты по имеющейся истории.
+
+    Создаёт ДВА набора файлов:
+
+    1. datasets/seasonal/global.json — глобальный профиль, среднее по всем
+       регионам и годам (используется как фолбэк для регионов с малой историей).
+
+    2. datasets/seasonal/{region_code}.json — per-region профиль, среднее
+       по годам этого региона. Создаётся только если есть >=
+       MIN_SAMPLES_FOR_PER_REGION лет с deaths_by_month.
+
+    Метод для каждого сэмпла (регион-год):
+        доля месяца m = deaths_by_month[m] / deaths_total
+    Усреднение по сэмплам с последующей нормализацией суммы долей к 1.0.
+
+    Returns:
+        dict с ключами:
+            - global: payload глобального профиля
+            - per_region: {region_code: payload} для каждого региона с историей
+            - regions_per_region: int (сколько регионов получили per-region)
+            - regions_fallback: int (сколько регионов используют global)
+    """
+    print("[forecast] recalc_seasonal_coefficients: расчёт по истории...")
+    SEASONAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Собираем сэмплы по регионам: {region_code: [(dbm_full, total), ...]}.
+    samples_by_region: dict[str, list[tuple[dict[str, int], int]]] = {}
+    all_samples: list[tuple[dict[str, int], int]] = []
+
+    for hist_file in DATA_HIST_DIR.glob("*.json"):
+        region_code = hist_file.stem
+        with hist_file.open("r", encoding="utf-8") as fh:
+            hist = json.load(fh)
+        region_samples: list[tuple[dict[str, int], int]] = []
+        for year_str, rec in hist.get("years", {}).items():
+            dbm = rec.get("deaths_by_month")
+            total = rec.get("deaths", 0)
+            if not dbm or total <= 0:
+                continue
+            dbm_full = {str(m): int(dbm.get(str(m), 0)) for m in range(1, 13)}
+            sum_check = sum(dbm_full.values())
+            region_samples.append((dbm_full, sum_check))
+            all_samples.append((dbm_full, sum_check))
+        if region_samples:
+            samples_by_region[region_code] = region_samples
+
+    if not all_samples:
+        print("[forecast] В history нет записей с deaths_by_month. "
+              "Создаю default uniform.")
+        uniform_payload = _default_uniform_payload("no history available")
+        uniform_payload["source"] = "uniform"
+        SEASONAL_GLOBAL_FILE.write_text(
+            json.dumps(uniform_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return {"global": uniform_payload, "per_region": {},
+                "regions_per_region": 0, "regions_fallback": 0}
+
+    print(f"[forecast] Всего сэмплов: {len(all_samples)} регион-лет "
+          f"по {len(samples_by_region)} регионам.")
+
+    # --- 1. Глобальный профиль ---
+    global_share, global_cum = _compute_monthly_share_from_samples(all_samples)
+    global_payload = {
+        "updated_at": TODAY.isoformat(),
+        "method": f"среднее по {len(all_samples)} регион-годам (global)",
+        "monthly_share": global_share,
+        "cumulative_share": global_cum,
+        "region_code": None,
+        "samples_used": len(all_samples),
+    }
+    SEASONAL_GLOBAL_FILE.write_text(
+        json.dumps(global_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"\n[forecast] {SEASONAL_GLOBAL_FILE} сохранён (global, "
+          f"{len(all_samples)} сэмплов).")
+    print("[forecast] Глобальный профиль:")
+    _print_seasonal_profile(global_share, global_cum)
+
+    # --- 2. Per-region профили ---
+    per_region_payloads: dict[str, dict[str, Any]] = {}
+    regions_per_region_count = 0
+    regions_fallback_count = 0
+
+    print(f"\n[forecast] Per-region профили (порог: "
+          f"{MIN_SAMPLES_FOR_PER_REGION} сэмпла):")
+    for region_code, samples in sorted(samples_by_region.items()):
+        if len(samples) >= MIN_SAMPLES_FOR_PER_REGION:
+            monthly_share, cumulative = _compute_monthly_share_from_samples(samples)
+            payload = {
+                "updated_at": TODAY.isoformat(),
+                "method": f"среднее по {len(samples)} годам для региона {region_code}",
+                "monthly_share": monthly_share,
+                "cumulative_share": cumulative,
+                "region_code": region_code,
+                "samples_used": len(samples),
+            }
+            out_file = SEASONAL_DIR / f"{region_code}.json"
+            out_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            per_region_payloads[region_code] = payload
+            regions_per_region_count += 1
+            print(f"  ✓ {region_code}: {len(samples)} лет — per-region сохранён.")
+        else:
+            regions_fallback_count += 1
+            print(f"  → {region_code}: {len(samples)} лет (< {MIN_SAMPLES_FOR_PER_REGION}) "
+                  f"— фолбэк на global.")
+
+    # --- 3. Сводка ---
+    print(f"\n[forecast] СВОДКА:")
+    print(f"  Глобальный профиль: {SEASONAL_GLOBAL_FILE.name} ({len(all_samples)} сэмплов).")
+    print(f"  Per-region профили: {regions_per_region_count} регионов.")
+    print(f"  Фолбэк на global: {regions_fallback_count} регионов.")
+
+    # --- 4. Покажем сравнение per-region vs global для диагностики ---
+    if per_region_payloads:
+        print(f"\n[forecast] Сравнение per-region профилей (cumulative_share[6]):")
+        print(f"  global: {global_cum['6']:.4f}")
+        for region_code, payload in sorted(per_region_payloads.items()):
+            cum6 = payload["cumulative_share"]["6"]
+            diff_pct = (cum6 - float(global_cum["6"])) / float(global_cum["6"]) * 100
+            print(f"  {region_code}: {cum6:.4f} ({diff_pct:+.1f}% к global)")
+
+    return {
+        "global": global_payload,
+        "per_region": per_region_payloads,
+        "regions_per_region": regions_per_region_count,
+        "regions_fallback": regions_fallback_count,
+    }
 
 
 # --- CLI -------------------------------------------------------------------
@@ -580,7 +781,7 @@ def recalc_seasonal_coefficients() -> dict[str, Any]:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--recalc-seasonal", action="store_true",
-                        help="Пересчитать seasonal_coefficients.json")
+                        help="Пересчитать сезонные коэффициенты: global + per-region")
     parser.add_argument("--region", type=str,
                         help="Напечатать runtime_calc для региона")
     parser.add_argument("--plan-line", choices=["linear", "horizontal"],
