@@ -46,10 +46,10 @@ from jsonschema import validate
 
 # --- Относительные пути ---------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # np_bdd/
-DATA_RAW_DIR = PROJECT_ROOT / "data" / "raw"
-DATA_HIST_DIR = PROJECT_ROOT / "data" / "history"
-DATA_PLANS_DIR = PROJECT_ROOT / "data" / "plans"
-DATA_VEHI_DIR = PROJECT_ROOT / "data" / "vehicles"
+DATA_RAW_DIR = PROJECT_ROOT / "datasets" / "raw"
+DATA_HIST_DIR = PROJECT_ROOT / "datasets" / "history"
+DATA_PLANS_DIR = PROJECT_ROOT / "datasets" / "plans"
+DATA_VEHI_DIR = PROJECT_ROOT / "datasets" / "vehicles"
 SCHEMAS_DIR = PROJECT_ROOT / "schemas"
 
 TODAY = date.today().isoformat()

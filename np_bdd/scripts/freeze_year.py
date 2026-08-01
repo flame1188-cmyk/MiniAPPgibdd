@@ -43,9 +43,9 @@ from jsonschema import validate
 
 # --- Относительные пути ---------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # np_bdd/
-DATA_HIST_DIR = PROJECT_ROOT / "data" / "history"
-DATA_VEHI_DIR = PROJECT_ROOT / "data" / "vehicles"
-DATA_FREEZE_DIR = PROJECT_ROOT / "data" / "freeze"
+DATA_HIST_DIR = PROJECT_ROOT / "datasets" / "history"
+DATA_VEHI_DIR = PROJECT_ROOT / "datasets" / "vehicles"
+DATA_FREEZE_DIR = PROJECT_ROOT / "datasets" / "freeze"
 SCHEMAS_DIR = PROJECT_ROOT / "schemas"
 
 

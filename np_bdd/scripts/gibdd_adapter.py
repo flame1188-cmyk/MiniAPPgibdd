@@ -48,7 +48,7 @@ from typing import Any
 # scripts/ → np_bdd/ → gibdd-bot/
 NPBDD_ROOT = Path(__file__).resolve().parent.parent
 GIBDD_BOT_ROOT = NPBDD_ROOT.parent  # = gibdd-bot/
-REGION_MAPPING_FILE = NPBDD_ROOT / "data" / "region_mapping.json"
+REGION_MAPPING_FILE = NPBDD_ROOT / "datasets" / "region_mapping.json"
 
 
 # --- Маппинг кодов регионов ----------------------------------------------
