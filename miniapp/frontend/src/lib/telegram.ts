@@ -41,6 +41,11 @@ export interface TelegramWebApp {
   viewportStableHeight: number
   headerColor: string
   backgroundColor: string
+  /**
+   * true, если Mini App сейчас в полноэкранном режиме.
+   * Доступно с версии WebApp SDK 8.0+.
+   */
+  isFullscreen?: boolean
 
   ready: () => void
   expand: () => void
@@ -49,6 +54,18 @@ export interface TelegramWebApp {
   setBackgroundColor: (color: string) => void
   enableClosingConfirmation: () => void
   disableVerticalSwipes?: () => void
+  /**
+   * Запросить переход в полноэкранный режим. Доступно с SDK 8.0+.
+   * На некоторых платформах требует user gesture — вызывающая сторона
+   * должна быть готова сделать fallback на обработчик клика.
+   * Возвращает Promise, который резолвится при успехе и реджектится
+   * при ошибке/отмене.
+   */
+  requestFullscreen?: () => Promise<void>
+  exitFullscreen?: () => Promise<void>
+  isVersionAtLeast?: (version: string) => boolean
+  onEvent: (event: string, cb: () => void) => void
+  offEvent: (event: string, cb: () => void) => void
   MainButton: {
     text: string
     color: string
@@ -99,7 +116,7 @@ export function initTelegram(): void {
 
   // Сигналим Telegram, что приложение готово к отображению
   wa.ready()
-  // Разворачиваем на весь экран
+  // Разворачиваем на весь экран (доступно на всех платформах)
   wa.expand()
   // Запрашиваем подтверждение перед закрытием (если есть активная задача)
   // wa.enableClosingConfirmation()
@@ -112,6 +129,29 @@ export function initTelegram(): void {
     wa.disableVerticalSwipes?.()
   } catch {
     // Метод доступен не на всех версиях SDK
+  }
+
+  // Пробуем перейти в полноэкранный режим (SDK 8.0+, Telegram Desktop 5.x+).
+  // На десктопе обычно срабатывает сразу при загрузке.
+  // На iOS/Android иногда требует user gesture — для этого случая
+  // в UI есть кнопка «Развернуть» (см. App.tsx).
+  try {
+    if (isFullscreenSupported() && !isFullscreenActive()) {
+      const p = wa.requestFullscreen?.()
+      // Если вернулся Promise — ловим ошибки тихо (кнопка-фолбэк сработает)
+      if (p && typeof p.catch === 'function') {
+        p.catch((err: unknown) => {
+          console.warn(
+            '[telegram] requestFullscreen() не сработал при загрузке. ' +
+            'Пользователь может развернуть вручную кнопкой в шапке.',
+            err
+          )
+        })
+      }
+    }
+  } catch (err) {
+    // На старых клиентах метод может отсутствовать — игнорируем
+    console.warn('[telegram] requestFullscreen error:', err)
   }
 
   initialized = true
@@ -259,4 +299,66 @@ export function setMainButton(
 
 export function hideMainButton(): void {
   getWebApp()?.MainButton?.hide()
+}
+
+/**
+ * Доступен ли полноэкранный режим в текущем клиенте Telegram.
+ * Проверяет и наличие метода requestFullscreen, и версию SDK >= 8.0.
+ */
+export function isFullscreenSupported(): boolean {
+  const wa = getWebApp()
+  if (!wa) return false
+  if (typeof wa.requestFullscreen !== 'function') return false
+  // На очень старых клиентах метод может быть определён, но не работать —
+  // страхуемся проверкой версии SDK.
+  if (typeof wa.isVersionAtLeast === 'function') {
+    return wa.isVersionAtLeast('8.0')
+  }
+  // Если isVersionAtLeast нет — доверяем наличию requestFullscreen.
+  return true
+}
+
+/**
+ * Mini App сейчас в полноэкранном режиме?
+ */
+export function isFullscreenActive(): boolean {
+  return !!getWebApp()?.isFullscreen
+}
+
+/**
+ * Запросить полноэкранный режим. Возвращает Promise (ресолвится при успехе).
+ * Если метод недоступен — Promise сразу реджектится.
+ */
+export function requestAppFullscreen(): Promise<void> {
+  const wa = getWebApp()
+  if (!wa || typeof wa.requestFullscreen !== 'function') {
+    return Promise.reject(new Error('requestFullscreen is not supported'))
+  }
+  return wa.requestFullscreen()
+}
+
+/**
+ * Выйти из полноэкранного режима.
+ */
+export function exitAppFullscreen(): Promise<void> {
+  const wa = getWebApp()
+  if (!wa || typeof wa.exitFullscreen !== 'function') {
+    return Promise.reject(new Error('exitFullscreen is not supported'))
+  }
+  return wa.exitFullscreen()
+}
+
+/**
+ * Подписка на изменение полноэкранного режима.
+ * Возвращает функцию отписки.
+ */
+export function onFullscreenChange(cb: (isFullscreen: boolean) => void): () => void {
+  const wa = getWebApp()
+  if (!wa) return () => {}
+
+  const handler = () => cb(!!wa.isFullscreen)
+  wa.onEvent('fullscreenChanged', handler)
+  return () => {
+    wa.offEvent('fullscreenChanged', handler)
+  }
 }
