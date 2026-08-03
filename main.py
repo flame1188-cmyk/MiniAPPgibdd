@@ -384,6 +384,21 @@ if FRONTEND_DIST.exists():
         name="frontend",
     )
     logger.info(f"Frontend раздаётся из {FRONTEND_DIST}")
+
+    # No-cache middleware для index.html — иначе Telegram WebView
+    # кеширует HTML навсегда и не подхватывает новый JS-бандл при деплое.
+    # Assets (с хешированными именами типа index-Dwtow6gx.js) кешируются
+    # агрессивно — это безопасно, т.к. Vite меняет имя файла при любой правке.
+    @app.middleware("http")
+    async def no_cache_index_html(request: Request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        # Только для index.html и /app/ — НЕ трогаем assets (они с хешем)
+        if path in ("/app", "/app/", "/app/index.html"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        return response
 else:
     logger.warning(
         f"Frontend не собран ({FRONTEND_DIST} не существует). "
