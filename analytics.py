@@ -1247,6 +1247,9 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
       - weather_x_severity: {weather: {dtp, deaths, injured}}
       - lighting_x_severity: {lighting: {dtp, deaths, injured}}
       - month_x_severity: {month: {dtp, deaths, injured}}
+      - district_x_severity: {district_name: {dtp, deaths, injured}}
+      - road_name_x_severity: {road_name: {dtp, deaths, injured, road_value}}
+        (road_value — каноническая категория: Федеральные/Региональные/...)
     """
     # Инициализация всех таблиц
     hour_x_severity: dict[str, dict] = {}
@@ -1267,6 +1270,9 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
     weather_x_severity: dict[str, dict] = {}
     lighting_x_severity: dict[str, dict] = {}
     month_x_severity: dict[str, dict] = {}
+    # Районы (district) и наименования дорог (dor) с категорией (dor_z)
+    district_x_severity: dict[str, dict] = {}
+    road_name_x_severity: dict[str, dict] = {}
 
     def _add_severity(table: dict, key: str, deaths: int, injured: int, count: int = 1):
         if key not in table:
@@ -1349,6 +1355,36 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
 
         # 17. Месяц × тяжесть
         _add_severity(month_x_severity, month_str, deaths, injured)
+
+        # 18. Район × тяжесть
+        # Берём поле district, при отсутствии — наименование населённого
+        # пункта (np). Это позволяет отвечать на вопросы про наиболее
+        # аварийные районы/города региона.
+        district_name = str(card.get("district", "")).strip()
+        if not district_name:
+            district_name = str(card.get("np", "")).strip()
+        if district_name:
+            _add_severity(district_x_severity, district_name, deaths, injured)
+
+        # 19. Наименование дороги × тяжесть (с категорией)
+        # Поле dor — наименование (например «М-4 Дон»), dor_z — значение
+        # (категория). Сохраняем категорию в road_value поле bucket'а,
+        # чтобы в промпте показывать «М-4 Дон (Федеральные)».
+        road_name = str(card.get("dor", "")).strip()
+        if road_name:
+            road_sig_canonical = group_road_significance(
+                str(card.get("dor_z", "")).strip()
+            )
+            bucket = road_name_x_severity.get(road_name)
+            if bucket is None:
+                bucket = {
+                    "dtp": 0, "deaths": 0, "injured": 0,
+                    "road_value": road_sig_canonical,
+                }
+                road_name_x_severity[road_name] = bucket
+            bucket["dtp"] += 1
+            bucket["deaths"] += deaths
+            bucket["injured"] += injured
 
         # 7. Погода × вид ДТП
         for w in weather_list:
@@ -1442,4 +1478,6 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "weather_x_severity": weather_x_severity,
         "lighting_x_severity": lighting_x_severity,
         "month_x_severity": month_x_severity,
+        "district_x_severity": district_x_severity,
+        "road_name_x_severity": road_name_x_severity,
     }
