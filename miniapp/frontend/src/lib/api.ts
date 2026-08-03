@@ -520,8 +520,11 @@ export const api = {
       body: JSON.stringify({}),
     }),
 
-  getClusters: (taskId: string) =>
-    request<ClustersResponse>(`/api/dtp/tasks/${taskId}/clusters`),
+  getClusters: (taskId: string, wait: number = 0) =>
+    request<ClustersResponse>(
+      `/api/dtp/tasks/${taskId}/clusters` +
+        (wait > 0 ? `?wait=${wait}` : '')
+    ),
 
   getClustersMapUrl: (taskId: string) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/clusters/map?tg_init_data=${encodeURIComponent(getInitData())}`,
@@ -579,8 +582,11 @@ export const api = {
       body: JSON.stringify({ provider }),
     }),
 
-  getLLMSummary: (taskId: string) =>
-    request<LLMSummaryResponse>(`/api/dtp/tasks/${taskId}/llm/summary`),
+  getLLMSummary: (taskId: string, wait: number = 0) =>
+    request<LLMSummaryResponse>(
+      `/api/dtp/tasks/${taskId}/llm/summary` +
+        (wait > 0 ? `?wait=${wait}` : '')
+    ),
 
   askLLM: (taskId: string, question: string, provider: 'free' | 'paid') =>
     request<LLMAskResponse>(`/api/dtp/tasks/${taskId}/llm/ask`, {
