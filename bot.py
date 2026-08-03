@@ -2153,15 +2153,25 @@ async def _run_analysis(
             cross_tables_ctx = ""
             if llm_provider == "free" and current_cards:
                 try:
-                    from analytics import calculate_cross_tables
+                    from analytics import (
+                        calculate_cross_tables, calculate_statistical_metrics,
+                    )
                     current_cross = calculate_cross_tables(current_cards)
                     prev_cross = None
                     if prev_cards:
                         prev_cross = calculate_cross_tables(prev_cards)
-                    from llm_analyzer import format_cross_tables_for_prompt
+                    from llm_analyzer import (
+                        format_cross_tables_for_prompt,
+                        format_statistical_metrics_for_prompt,
+                    )
                     cross_tables_ctx = format_cross_tables_for_prompt(
                         current_cross, prev_cross, current_label, prev_label,
                     )
+                    # Этап 2: статистические метрики (severity rates, Z-score, χ²)
+                    stats = calculate_statistical_metrics(current_cross)
+                    stats_text = format_statistical_metrics_for_prompt(stats)
+                    if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
+                        cross_tables_ctx += "\n\n" + stats_text
                     logger.info(
                         f"Кросс-таблицы для GLM: {len(cross_tables_ctx)} символов"
                     )
@@ -3463,15 +3473,25 @@ async def _handle_analytics_question(
         cross_tables_ctx = ""
         if llm_provider == "free" and current_cards:
             try:
-                from analytics import calculate_cross_tables
+                from analytics import (
+                    calculate_cross_tables, calculate_statistical_metrics,
+                )
                 current_cross = calculate_cross_tables(current_cards)
                 prev_cross = None
                 if prev_cards:
                     prev_cross = calculate_cross_tables(prev_cards)
-                from llm_analyzer import format_cross_tables_for_prompt
+                from llm_analyzer import (
+                    format_cross_tables_for_prompt,
+                    format_statistical_metrics_for_prompt,
+                )
                 cross_tables_ctx = format_cross_tables_for_prompt(
                     current_cross, prev_cross, current_label, prev_label,
                 )
+                # Этап 2: статистические метрики (severity rates, Z-score, χ²)
+                stats = calculate_statistical_metrics(current_cross)
+                stats_text = format_statistical_metrics_for_prompt(stats)
+                if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
+                    cross_tables_ctx += "\n\n" + stats_text
             except Exception as e:
                 logger.warning(f"Не удалось построить кросс-таблицы для Q&A: {e}")
 

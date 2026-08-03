@@ -1250,6 +1250,12 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
       - district_x_severity: {district_name: {dtp, deaths, injured}}
       - road_name_x_severity: {road_name: {dtp, deaths, injured, road_value}}
         (road_value — каноническая категория: Федеральные/Региональные/...)
+      - dtp_type_x_district: {district: Counter(dtp_type)} — вид ДТП по районам
+      - dtp_type_x_hour: {hour_interval: Counter(dtp_type)} — вид ДТП по времени суток
+      - dtp_type_x_road_value: {road_category: Counter(dtp_type)} — вид ДТП по категории дороги
+      - alcohol_x_district: {district: Counter("да"/"нет")} — опьянение по районам
+      - alcohol_x_road_value: {road_category: Counter("да"/"нет")} — опьянение по категориям дорог
+      - street_x_severity: {street_name: {dtp, deaths, injured}} — топ-15 улиц (k_ul/street + np)
     """
     # Инициализация всех таблиц
     hour_x_severity: dict[str, dict] = {}
@@ -1273,6 +1279,16 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
     # Районы (district) и наименования дорог (dor) с категорией (dor_z)
     district_x_severity: dict[str, dict] = {}
     road_name_x_severity: dict[str, dict] = {}
+    # Этап 1: новые кросс-таблицы
+    # Вид ДТП × Район / Час / Категория дороги — Counter {key: Counter(dtp_type)}
+    dtp_type_x_district: dict[str, Counter] = {}
+    dtp_type_x_hour: dict[str, Counter] = {}
+    dtp_type_x_road_value: dict[str, Counter] = {}
+    # Опьянение × Район / Категория дороги — Counter {key: Counter("да"/"нет")}
+    alcohol_x_district: dict[str, Counter] = {}
+    alcohol_x_road_value: dict[str, Counter] = {}
+    # Улица × тяжесть (топ-15) — берём из k_ul или street
+    street_x_severity: dict[str, dict] = {}
 
     def _add_severity(table: dict, key: str, deaths: int, injured: int, count: int = 1):
         if key not in table:
@@ -1303,6 +1319,7 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
         wd_name = DAY_NAMES.get(wd_num, str(wd_num)) if wd_num is not None else "не указан"
         has_ped = _has_pedestrian_dtp(card)
         has_alc = _is_alcohol_dtp(card)
+        _alc_key = "да" if has_alc else "нет"
 
         # Погода
         dor_usl = card.get("dor_usl", {}) or {}
@@ -1360,9 +1377,10 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
         # Берём поле district, при отсутствии — наименование населённого
         # пункта (np). Это позволяет отвечать на вопросы про наиболее
         # аварийные районы/города региона.
+        np_name = str(card.get("np", "")).strip()
         district_name = str(card.get("district", "")).strip()
         if not district_name:
-            district_name = str(card.get("np", "")).strip()
+            district_name = np_name
         if district_name:
             _add_severity(district_x_severity, district_name, deaths, injured)
 
@@ -1385,6 +1403,42 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
             bucket["dtp"] += 1
             bucket["deaths"] += deaths
             bucket["injured"] += injured
+
+        # 20. Вид ДТП × Район (для адресных мер: где какой тип преобладает)
+        if dtp_type and district_name:
+            dtp_type_x_district.setdefault(district_name, Counter())[dtp_type] += 1
+
+        # 21. Вид ДТП × Время суток (типичные часы для каждого вида ДТП)
+        if dtp_type:
+            dtp_type_x_hour.setdefault(hour_interval, Counter())[dtp_type] += 1
+
+        # 22. Вид ДТП × Категория дороги (каноническая: Федеральные/Региональные/...)
+        if dtp_type:
+            road_sig_canonical_for_dtp = group_road_significance(
+                str(card.get("dor_z", "")).strip()
+            )
+            dtp_type_x_road_value.setdefault(road_sig_canonical_for_dtp, Counter())[dtp_type] += 1
+
+        # 23. Опьянение × Район (где чаще пьяные ДТП)
+        if district_name:
+            alcohol_x_district.setdefault(district_name, Counter())[_alc_key] += 1
+
+        # 24. Опьянение × Категория дороги (на каких дорогах пьяные)
+        road_sig_canonical_for_alc = group_road_significance(
+            str(card.get("dor_z", "")).strip()
+        )
+        alcohol_x_road_value.setdefault(road_sig_canonical_for_alc, Counter())[_alc_key] += 1
+
+        # 25. Улица × тяжесть (топ-15 улиц — для городского анализа очагов)
+        # Берём k_ul (улица) или street, объединяем с np при наличии,
+        # чтобы различать «ул. Ленина» в разных населённых пунктах.
+        street_name = str(card.get("k_ul", "")).strip()
+        if not street_name:
+            street_name = str(card.get("street", "")).strip()
+        if street_name and np_name:
+            street_name = f"{street_name} ({np_name})"
+        if street_name:
+            _add_severity(street_x_severity, street_name, deaths, injured)
 
         # 7. Погода × вид ДТП
         for w in weather_list:
@@ -1409,7 +1463,8 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
             road_value_x_dtp_type[road_value][dtp_type] += 1
 
         # 10. Опьянение × день недели
-        _alc_key = "да" if has_alc else "нет"
+        # _alc_key уже вычислен выше (рядом с has_alc) — используется и в новых
+        # таблицах 23-24, и здесь, и в 11.
         if _alc_key not in alcohol_x_weekday:
             alcohol_x_weekday[_alc_key] = Counter()
         if wd_num is not None:
@@ -1480,4 +1535,318 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "month_x_severity": month_x_severity,
         "district_x_severity": district_x_severity,
         "road_name_x_severity": road_name_x_severity,
+        # Этап 1: новые кросс-таблицы
+        "dtp_type_x_district": dtp_type_x_district,
+        "dtp_type_x_hour": dtp_type_x_hour,
+        "dtp_type_x_road_value": dtp_type_x_road_value,
+        "alcohol_x_district": alcohol_x_district,
+        "alcohol_x_road_value": alcohol_x_road_value,
+        "street_x_severity": street_x_severity,
     }
+
+
+# ============================================================
+# Этап 2: Производные статистические метрики
+# ============================================================
+
+# Критические значения χ² при α=0.05 для df=1..20.
+# Взято из стандартных таблиц (Pearson chi-square distribution).
+# Используем хардкод, чтобы не тянуть scipy в продакшен.
+_CHI2_CRITICAL_005 = {
+    1: 3.841, 2: 5.991, 3: 7.815, 4: 9.488, 5: 11.070,
+    6: 12.592, 7: 14.067, 8: 15.507, 9: 16.919, 10: 18.307,
+    11: 19.675, 12: 21.026, 13: 22.362, 14: 23.685, 15: 24.996,
+    16: 26.296, 17: 27.587, 18: 28.869, 19: 30.144, 20: 31.410,
+}
+
+
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    """Среднее и стандартное отклонение (population, не sample).
+
+    Используем population std (деление на n, а не на n-1), так как
+    кросс-таблица содержит данные по всем ДТП за период — это не выборка,
+    а полная генеральная совокупность.
+    """
+    if not values:
+        return 0.0, 0.0
+    n = len(values)
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n
+    return mean, var ** 0.5
+
+
+def _z_score(x: float, mean: float, std: float) -> float:
+    """Z-score. При std=0 возвращает 0 (нет вариации → нет аномалии)."""
+    if std == 0:
+        return 0.0
+    return (x - mean) / std
+
+
+def _classify_z(z: float) -> str:
+    """Классифицирует Z-score по уровням значимости."""
+    az = abs(z)
+    if az >= 2.0:
+        return "значимо выше" if z > 0 else "значимо ниже"
+    if az >= 1.5:
+        return "выше среднего" if z > 0 else "ниже среднего"
+    return "около среднего"
+
+
+def _severity_rate(deaths: int, dtp: int) -> float:
+    """Погибших на 100 ДТП. При dtp=0 возвращает 0.0."""
+    if dtp <= 0:
+        return 0.0
+    return round(deaths / dtp * 100, 1)
+
+
+def _build_severity_rates(
+    table: dict[str, dict], slice_name: str,
+) -> list[dict[str, Any]]:
+    """Строит список {key, dtp, deaths, injured, deaths_per_100, injured_per_100}
+    отсортированный по убыванию deaths_per_100.
+    """
+    rows = []
+    for key, b in table.items():
+        dtp = b.get("dtp", 0)
+        deaths = b.get("deaths", 0)
+        injured = b.get("injured", 0)
+        rows.append({
+            "key": key,
+            "dtp": dtp,
+            "deaths": deaths,
+            "injured": injured,
+            "deaths_per_100": _severity_rate(deaths, dtp),
+            "injured_per_100": _severity_rate(injured, dtp),
+        })
+    rows.sort(key=lambda r: r["deaths_per_100"], reverse=True)
+    return rows
+
+
+def _build_z_anomalies(
+    table: dict[str, dict], slice_name: str, min_dtp: int = 3,
+) -> list[dict[str, Any]]:
+    """Считает Z-score для каждого ключа таблицы по двум метрикам:
+    числу ДТП и fatal rate (погибших на 100 ДТП).
+
+    Фильтрует ключи с dtp < min_dtp — на маленькой выборке
+    Z-score нестабилен и неинтерпретируем.
+
+    Возвращает список словарей {key, dtp, deaths_per_100, z_dtp, z_fatality, label_dtp, label_fatality}
+    отсортированный по убыванию |z_fatality| (наиболее аномальные по тяжести — сверху).
+    """
+    # Фильтруем по min_dtp
+    keys_data = [(k, b) for k, b in table.items() if b.get("dtp", 0) >= min_dtp]
+    if len(keys_data) < 2:
+        # Если осталось <2 ключей — Z-score бессмысленен
+        return []
+
+    dtp_values = [float(b.get("dtp", 0)) for _, b in keys_data]
+    fatality_values = [
+        float(_severity_rate(b.get("deaths", 0), b.get("dtp", 0)))
+        for _, b in keys_data
+    ]
+
+    mean_dtp, std_dtp = _mean_std(dtp_values)
+    mean_fat, std_fat = _mean_std(fatality_values)
+
+    rows = []
+    for k, b in keys_data:
+        dtp = b.get("dtp", 0)
+        fat = _severity_rate(b.get("deaths", 0), dtp)
+        z_dtp = _z_score(float(dtp), mean_dtp, std_dtp)
+        z_fat = _z_score(float(fat), mean_fat, std_fat)
+        rows.append({
+            "key": k,
+            "dtp": dtp,
+            "deaths_per_100": fat,
+            "z_dtp": round(z_dtp, 2),
+            "z_fatality": round(z_fat, 2),
+            "label_dtp": _classify_z(z_dtp),
+            "label_fatality": _classify_z(z_fat),
+        })
+    rows.sort(key=lambda r: abs(r["z_fatality"]), reverse=True)
+    return rows
+
+
+def _chi_square_test(
+    contingency: list[list[int]],
+) -> dict[str, Any]:
+    """χ²-тест независимости для матрицы наблюдаемых частот.
+
+    Args:
+        contingency: матрица [rows][cols] наблюдаемых частот.
+
+    Returns:
+        dict с chi2, df, expected, critical_005, significant.
+    """
+    rows = len(contingency)
+    if rows < 2:
+        return {"chi2": 0.0, "df": 0, "significant": False, "note": "мало строк"}
+    cols = len(contingency[0])
+    if cols < 2:
+        return {"chi2": 0.0, "df": 0, "significant": False, "note": "мало колонок"}
+
+    row_totals = [sum(r) for r in contingency]
+    col_totals = [sum(contingency[r][c] for r in range(rows)) for c in range(cols)]
+    grand_total = sum(row_totals)
+    if grand_total == 0:
+        return {"chi2": 0.0, "df": 0, "significant": False, "note": "пустая таблица"}
+
+    # Ожидаемые частоты и χ²
+    chi2 = 0.0
+    for i in range(rows):
+        for j in range(cols):
+            expected = row_totals[i] * col_totals[j] / grand_total
+            if expected > 0:
+                chi2 += (contingency[i][j] - expected) ** 2 / expected
+
+    df = (rows - 1) * (cols - 1)
+    critical = _CHI2_CRITICAL_005.get(df)
+    if critical is None:
+        # Для df > 20 используем аппроксимацию: χ² ≈ df + 2*sqrt(2*df) при α=0.05
+        critical = df + 2 * (2 * df) ** 0.5
+    significant = chi2 > critical
+    return {
+        "chi2": round(chi2, 2),
+        "df": df,
+        "critical_005": round(critical, 2),
+        "significant": significant,
+        "note": "значимая связь" if significant else "связь не подтверждена",
+    }
+
+
+def calculate_statistical_metrics(cross: dict[str, Any]) -> dict[str, Any]:
+    """Этап 2: производные статистические метрики на основе кросс-таблиц.
+
+    Возвращает dict с тремя блоками:
+      - severity_rates: {slice_name: [{key, dtp, deaths, injured, deaths_per_100, injured_per_100}]}
+        — топ-5 самых "тяжёлых" разрезов по каждой таблице
+      - z_score_anomalies: {slice_name: [{key, dtp, deaths_per_100, z_dtp, z_fatality, label_*}]}
+        — аномалии по числу ДТП и по тяжести последствий
+      - chi_square_tests: [{test_name, chi2, df, significant, note, top_cells}]
+        — тесты независимости для пар факторов
+
+    Все метрики вычисляются по текущему периоду (без сравнения с прошлым).
+    """
+    result: dict[str, Any] = {
+        "severity_rates": {},
+        "z_score_anomalies": {},
+        "chi_square_tests": [],
+    }
+
+    # --- 1. Severity rates: погибших на 100 ДТП по разным срезам ---
+    severity_slices = [
+        ("Районы", "district_x_severity"),
+        ("Дороги", "road_name_x_severity"),
+        ("Время суток", "hour_x_severity"),
+        ("Категория дороги", "road_value_x_severity"),
+        ("Вид ДТП", "dtp_type_x_severity"),
+        ("Месяц", "month_x_severity"),
+        ("Освещение", "lighting_x_severity"),
+        ("Улицы", "street_x_severity"),
+    ]
+    for slice_name, key in severity_slices:
+        table = cross.get(key, {})
+        if table:
+            rates = _build_severity_rates(table, slice_name)
+            # Берём топ-5 по тяжести + те, где >=3 ДТП
+            top_rates = [r for r in rates if r["dtp"] >= 3][:5]
+            if top_rates:
+                result["severity_rates"][slice_name] = top_rates
+
+    # --- 2. Z-score аномалии ---
+    anomaly_slices = [
+        ("Районы", "district_x_severity"),
+        ("Дороги", "road_name_x_severity"),
+        ("Время суток", "hour_x_severity"),
+        ("Категория дороги", "road_value_x_severity"),
+        ("Вид ДТП", "dtp_type_x_severity"),
+        ("Улицы", "street_x_severity"),
+    ]
+    for slice_name, key in anomaly_slices:
+        table = cross.get(key, {})
+        if table:
+            anomalies = _build_z_anomalies(table, slice_name, min_dtp=3)
+            # Берём топ-5 наиболее аномальных (по |z_fatality|)
+            if anomalies:
+                result["z_score_anomalies"][slice_name] = anomalies[:5]
+
+    # --- 3. χ²-тесты независимости ---
+
+    # 3a. Категория дороги × Вид ДТП
+    if "dtp_type_x_road_value" in cross:
+        rv_x_dt = cross["dtp_type_x_road_value"]
+        if len(rv_x_dt) >= 2:
+            # Соберём все виды ДТП встречающиеся хотя бы в 2 категориях
+            all_dtp_types = set()
+            for cnt in rv_x_dt.values():
+                for t in cnt:
+                    all_dtp_types.add(t)
+            all_dtp_types = sorted(all_dtp_types)
+            road_cats = sorted(rv_x_dt.keys())
+            # Берём топ-5 самых частых видов ДТП чтобы не раздувать df
+            total_per_type = Counter()
+            for cnt in rv_x_dt.values():
+                total_per_type.update(cnt)
+            top_types = [t for t, _ in total_per_type.most_common(5)]
+            contingency = [
+                [rv_x_dt[rc].get(t, 0) for t in top_types]
+                for rc in road_cats
+            ]
+            test = _chi_square_test(contingency)
+            test["test_name"] = "Категория дороги × Вид ДТП"
+            test["contingency_rows"] = road_cats
+            test["contingency_cols"] = top_types
+            result["chi_square_tests"].append(test)
+
+    # 3b. Время суток × Опьянение
+    if "alcohol_x_hour" in cross:
+        axh = cross["alcohol_x_hour"]
+        # axh: {"да": Counter(interval), "нет": Counter(interval)}
+        alc_data = axh.get("да", Counter())
+        no_alc_data = axh.get("нет", Counter())
+        if alc_data and no_alc_data:
+            intervals = sorted(set(list(alc_data.keys()) + list(no_alc_data.keys())))
+            contingency = [
+                [alc_data.get(iv, 0) for iv in intervals],
+                [no_alc_data.get(iv, 0) for iv in intervals],
+            ]
+            test = _chi_square_test(contingency)
+            test["test_name"] = "Время суток × Опьянение"
+            test["contingency_rows"] = ["Опьянение", "Трезвые"]
+            test["contingency_cols"] = intervals
+            result["chi_square_tests"].append(test)
+
+    # 3c. Категория дороги × Опьянение
+    if "alcohol_x_road_value" in cross:
+        axrv = cross["alcohol_x_road_value"]
+        if len(axrv) >= 2:
+            road_cats = sorted(axrv.keys())
+            contingency = [
+                [axrv[rc].get("да", 0), axrv[rc].get("нет", 0)]
+                for rc in road_cats
+            ]
+            test = _chi_square_test(contingency)
+            test["test_name"] = "Категория дороги × Опьянение"
+            test["contingency_rows"] = road_cats
+            test["contingency_cols"] = ["Опьянение", "Трезвые"]
+            result["chi_square_tests"].append(test)
+
+    # 3d. Освещение × Тяжесть (погиб/не погиб)
+    if "lighting_x_severity" in cross:
+        lxs = cross["lighting_x_severity"]
+        if len(lxs) >= 2:
+            lightings = sorted(lxs.keys())
+            contingency = [
+                # [погибло в ДТП с такой тяжестью, без погибших]
+                # approximation: deaths>0 → есть погибшие, иначе нет
+                [lxs[l].get("deaths", 0), lxs[l].get("dtp", 0) - lxs[l].get("deaths", 0)]
+                for l in lightings
+            ]
+            test = _chi_square_test(contingency)
+            test["test_name"] = "Освещение × Тяжесть (погибшие)"
+            test["contingency_rows"] = lightings
+            test["contingency_cols"] = ["С погибшими", "Без погибших"]
+            result["chi_square_tests"].append(test)
+
+    return result
