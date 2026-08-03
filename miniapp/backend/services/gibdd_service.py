@@ -1563,6 +1563,20 @@ async def ask_llm_question(
                 fake_clusters, max_clusters=10,
             )
 
+        # Преобразуем сохранённую историю Q&A (для UI) в формат OpenAI
+        # и передаём в LLM — чтобы модель понимала follow-up-вопросы.
+        # Берём последние 12 сообщений (6 пар Q&A), чтобы не раздувать промпт.
+        history_for_llm: list[dict[str, str]] = []
+        for h in task.llm_qa_history:
+            q = h.get("question", "")
+            a = h.get("answer", "")
+            if q:
+                history_for_llm.append({"role": "user", "content": q})
+            if a:
+                history_for_llm.append({"role": "assistant", "content": a})
+        if len(history_for_llm) > 12:
+            history_for_llm = history_for_llm[-12:]
+
         answer = await llm_module.get_ai_answer(
             question=question,
             comparison=comparison,
@@ -1574,6 +1588,7 @@ async def ask_llm_question(
             clusters_context=clusters_ctx,
             cross_tables_context=cross_tables_ctx,
             provider=provider,
+            history=history_for_llm,
         )
 
         # Сохраняем в историю
