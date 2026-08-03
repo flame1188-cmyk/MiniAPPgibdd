@@ -1577,6 +1577,16 @@ async def ask_llm_question(
         if len(history_for_llm) > 12:
             history_for_llm = history_for_llm[-12:]
 
+        # Диагностическое логирование: видно, доходит ли история до LLM
+        hist_total_chars = sum(len(m.get("content", "")) for m in history_for_llm)
+        logger.info(
+            f"Task {task.id}: LLM ask — "
+            f"qa_history={len(task.llm_qa_history)} records, "
+            f"history_for_llm={len(history_for_llm)} msgs, "
+            f"history_chars={hist_total_chars}, "
+            f"provider={provider}"
+        )
+
         answer = await llm_module.get_ai_answer(
             question=question,
             comparison=comparison,
