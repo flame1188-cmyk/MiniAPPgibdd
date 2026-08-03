@@ -14,7 +14,7 @@
  *  - Длинный текст разбит на абзацы с переносами
  *  - Подсказки: типичные вопросы (что росло, какие рекомендации и т.д.)
  */
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   api,
   type LLMProvidersResponse,
@@ -35,6 +35,13 @@ const SUGGESTED_QUESTIONS = [
   'Какие рекомендации по снижению ДТП с пешеходами?',
   'Как влияет время суток на тяжесть последствий?',
   'Какова доля нетрезвых водителей в ДТП?',
+  // Новые вопросы для Этапов 1-2 (БДД-экспертиза + профиль ТС):
+  'Какие недостатки дороги чаще всего способствуют ДТП?',
+  'На каких участках УДС (перекрёстки, переходы) больше аварий?',
+  'Как состояние покрытия влияет на тяжесть последствий?',
+  'В ДТП с каким возрастом ТС больше погибших?',
+  'Какие марки автомобилей чаще всего фигурируют в ДТП?',
+  'Как распределены ДТП по количеству участвующих ТС?',
 ]
 
 export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
@@ -47,6 +54,14 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
   const [qaLoading, setQaLoading] = useState(false)
   const [qaError, setQaError] = useState<string | null>(null)
   const [qaHistory, setQaHistory] = useState<QAHistoryItem[]>([])
+
+  // 3 случайных подсказки из полного списка — при каждом монтировании
+  // компонента пользователь видит разные, что расширяет охват возможностей
+  // (теперь включает БДД-факторы и профиль ТС).
+  const suggestedQuestions = useMemo(
+    () => [...SUGGESTED_QUESTIONS].sort(() => Math.random() - 0.5).slice(0, 3),
+    [],
+  )
 
   // Polling для summary
   const { data: summaryData } = useLLMSummaryPolling(task.task_id, started)
@@ -304,7 +319,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           {/* Подсказки */}
           {!question && (
             <div className="flex flex-wrap gap-1.5">
-              {SUGGESTED_QUESTIONS.slice(0, 3).map((q) => (
+              {suggestedQuestions.map((q) => (
                 <button
                   key={q}
                   onClick={() => {
