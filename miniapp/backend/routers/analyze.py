@@ -276,13 +276,28 @@ async def start_clusters(
 )
 async def get_clusters_status(
     task_id: str,
+    wait: int = 0,
     user: TelegramUser = Depends(get_current_user),
 ):
     """
-    Возвращает статус расчёта очагов (для polling из frontend).
+    Возвращает статус расчёта очагов.
+
+    Поддержка long polling: если ?wait=N (секунды) и статус running,
+    endpoint держит соединение открытым до N секунд, ожидая завершения.
+    Возвращает сразу при смене статуса на done/failed или по таймауту.
     """
     task = _require_done_task(task_id, user)
     state = task.clusters_state
+
+    # Long polling: ждём, пока статус running, до `wait` секунд
+    if wait > 0 and state.status == AnalysisStatus.RUNNING:
+        deadline = asyncio.get_event_loop().time() + min(wait, 60)
+        while (
+            state.status == AnalysisStatus.RUNNING
+            and asyncio.get_event_loop().time() < deadline
+        ):
+            await asyncio.sleep(1)
+
     return ClustersResponse(
         state=_state_to_response(state),
         result=_clusters_result_to_response(state.result)
@@ -593,11 +608,28 @@ async def start_llm_summary_endpoint(
 )
 async def get_llm_summary_status(
     task_id: str,
+    wait: int = 0,
     user: TelegramUser = Depends(get_current_user),
 ):
-    """Возвращает статус генерации LLM-резюме (для polling)."""
+    """
+    Возвращает статус генерации LLM-резюме.
+
+    Поддержка long polling: если ?wait=N (секунды) и статус running,
+    endpoint держит соединение открытым до N секунд, ожидая завершения.
+    Возвращает сразу при смене статуса на done/failed или по таймауту.
+    """
     task = _require_done_task(task_id, user)
     state = task.llm_summary_state
+
+    # Long polling: ждём, пока статус running, до `wait` секунд
+    if wait > 0 and state.status == AnalysisStatus.RUNNING:
+        deadline = asyncio.get_event_loop().time() + min(wait, 60)
+        while (
+            state.status == AnalysisStatus.RUNNING
+            and asyncio.get_event_loop().time() < deadline
+        ):
+            await asyncio.sleep(1)
+
     return LLMSummaryResponse(
         state=_state_to_response(state),
         result=LLMSummaryResult(**state.result)
