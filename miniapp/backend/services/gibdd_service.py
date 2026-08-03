@@ -1547,8 +1547,13 @@ async def ask_llm_question(
                 stats_text = llm_module.format_statistical_metrics_for_prompt(stats)
                 if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
                     cross_tables_ctx += "\n\n" + stats_text
-            except Exception:
-                pass
+            except Exception as exc:
+                # Не валить весь Q&A, если кросс-таблицы упали —
+                # LLM ответит на основе comparison + clusters_context.
+                # Но залогировать нужно, иначе ошибка будет невидимой.
+                logger.warning(
+                    f"Task {task.id}: Q&A cross-tables failed: {exc}"
+                )
 
         # Очаги (если есть)
         clusters_ctx = ""
