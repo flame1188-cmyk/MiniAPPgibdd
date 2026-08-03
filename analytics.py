@@ -1256,6 +1256,17 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
       - alcohol_x_district: {district: Counter("да"/"нет")} — опьянение по районам
       - alcohol_x_road_value: {road_category: Counter("да"/"нет")} — опьянение по категориям дорог
       - street_x_severity: {street_name: {dtp, deaths, injured}} — топ-15 улиц (k_ul/street + np)
+
+      Этап 1 «БДД-экспертиза» (по dor_usl):
+      - ndu_x_severity: {ndu_item: {dtp, deaths, injured}} — недостатки УДС
+      - objects_addr_x_severity: {obj_dtp_item: {dtp, deaths, injured}} — объекты УДС вблизи
+      - s_pch_x_severity: {s_pch: {dtp, deaths, injured}} — состояние проезжей части
+      - factor_x_severity: {factor_item: {dtp, deaths, injured}} — факторы режима движения
+
+      Этап 2 «Профиль ТС»:
+      - vehicles_count_x_severity: {bucket: {dtp, deaths, injured}} — 1/2/3/4+ ТС
+      - vehicle_brand_x_severity: {brand: {dtp, deaths, injured}} — марка ТС (marka_ts → m_ts)
+      - vehicle_age_x_severity: {age_bucket: {dtp, deaths, injured}} — 0-3/4-7/8-12/13-20/20+/—
     """
     # Инициализация всех таблиц
     hour_x_severity: dict[str, dict] = {}
@@ -1289,6 +1300,24 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
     alcohol_x_road_value: dict[str, Counter] = {}
     # Улица × тяжесть (топ-15) — берём из k_ul или street
     street_x_severity: dict[str, dict] = {}
+
+    # Этап 1 «БДД-экспертиза» — все четыре поля из dor_usl.
+    # Шаблон тот же, что у weather_x_severity: для каждого элемента списка
+    # добавляем {dtp, deaths, injured} (одно ДТП может попасть в несколько
+    # категорий, если в карточке указано несколько недостатков/факторов).
+    ndu_x_severity: dict[str, dict] = {}
+    objects_addr_x_severity: dict[str, dict] = {}
+    s_pch_x_severity: dict[str, dict] = {}
+    factor_x_severity: dict[str, dict] = {}
+
+    # Этап 2 «Профиль ТС»
+    # B1 — количество ТС в ДТП (k_ts): бакеты 1/2/3/4+.
+    vehicles_count_x_severity: dict[str, dict] = {}
+    # B2 — марка ТС (marka_ts, fallback m_ts): по ДТП, не по участникам.
+    # Если в ДТП 2 ТС одной марки — считаем ДТП один раз для этой марки.
+    vehicle_brand_x_severity: dict[str, dict] = {}
+    # B3 — возраст ТС = год ДТП − g_v. Бакеты 0-3/4-7/8-12/13-20/20+/—.
+    vehicle_age_x_severity: dict[str, dict] = {}
 
     def _add_severity(table: dict, key: str, deaths: int, injured: int, count: int = 1):
         if key not in table:
@@ -1440,6 +1469,126 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
         if street_name:
             _add_severity(street_x_severity, street_name, deaths, injured)
 
+        # 26. Этап 1: Недостатки УДС × тяжесть (ndu — список строк)
+        # Шаблон полностью повторяет weather_x_severity.
+        ndu_list = dor_usl.get("ndu", []) or []
+        if isinstance(ndu_list, list):
+            for ndu_item in ndu_list:
+                ndu_str = str(ndu_item).strip()
+                if ndu_str:
+                    _add_severity(ndu_x_severity, ndu_str, deaths, injured)
+        else:
+            ndu_str = str(ndu_list).strip()
+            if ndu_str:
+                _add_severity(ndu_x_severity, ndu_str, deaths, injured)
+
+        # 27. Этап 1: Объекты УДС вблизи × тяжесть (obj_dtp — список строк)
+        obj_dtp_list = dor_usl.get("obj_dtp", []) or []
+        if isinstance(obj_dtp_list, list):
+            for obj_item in obj_dtp_list:
+                obj_str = str(obj_item).strip()
+                if obj_str:
+                    _add_severity(objects_addr_x_severity, obj_str, deaths, injured)
+        else:
+            obj_str = str(obj_dtp_list).strip()
+            if obj_str:
+                _add_severity(objects_addr_x_severity, obj_str, deaths, injured)
+
+        # 28. Этап 1: Состояние проезжей части × тяжесть (s_pch — строка)
+        s_pch_val = str(dor_usl.get("s_pch", "")).strip()
+        if s_pch_val:
+            _add_severity(s_pch_x_severity, s_pch_val, deaths, injured)
+
+        # 29. Этап 1: Факторы режима движения × тяжесть (factor — список строк)
+        factor_list = dor_usl.get("factor", []) or []
+        if isinstance(factor_list, list):
+            for f_item in factor_list:
+                f_str = str(f_item).strip()
+                if f_str:
+                    _add_severity(factor_x_severity, f_str, deaths, injured)
+        else:
+            f_str = str(factor_list).strip()
+            if f_str:
+                _add_severity(factor_x_severity, f_str, deaths, injured)
+
+        # 30. Этап 2: Количество ТС × тяжесть (k_ts → бакеты 1/2/3/4+)
+        k_ts_val = _safe_int(card.get("k_ts"))
+        if k_ts_val <= 0:
+            # Если k_ts не указан — берём длину ts_info как fallback
+            k_ts_val = len(card.get("ts_info", []) or [])
+        if k_ts_val <= 0:
+            k_ts_bucket = "не указано"
+        elif k_ts_val == 1:
+            k_ts_bucket = "1 ТС"
+        elif k_ts_val == 2:
+            k_ts_bucket = "2 ТС"
+        elif k_ts_val == 3:
+            k_ts_bucket = "3 ТС"
+        else:
+            k_ts_bucket = "4+ ТС"
+        _add_severity(vehicles_count_x_severity, k_ts_bucket, deaths, injured)
+
+        # 31-32. Этап 2: Марка и возраст ТС — собираем уникальные значения
+        # по ts_info (одно ДТП учитывается один раз для каждой уникальной
+        # марки/возрастной группы, представленной среди ТС этого ДТП).
+        ts_list_for_profile = card.get("ts_info", []) or []
+
+        # 31. Марка ТС × тяжесть
+        # Приоритет: marka_ts (марка — производитель), fallback — m_ts (модель).
+        unique_brands: set[str] = set()
+        for ts in ts_list_for_profile:
+            brand = str(ts.get("marka_ts", "")).strip()
+            if not brand:
+                brand = str(ts.get("m_ts", "")).strip()
+            if brand:
+                # Нормализуем: режем лишние пробелы и приводим к нижнему регистру
+                # только для дедупликации (в таблице сохраняем оригинальный регистр).
+                brand_norm = " ".join(brand.split())
+                unique_brands.add(brand_norm)
+        for brand in unique_brands:
+            _add_severity(vehicle_brand_x_severity, brand, deaths, injured)
+
+        # 32. Возраст ТС × тяжесть
+        # Год ДТП берём из date_dtp (формат DD.MM.YYYY).
+        dtp_year: int | None = None
+        if date_str:
+            try:
+                from datetime import datetime
+                dtp_year = datetime.strptime(date_str[:10], "%d.%m.%Y").year
+            except (ValueError, IndexError):
+                dtp_year = None
+
+        unique_age_buckets: set[str] = set()
+        for ts in ts_list_for_profile:
+            g_v_str = str(ts.get("g_v", "")).strip()
+            if not g_v_str or not dtp_year:
+                continue
+            try:
+                g_v = int(float(g_v_str))
+            except (ValueError, TypeError):
+                continue
+            if g_v <= 1900 or g_v > dtp_year + 1:
+                # Явно некорректный год выпуска — пропускаем
+                continue
+            age = dtp_year - g_v
+            if age < 0:
+                age = 0
+            if age <= 3:
+                unique_age_buckets.add("0-3 года")
+            elif age <= 7:
+                unique_age_buckets.add("4-7 лет")
+            elif age <= 12:
+                unique_age_buckets.add("8-12 лет")
+            elif age <= 20:
+                unique_age_buckets.add("13-20 лет")
+            else:
+                unique_age_buckets.add("старше 20 лет")
+        if not unique_age_buckets and ts_list_for_profile:
+            # Были ТС, но ни одного валидного g_v — помечаем как «не указан»
+            unique_age_buckets.add("не указан")
+        for bucket in unique_age_buckets:
+            _add_severity(vehicle_age_x_severity, bucket, deaths, injured)
+
         # 7. Погода × вид ДТП
         for w in weather_list:
             w_str = str(w).strip()
@@ -1542,6 +1691,15 @@ def calculate_cross_tables(cards: list[dict[str, Any]]) -> dict[str, Any]:
         "alcohol_x_district": alcohol_x_district,
         "alcohol_x_road_value": alcohol_x_road_value,
         "street_x_severity": street_x_severity,
+        # Этап 1 «БДД-экспертиза»
+        "ndu_x_severity": ndu_x_severity,
+        "objects_addr_x_severity": objects_addr_x_severity,
+        "s_pch_x_severity": s_pch_x_severity,
+        "factor_x_severity": factor_x_severity,
+        # Этап 2 «Профиль ТС»
+        "vehicles_count_x_severity": vehicles_count_x_severity,
+        "vehicle_brand_x_severity": vehicle_brand_x_severity,
+        "vehicle_age_x_severity": vehicle_age_x_severity,
     }
 
 
