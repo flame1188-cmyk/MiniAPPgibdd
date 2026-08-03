@@ -1364,7 +1364,22 @@ async def _do_llm_request(
         logger.info(f"Rate limiter: ждём {cooldown:.0f} сек между LLM-вызовами...")
         await asyncio.sleep(cooldown)
 
-    logger.info(f"LLM запрос: модель={model_name}, url={api_url}, длина промпта={prompt_len} символов")
+    # Диагностическое логирование: показываем реальную структуру messages
+    # (включая history), а не только длину user_message.
+    messages_in_payload = payload.get("messages", [])
+    msgs_count = len(messages_in_payload)
+    msgs_total_chars = sum(len(m.get("content", "")) for m in messages_in_payload)
+    # Распределение по ролям
+    roles_count = {}
+    for m in messages_in_payload:
+        r = m.get("role", "?")
+        roles_count[r] = roles_count.get(r, 0) + 1
+    roles_str = ", ".join(f"{r}={c}" for r, c in sorted(roles_count.items()))
+    logger.info(
+        f"LLM запрос: модель={model_name}, url={api_url}, "
+        f"user_msg_len={prompt_len}, messages={msgs_count} ({roles_str}), "
+        f"total_chars={msgs_total_chars}"
+    )
 
     retry_delays = [30, 60, 90, 120, 150]
 
