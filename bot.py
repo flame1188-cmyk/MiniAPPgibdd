@@ -45,6 +45,11 @@ from llm_analyzer import is_paid_llm_available, is_any_llm_available
 _MAX_TG_RETRIES = 3
 _TG_RETRY_DELAYS = [2, 5, 10]  # секунды между попытками
 
+# Лимит истории Q&A-режима (в сообщениях, не в парах).
+# 12 = 6 пар вопрос/ответ. Больше раздувает промпт и упирается в контекст;
+# меньше — модель теряет контекст диалога слишком быстро.
+_QA_HISTORY_MAX_MESSAGES = 12
+
 
 async def _tg_retry(coro_factory, description="Telegram API"):
     """Выполняет вызов Telegram API с ретраем при TimedOut/NetworkError.
@@ -1412,7 +1417,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if data == "back_to_menu":
                 # Сбрасываем временные флаги режимов, но НЕ удаляем данные
                 for key in [
-                    "qa_mode", "qa_llm_provider", "point_stats_mode",
+                    "qa_mode", "qa_llm_provider", "qa_history",
+                    "point_stats_mode",
                     "waiting_camera_file", "waiting_camera_for_map",
                 ]:
                     context.user_data.pop(key, None)
@@ -2341,7 +2347,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_period", "analytics_cards", "analytics_comparison",
         "analytics_current_label", "analytics_prev_label",
         "analytics_prev_cards", "analytics_clusters",
-        "analytics_news_context", "qa_mode", "qa_llm_provider",
+        "analytics_news_context", "qa_mode", "qa_llm_provider", "qa_history",
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
         "cameras_data", "waiting_camera_file", "waiting_camera_for_map",
         "_settlement_polygons", "_preload_task",
@@ -3482,7 +3488,20 @@ async def _handle_analytics_question(
             ),
             cross_tables_context=cross_tables_ctx,
             provider=llm_provider,
+            # Передаём историю диалога, чтобы LLM понимала follow-up-вопросы
+            history=context.user_data.get("qa_history", []),
         )
+
+        # Сохраняем пару (вопрос, ответ) в историю диалога.
+        # История хранится в OpenAI-формате: [{role, content}, ...]
+        # и обрезается до последних _QA_HISTORY_MAX_MESSAGES сообщений
+        # (6 пар Q&A), чтобы не раздувать промпт сверх лимита контекста.
+        qa_history = context.user_data.get("qa_history", [])
+        qa_history.append({"role": "user", "content": question})
+        qa_history.append({"role": "assistant", "content": answer})
+        if len(qa_history) > _QA_HISTORY_MAX_MESSAGES:
+            qa_history = qa_history[-_QA_HISTORY_MAX_MESSAGES:]
+        context.user_data["qa_history"] = qa_history
 
         # Удаляем индикатор
         try:

@@ -1194,6 +1194,7 @@ async def ask_llm(
     system_prompt: str | None = None,
     max_retries: int = 5,
     provider: LLMProvider = "free",
+    history: list[dict[str, str]] | None = None,
 ) -> str:
     """
     Отправляет запрос к LLM и возвращает текстовый ответ.
@@ -1208,6 +1209,10 @@ async def ask_llm(
         system_prompt: Системный промпт (если None — используется стандартный)
         max_retries: Максимальное число повторных попыток при 429/5xx
         provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
+        history: История предыдущих пар Q&A в формате OpenAI
+                 ([{role: "user"|"assistant", content: "..."}, ...]).
+                 None или пустой список — режим без памяти (как раньше).
+                 Вставляется между system и новым user_message.
 
     Returns:
         Текст ответа от модели
@@ -1221,11 +1226,13 @@ async def ask_llm(
             user_message=user_message,
             system_prompt=system_prompt,
             max_retries=max_retries,
+            history=history,
         )
     return await _ask_free_llm(
         user_message=user_message,
         system_prompt=system_prompt,
         max_retries=max_retries,
+        history=history,
     )
 
 
@@ -1233,6 +1240,7 @@ async def _ask_free_llm(
     user_message: str,
     system_prompt: str | None = None,
     max_retries: int = 5,
+    history: list[dict[str, str]] | None = None,
 ) -> str:
     """Запрос к бесплатному провайдеру (ZhipuAI / GLM)."""
     if not LLM_API_KEY:
@@ -1244,12 +1252,22 @@ async def _ask_free_llm(
     if system_prompt is None:
         system_prompt = SYSTEM_PROMPT
 
+    # Собираем messages: system + история + новый вопрос
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+    ]
+    if history:
+        # Берём только валидные пары (role, content) — страховка от мусора
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_message})
+
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "max_tokens": 8192,
     }
@@ -1274,6 +1292,7 @@ async def _ask_paid_llm(
     user_message: str,
     system_prompt: str | None = None,
     max_retries: int = 5,
+    history: list[dict[str, str]] | None = None,
 ) -> str:
     """Запрос к платному провайдеру (OpenAI-совместимый API)."""
     if not LLM_PAID_API_KEY:
@@ -1288,12 +1307,21 @@ async def _ask_paid_llm(
     base_url = LLM_PAID_API_URL.rstrip("/")
     api_url = f"{base_url}/chat/completions"
 
+    # Собираем messages: system + история + новый вопрос
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+    ]
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_message})
+
     payload = {
         "model": LLM_PAID_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
+        "messages": messages,
         "temperature": 0.7,
         "max_tokens": 8192,
     }
@@ -1552,6 +1580,7 @@ async def get_ai_answer(
     clusters_context: str = "",
     cross_tables_context: str = "",
     provider: LLMProvider = "free",
+    history: list[dict[str, str]] | None = None,
 ) -> str:
     """
     Отвечает на вопрос пользователя по данным с помощью LLM.
@@ -1562,6 +1591,9 @@ async def get_ai_answer(
         clusters_context: Данные об очагах концентрации ДТП
         cross_tables_context: Кросс-таблицы для бесплатного метода
         provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
+        history: История предыдущих пар Q&A в формате OpenAI
+                 ([{role: "user"|"assistant", content: "..."}, ...]).
+                 None или пустой список — режим без памяти (как раньше).
 
     Returns:
         Текст ответа от нейросети
@@ -1573,4 +1605,8 @@ async def get_ai_answer(
         clusters_context=clusters_context,
         cross_tables_context=cross_tables_context,
     )
-    return await ask_llm(user_message=prompt, provider=provider)
+    return await ask_llm(
+        user_message=prompt,
+        provider=provider,
+        history=history,
+    )
