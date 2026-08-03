@@ -138,9 +138,15 @@ BBOX_MIN_CLAMP = 0.01  # минимальный размер bbox (если ДТ
 # Параметры исторической динамики
 # ========================
 
-# Радиус сопоставления очагов между периодами (км)
-MATCH_RADIUS_SETTLEMENT = 0.5       # 500 м — для НП
-MATCH_RADIUS_NONSETTLEMENT = 2.0    # 2 км — для вне НП (участки длиннее)
+# Радиус сопоставления очагов между периодами (в МЕТРАХ).
+# ВАЖНО: haversine_meters() возвращает метры (EARTH_RADIUS_KM * c * 1000),
+# поэтому и радиусы должны быть в метрах — иначе сравнение dist <= radius
+# будет некорректным. Раньше тут было 0.5/2.0 (что фактически означало
+# 0.5м/2м) — из-за этого НИ ОДИН очаг не сматчивался между периодами,
+# все помечались «новые»/«исчезнувшие» (баг выявлен в production-логах
+# Московской обл.: 8+9 очагов, 0 совпадений).
+MATCH_RADIUS_SETTLEMENT = 500       # 500 м — для НП
+MATCH_RADIUS_NONSETTLEMENT = 2000   # 2 км — для вне НП (участки длиннее)
 
 DYNAMICS_STATUS_LABELS = {
     "new": "Новый",
@@ -2975,9 +2981,19 @@ def _match_clusters(
     Сопоставляет текущие очаги с прошлыми по географической близости
     и совпадению названия дороги.
 
-    Алгоритм: для каждого текущего очага ищет ближайший прошлый
-    в пределах радиуса сопоставления (зависит от типа зоны).
-    Дорога должна совпадать (если указана у обоих очагов).
+    Двухпроходный алгоритм:
+
+    1. Основной проход: road + distance.
+       Радиус зависит от типа зоны (500м для НП, 2км для вне-НП).
+       Дорога должна совпадать, если указана у обоих очагов.
+
+    2. Fallback-проход: distance-only с уменьшенным радиусом
+       (50% от основного). Применяется к текущим очагам, для которых
+       проход 1 не нашёл матча. Нужно для случаев, когда названия дорог
+       изменились между периодами — переименование, разная регистрация
+       в данных ГИБДД (типично для трасс М-12/М-12 «Восток» и т.п.).
+       Zone_type должен совпадать — не матчим НП с вне-НП даже fallback'ом.
+
     Каждый прошлый очаг сопоставляется не более одного раза.
 
     Returns:
@@ -2986,6 +3002,7 @@ def _match_clusters(
     matches: dict[int, int | None] = {}
     used_prev: set[int] = set()
 
+    # === Проход 1: road + distance ===
     for ci, curr in enumerate(current_clusters):
         cc = curr.get("center")
         if not cc:
@@ -3025,12 +3042,120 @@ def _match_clusters(
         if best_idx is not None:
             used_prev.add(best_idx)
 
+    # === Проход 2: fallback — distance-only, уменьшенный радиус ===
+    # Применяется к текущим очагам, для которых проход 1 не нашёл матча.
+    # Контекст: между периодами (особенно год к году) названия дорог в
+    # данных ГИБДД могут отличаться — переименование трасс, разные пробелы,
+    # разный регистр, «М-12» vs «М-12 «Восток»». Без fallback'а все такие
+    # очаги помечаются как «новые» + их прошлогодние аналоги как «исчезнувшие»,
+    # что делает динамику бессмысленной (было: 8 новых + 9 исчезнувших при
+    # 0 совпадениях на сопоставимых периодах Московской обл.).
+    fallback_used = 0
+    for ci, curr in enumerate(current_clusters):
+        if matches[ci] is not None:
+            continue  # уже сопоставлен в проходе 1
+
+        cc = curr.get("center")
+        if not cc:
+            continue
+
+        # Fallback: жёстче радиус (50% от основного), zone_type должен совпадать
+        radius_fallback = (
+            MATCH_RADIUS_SETTLEMENT * 0.5  # 250м для НП
+            if curr["zone_type"].startswith("settlement")
+            else MATCH_RADIUS_NONSETTLEMENT * 0.5  # 1000м (1км) для вне-НП
+        )
+
+        best_dist = float("inf")
+        best_idx: int | None = None
+
+        for pi, prev in enumerate(prev_clusters):
+            if pi in used_prev:
+                continue
+
+            # Zone_type должен совпадать — не матчим НП с вне-НП
+            if curr["zone_type"] != prev["zone_type"]:
+                continue
+
+            pc = prev.get("center")
+            if not pc:
+                continue
+
+            dist = haversine_meters(cc[0], cc[1], pc[0], pc[1])
+            if dist <= radius_fallback and dist < best_dist:
+                best_dist = dist
+                best_idx = pi
+
+        if best_idx is not None:
+            matches[ci] = best_idx
+            used_prev.add(best_idx)
+            fallback_used += 1
+            logger.info(
+                f"Match fallback: текущий очаг #{ci} "
+                f"(road='{curr['road']}' zone={curr['zone_type']}) "
+                f"<-> прошлый #{best_idx} "
+                f"(road='{prev_clusters[best_idx]['road']}'), "
+                f"дистанция={best_dist:.0f}м (без проверки названия дороги)"
+            )
+
+    # === Итоговое логирование + диагностика низкого match rate ===
+    matched_count = sum(1 for v in matches.values() if v is not None)
+    total_curr = len(current_clusters)
+    total_prev = len(prev_clusters)
+
     logger.info(
-        f"Сопоставление очагов: {len(current_clusters)} текущих, "
-        f"{len(prev_clusters)} прошлых, "
-        f"совпало {sum(1 for v in matches.values() if v is not None)}, "
-        f"новых {sum(1 for v in matches.values() if v is None)}"
+        f"Сопоставление очагов: {total_curr} текущих, "
+        f"{total_prev} прошлых, "
+        f"совпало {matched_count} (из них {fallback_used} через fallback), "
+        f"новых {total_curr - matched_count}"
     )
+
+    # Подробная диагностика при аномально низком match rate
+    # (< 30% от меньшего из двух списков и хотя бы 2 в каждом).
+    # Помогает понять, почему матчинг не сработал: расхождение дорог,
+    # слишком большие дистанции между центрами, и т.д.
+    if (
+        total_curr >= 2
+        and total_prev >= 2
+        and matched_count < max(1, int(min(total_curr, total_prev) * 0.3))
+    ):
+        logger.warning(
+            f"Аномально низкий match rate: {matched_count}/"
+            f"{min(total_curr, total_prev)} возможных. "
+            f"Диагностика по каждому несопоставленному текущему очагу:"
+        )
+        for ci, curr in enumerate(current_clusters):
+            if matches[ci] is not None:
+                continue
+            cc = curr.get("center")
+            if not cc:
+                logger.warning(f"  #{ci}: нет center (пропуск)")
+                continue
+
+            # Найдём ближайший prev (без фильтра по дороге)
+            best_dist = float("inf")
+            best_pi = -1
+            best_road = ""
+            best_zone = ""
+            for pi, prev in enumerate(prev_clusters):
+                pc = prev.get("center")
+                if not pc:
+                    continue
+                dist = haversine_meters(cc[0], cc[1], pc[0], pc[1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pi = pi
+                    best_road = prev["road"]
+                    best_zone = prev["zone_type"]
+
+            if best_pi >= 0:
+                logger.warning(
+                    f"  #{ci} road='{curr['road']}' zone={curr['zone_type']} "
+                    f"-> ближайший прошлый #{best_pi} "
+                    f"road='{best_road}' zone={best_zone} "
+                    f"дистанция={best_dist:.0f}м"
+                )
+
     return matches
 
 
