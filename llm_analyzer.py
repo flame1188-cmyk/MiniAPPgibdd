@@ -173,7 +173,18 @@ SYSTEM_PROMPT = (
     "9. Структурируй ответ: выводы, причины, рекомендации\n"
     "10. Если данных недостаточно для вывода — так и скажи\n"
     "11. Не используй эмодзи и markdown-форматирование\n"
-    "12. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос"
+    "12. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос\n\n"
+    "ДИАЛОГ:\n"
+    "Если в сообщениях выше есть история предыдущих вопросов и твоих ответов — "
+    "это продолжение диалога с пользователем.\n"
+    "13. Для follow-up-вопросов («а там?», «а ещё?», «а как с...») — "
+    "не повторяй полный анализ с нуля, а опирайся на то, что уже было сказано. "
+    "Уточняй, дополняй, раскрывай новые аспекты.\n"
+    "14. Если пользователь прямо спрашивает «ты помнишь контекст?» или подобное — "
+    "подтверди, кратко перечислив темы предыдущих вопросов (1-2 предложения), "
+    "и предложи продолжить.\n"
+    "15. Не противоречь своим предыдущим ответам. Если новые данные в текущем "
+    "вопросе меняют вывод — явно укажи это («Уточняю ранее сказанное: ...»)."
 )
 
 
@@ -254,7 +265,18 @@ SYSTEM_PROMPT_PAID = (
     "статистики и упоминания реальных событий. "
     "Если новость противоречит статистике — укажи на это.\n\n"
     "Объём ответа: развёрнутый анализ, каждый раздел — с конкретными цифрами из данных. "
-    "Приоритет — точность и конкретика, а не объём."
+    "Приоритет — точность и конкретика, а не объём.\n\n"
+    "ДИАЛОГ:\n"
+    "Если в сообщениях выше есть история предыдущих вопросов и твоих ответов — "
+    "это продолжение диалога с пользователем.\n"
+    "9. Для follow-up-вопросов («а там?», «а ещё?», «а как с...») — "
+    "не повторяй полный анализ с нуля, а опирайся на то, что уже было сказано. "
+    "Уточняй, дополняй, раскрывай новые аспекты.\n"
+    "10. Если пользователь прямо спрашивает «ты помнишь контекст?» или подобное — "
+    "подтверди, кратко перечислив темы предыдущих вопросов (1-2 предложения), "
+    "и предложи продолжить.\n"
+    "11. Не противоречь своим предыдущим ответам. Если новые данные в текущем "
+    "вопросе меняют вывод — явно укажи это («Уточняю ранее сказанное: ...»)."
 )
 
 
@@ -1195,6 +1217,7 @@ async def ask_llm(
     max_retries: int = 5,
     provider: LLMProvider = "free",
     history: list[dict[str, str]] | None = None,
+    temperature: float = 0.7,
 ) -> str:
     """
     Отправляет запрос к LLM и возвращает текстовый ответ.
@@ -1213,6 +1236,9 @@ async def ask_llm(
                  ([{role: "user"|"assistant", content: "..."}, ...]).
                  None или пустой список — режим без памяти (как раньше).
                  Вставляется между system и новым user_message.
+        temperature: Температура генерации (0.0-2.0). Для резюме — 0.7,
+                     для Q&A — 0.3 (более детерминированно, меньше расхождений
+                     на одних и тех же данных).
 
     Returns:
         Текст ответа от модели
@@ -1227,12 +1253,14 @@ async def ask_llm(
             system_prompt=system_prompt,
             max_retries=max_retries,
             history=history,
+            temperature=temperature,
         )
     return await _ask_free_llm(
         user_message=user_message,
         system_prompt=system_prompt,
         max_retries=max_retries,
         history=history,
+        temperature=temperature,
     )
 
 
@@ -1241,6 +1269,7 @@ async def _ask_free_llm(
     system_prompt: str | None = None,
     max_retries: int = 5,
     history: list[dict[str, str]] | None = None,
+    temperature: float = 0.7,
 ) -> str:
     """Запрос к бесплатному провайдеру (ZhipuAI / GLM)."""
     if not LLM_API_KEY:
@@ -1268,7 +1297,7 @@ async def _ask_free_llm(
     payload = {
         "model": LLM_MODEL,
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": 8192,
     }
 
@@ -1293,6 +1322,7 @@ async def _ask_paid_llm(
     system_prompt: str | None = None,
     max_retries: int = 5,
     history: list[dict[str, str]] | None = None,
+    temperature: float = 0.7,
 ) -> str:
     """Запрос к платному провайдеру (OpenAI-совместимый API)."""
     if not LLM_PAID_API_KEY:
@@ -1322,7 +1352,7 @@ async def _ask_paid_llm(
     payload = {
         "model": LLM_PAID_MODEL,
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": 8192,
     }
 
@@ -1375,10 +1405,11 @@ async def _do_llm_request(
         r = m.get("role", "?")
         roles_count[r] = roles_count.get(r, 0) + 1
     roles_str = ", ".join(f"{r}={c}" for r, c in sorted(roles_count.items()))
+    temperature = payload.get("temperature", "?")
     logger.info(
         f"LLM запрос: модель={model_name}, url={api_url}, "
         f"user_msg_len={prompt_len}, messages={msgs_count} ({roles_str}), "
-        f"total_chars={msgs_total_chars}"
+        f"total_chars={msgs_total_chars}, temperature={temperature}"
     )
 
     retry_delays = [30, 60, 90, 120, 150]
@@ -1620,8 +1651,24 @@ async def get_ai_answer(
         clusters_context=clusters_context,
         cross_tables_context=cross_tables_context,
     )
+
+    # Если есть история — добавляем явный маркер в начало промпта,
+    # чтобы модель обратила внимание на контекст диалога
+    # (иначе follow-up-вопрос «тонет» в ~10к символов аналитики).
+    if history:
+        prompt = (
+            "[ПРОДОЛЖЕНИЕ ДИАЛОГА]\n"
+            "Выше приведены предыдущие вопросы пользователя и твои ответы. "
+            "Учитывай их при ответе на текущий вопрос — не противоречь, "
+            "опирайся на уже сказанное, для follow-up раскрывай новые аспекты.\n\n"
+            + prompt
+        )
+
+    # Q&A — более низкая температура, чем для summary:
+    # 0.3 = детерминированность, меньше расхождений на одних и тех же данных.
     return await ask_llm(
         user_message=prompt,
         provider=provider,
         history=history,
+        temperature=0.3,
     )
