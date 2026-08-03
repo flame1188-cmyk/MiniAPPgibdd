@@ -1893,6 +1893,8 @@ def calculate_statistical_metrics(cross: dict[str, Any]) -> dict[str, Any]:
     }
 
     # --- 1. Severity rates: погибших на 100 ДТП по разным срезам ---
+    # Включаем новые таблицы Этапов 1-2, где бакеты достаточно укрупнены
+    # (не более ~15-20 ключей), чтобы severity rates имели смысл.
     severity_slices = [
         ("Районы", "district_x_severity"),
         ("Дороги", "road_name_x_severity"),
@@ -1902,6 +1904,15 @@ def calculate_statistical_metrics(cross: dict[str, Any]) -> dict[str, Any]:
         ("Месяц", "month_x_severity"),
         ("Освещение", "lighting_x_severity"),
         ("Улицы", "street_x_severity"),
+        # Этап 1 «БДД-экспертиза»:
+        ("Недостатки УДС", "ndu_x_severity"),
+        ("Состояние покрытия", "s_pch_x_severity"),
+        ("Факторы режима", "factor_x_severity"),
+        # Этап 2 «Профиль ТС»:
+        ("Количество ТС", "vehicles_count_x_severity"),
+        ("Возраст ТС", "vehicle_age_x_severity"),
+        # Марка ТС НЕ включаем — слишком много уникальных значений,
+        # на каждой марке 1-5 ДТП, severity rate будет неинформативен.
     ]
     for slice_name, key in severity_slices:
         table = cross.get(key, {})
@@ -1913,6 +1924,8 @@ def calculate_statistical_metrics(cross: dict[str, Any]) -> dict[str, Any]:
                 result["severity_rates"][slice_name] = top_rates
 
     # --- 2. Z-score аномалии ---
+    # Z-score имеет смысл только для укрупнённых бакетов — иначе на каждой
+    # категории будет 1-2 ДТП и z будет огромным/неинформативным.
     anomaly_slices = [
         ("Районы", "district_x_severity"),
         ("Дороги", "road_name_x_severity"),
@@ -1920,6 +1933,15 @@ def calculate_statistical_metrics(cross: dict[str, Any]) -> dict[str, Any]:
         ("Категория дороги", "road_value_x_severity"),
         ("Вид ДТП", "dtp_type_x_severity"),
         ("Улицы", "street_x_severity"),
+        # Этап 1 «БДД-экспертиза» — важнейший срез для аномалий:
+        # если на «Яма на проезжей части» тяжесть аномально высокая — это
+        # прямой сигнал для адресных мер.
+        ("Недостатки УДС", "ndu_x_severity"),
+        ("Состояние покрытия", "s_pch_x_severity"),
+        ("Факторы режима", "factor_x_severity"),
+        # Этап 2 «Профиль ТС» — бакеты 1/2/3/4+ и 0-3/.../20+:
+        ("Количество ТС", "vehicles_count_x_severity"),
+        ("Возраст ТС", "vehicle_age_x_severity"),
     ]
     for slice_name, key in anomaly_slices:
         table = cross.get(key, {})
