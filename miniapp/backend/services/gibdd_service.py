@@ -1541,7 +1541,10 @@ async def _run_llm_summary_inner(
     clusters_ctx = ""
     if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
         llm_module = _import_module("llm_analyzer")
-        # Восстанавливаем минимальную структуру для format_clusters_for_prompt
+        # Передаём ВСЕ очаги (а не только топ-10), чтобы format_clusters_for_prompt
+        # могла разделить их по категориям (повторные/новые/исчезнувшие).
+        # Раньше брали [:10] и LLM видел «солянку» из текущих и прошлых очагов.
+        # Теперь метод сам сортирует и режет по max_clusters в каждой категории.
         fake_clusters = [
             {
                 "road": c.get("road", ""),
@@ -1555,8 +1558,14 @@ async def _run_llm_summary_inner(
                 "start_pos": c.get("start_pos"),
                 "end_pos": c.get("end_pos"),
                 "dates": c.get("dates", []),
+                # Передаём dynamics (status, prev_total, matched_prev_numbers, neighbors)
+                # и флаги is_lost/is_prev_matched — по ним LLM поймёт, к какой
+                # категории относится очаг.
+                "dynamics": c.get("dynamics", {}),
+                "_is_lost": c.get("is_lost", False),
+                "_is_prev_matched": c.get("is_prev_matched", False),
             }
-            for c in task.clusters_state.result.get("clusters", [])[:10]
+            for c in task.clusters_state.result.get("clusters", [])
         ]
         clusters_ctx = llm_module.format_clusters_for_prompt(
             fake_clusters, max_clusters=10,
@@ -1697,6 +1706,8 @@ async def ask_llm_question(
         # Очаги (если есть)
         clusters_ctx = ""
         if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
+            # Передаём ВСЕ очаги с dynamics — format_clusters_for_prompt
+            # сама разделит по категориям (повторные/новые/исчезнувшие).
             fake_clusters = [
                 {
                     "road": c.get("road", ""),
@@ -1710,8 +1721,11 @@ async def ask_llm_question(
                     "start_pos": c.get("start_pos"),
                     "end_pos": c.get("end_pos"),
                     "dates": c.get("dates", []),
+                    "dynamics": c.get("dynamics", {}),
+                    "_is_lost": c.get("is_lost", False),
+                    "_is_prev_matched": c.get("is_prev_matched", False),
                 }
-                for c in task.clusters_state.result.get("clusters", [])[:10]
+                for c in task.clusters_state.result.get("clusters", [])
             ]
             clusters_ctx = llm_module.format_clusters_for_prompt(
                 fake_clusters, max_clusters=10,

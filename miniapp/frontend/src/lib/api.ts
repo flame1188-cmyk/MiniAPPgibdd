@@ -237,6 +237,10 @@ export interface ClusterItem {
   dates: string[]
   dynamics: Record<string, any>
   camera_match?: Record<string, any> | null
+  // Флаги для фильтрации: исчезнувший / АППГ-повторённый.
+  // Нужны, чтобы исключать prev-очаги из «Топ-10 текущих».
+  is_lost?: boolean
+  is_prev_matched?: boolean
 }
 
 export interface ClustersSummary {

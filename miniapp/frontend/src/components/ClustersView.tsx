@@ -51,6 +51,10 @@ const DYNAMICS_LABELS: Record<string, { label: string; color: string; icon: stri
 
 export function ClustersView({ task }: ClustersViewProps) {
   const [started, setStarted] = useState(false)
+  // Локальный флаг «нажали кнопку, ждём первый ответ от API».
+  // Нужен, чтобы показать прогресс-бар МГНОВЕННО, не дожидаясь
+  // первого long-polling ответа (который может идти 25 сек).
+  const [starting, setStarting] = useState(false)
   const [startError, setStartError] = useState<string | null>(null)
   const [excelLoading, setExcelLoading] = useState(false)
   const [excelError, setExcelError] = useState<string | null>(null)
@@ -66,21 +70,29 @@ export function ClustersView({ task }: ClustersViewProps) {
   useEffect(() => {
     if (data?.state.status === 'done') {
       setStarted(true)
+      setStarting(false)
+    }
+    // Когда пришёл первый ответ со статусом running — локальный loading можно снять
+    if (data?.state.status === 'running') {
+      setStarting(false)
     }
   }, [data?.state.status])
 
   const handleStart = async () => {
     setStartError(null)
+    setStarting(true)  // мгновенно показываем прогресс
+    setStarted(true)   // запускаем polling
     haptic('medium')
     try {
       const resp = await api.startClusters(task.task_id)
-      setStarted(true)
       if (resp.state.status === 'done') {
-        // Уже было рассчитано раньше
+        // Уже было рассчитано раньше — polling подхватит результат
         haptic('success')
       }
     } catch (e: any) {
       setStartError(e?.message ?? 'Не удалось запустить расчёт')
+      setStarting(false)
+      setStarted(false)
       haptic('error')
     }
   }
@@ -98,6 +110,33 @@ export function ClustersView({ task }: ClustersViewProps) {
     } finally {
       setExcelLoading(false)
     }
+  }
+
+  // === Starting (мгновенный прогресс после клика, до первого ответа API) ===
+  if (starting && !data) {
+    return (
+      <div className="tg-card text-center py-6">
+        <div className="text-3xl mb-2 animate-pulse">⏳</div>
+        <div className="font-medium mb-1">Запуск расчёта...</div>
+        <div className="text-xs opacity-70 mb-3">
+          Загружаем границы населённых пунктов из OpenStreetMap
+        </div>
+        <div
+          className="w-full h-2 rounded-full overflow-hidden"
+          style={{
+            backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+          }}
+        >
+          <div
+            className="h-full transition-all duration-500"
+            style={{
+              width: '5%',
+              backgroundColor: 'var(--tg-color-button, #2481cc)',
+            }}
+          />
+        </div>
+      </div>
+    )
   }
 
   // === Состояния ===
@@ -141,13 +180,15 @@ export function ClustersView({ task }: ClustersViewProps) {
   }
 
   // === Running ===
-  if (data?.state.status === 'running') {
+  if (data?.state.status === 'running' || starting) {
+    const stage = data?.state.stage || 'Подготовка...'
+    const progress = data?.state.progress ?? 5
     return (
       <div className="tg-card text-center py-6">
-        <div className="text-3xl mb-2">⏳</div>
+        <div className="text-3xl mb-2 animate-pulse">⏳</div>
         <div className="font-medium mb-1">Расчёт очагов...</div>
         <div className="text-xs opacity-70 mb-3">
-          {data.state.stage || 'Подготовка...'}
+          {stage}
         </div>
         <div
           className="w-full h-2 rounded-full overflow-hidden"
@@ -158,13 +199,13 @@ export function ClustersView({ task }: ClustersViewProps) {
           <div
             className="h-full transition-all duration-500"
             style={{
-              width: `${data.state.progress}%`,
+              width: `${progress}%`,
               backgroundColor: 'var(--tg-color-button, #2481cc)',
             }}
           />
         </div>
         <div className="text-xs opacity-60 mt-1">
-          {data.state.progress}%
+          {progress}%
         </div>
       </div>
     )
@@ -201,8 +242,13 @@ export function ClustersView({ task }: ClustersViewProps) {
   if (data?.result) {
     const { summary, clusters, preclusters } = data.result
 
-    // Топ-10 очагов по тяжести (погибшие×3 + раненые + ДТП)
-    const sortedClusters = [...clusters].sort((a, b) => {
+    // Топ-10 очагов по тяжести — ТОЛЬКО текущего периода.
+    // Исключаем disappeared (is_lost) и АППГ-повторённые (is_prev_matched):
+    // для них total_accidents=0, и в «текущем» топе им не место.
+    const currentClusters = clusters.filter(
+      (c) => !c.is_lost && !c.is_prev_matched,
+    )
+    const sortedClusters = [...currentClusters].sort((a, b) => {
       const sa = a.deaths * 3 + a.injured + a.total_accidents
       const sb = b.deaths * 3 + b.injured + b.total_accidents
       return sb - sa

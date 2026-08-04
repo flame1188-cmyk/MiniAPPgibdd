@@ -15,6 +15,7 @@
  *  - Подсказки: типичные вопросы (что росло, какие рекомендации и т.д.)
  */
 import { useEffect, useMemo, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   api,
   type LLMProvidersResponse,
@@ -44,10 +45,37 @@ const SUGGESTED_QUESTIONS = [
   'Как распределены ДТП по количеству участвующих ТС?',
 ]
 
+// Тикер для обновления elapsed-time раз в секунду.
+// Используем отдельный state, чтобы не плодить re-render'ы всего компонента.
+function useElapsedSeconds(startedAt: string | null | undefined): number {
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!startedAt) return
+    const id = setInterval(() => setTick((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [startedAt])
+  if (!startedAt) return 0
+  const start = new Date(startedAt).getTime()
+  if (isNaN(start)) return 0
+  return Math.max(0, Math.floor((Date.now() - start) / 1000))
+}
+
+function formatElapsed(sec: number): string {
+  if (sec < 60) return `${sec} сек`
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return `${m} мин ${s} сек`
+}
+
 export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
+  const queryClient = useQueryClient()
   const [providers, setProviders] = useState<LLMProvidersResponse | null>(null)
   const [provider, setProvider] = useState<'free' | 'paid'>('free')
   const [started, setStarted] = useState(false)
+  // Локальный флаг «нажали кнопку, ждём первый ответ от API».
+  // Нужен, чтобы показать прогресс-бар МГНОВЕННО, не дожидаясь
+  // первого long-polling ответа (который может идти 25 сек).
+  const [starting, setStarting] = useState(false)
 
   // Вопрос-ответ
   const [question, setQuestion] = useState('')
@@ -66,6 +94,14 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
   // Polling для summary
   const { data: summaryData } = useLLMSummaryPolling(task.task_id, started)
 
+  // Elapsed time — пока статус running, показываем сколько секунд идёт анализ
+  const isRunning = summaryData?.state.status === 'running' || starting
+  const elapsedSec = useElapsedSeconds(isRunning ? summaryData?.state.started_at : null)
+  // Если прошло больше 90 сек — показываем предупреждение, что это дольше обычного
+  const isSlow = isRunning && elapsedSec > 90
+  // Если прошло больше 240 сек (4 мин) — показываем рекомендацию отменить
+  const isVerySlow = isRunning && elapsedSec > 240
+
   // Загружаем провайдеров и историю
   useEffect(() => {
     api.getLLMProvidersForTask(task.task_id).then(setProviders).catch(() => {})
@@ -76,6 +112,11 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
   useEffect(() => {
     if (summaryData?.state.status === 'done' && summaryData.result) {
       setStarted(true)
+      setStarting(false)
+    }
+    // Когда пришёл первый ответ со статусом running — локальный loading можно снять
+    if (summaryData?.state.status === 'running') {
+      setStarting(false)
     }
   }, [summaryData?.state.status, summaryData?.result])
 
@@ -92,13 +133,21 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
   }, [providers, provider])
 
   const handleGenerate = async () => {
-    setStarted(true)
+    // СБРОС кэша polling: при retry после ошибки статус в кэше = 'failed',
+    // и polling отключён. Чтобы он запустился заново, нужно очистить кэш.
+    // Без этого кнопка «Повторить» возвращает мгновенно старую ошибку.
+    queryClient.removeQueries({ queryKey: ['llm-summary', task.task_id] })
+    setStarting(true)  // мгновенно показываем прогресс
+    setStarted(true)   // запускаем polling
     haptic('medium')
     try {
       await api.startLLMSummary(task.task_id, provider)
+      // Если POST вернулся быстро — polling подхватит статус running.
+      // Если POST вернул уже done — polling подхватит результат.
     } catch (e: any) {
       haptic('error')
       setStarted(false)
+      setStarting(false)
     }
   }
 
@@ -192,7 +241,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
       <div className="tg-card">
         <div className="tg-section-header mb-2">Аналитическое резюме</div>
 
-        {!started && !summaryData?.result && (
+        {!started && !summaryData?.result && !starting && (
           <>
             <p className="text-sm opacity-80 mb-3">
               Нейросеть проанализирует метрики ДТП, кросс-таблицы
@@ -216,13 +265,49 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           </>
         )}
 
-        {summaryData?.state.status === 'running' && (
+        {(summaryData?.state.status === 'running' || starting) && (
           <div className="text-center py-4">
-            <div className="text-3xl mb-2">⏳</div>
-            <div className="font-medium mb-1">Нейросеть анализирует...</div>
-            <div className="text-xs opacity-70 mb-3">
-              {summaryData.state.stage}
+            <div className="text-3xl mb-2 animate-pulse">{isVerySlow ? '⏰' : '⏳'}</div>
+            <div className="font-medium mb-1">
+              {isVerySlow
+                ? 'Анализ идёт дольше обычного...'
+                : starting && !summaryData
+                  ? 'Запуск нейросети...'
+                  : 'Нейросеть анализирует...'}
             </div>
+            <div className="text-xs opacity-70 mb-3">
+              {summaryData?.state.stage || 'Подготовка промпта...'}
+            </div>
+            {/* Elapsed time — показываем после 5 сек, чтобы не мелькал «0 сек» */}
+            {elapsedSec >= 5 && (
+              <div
+                className="text-xs mb-3 font-mono"
+                style={{
+                  color: isVerySlow
+                    ? '#ff3b30'
+                    : isSlow
+                      ? '#ff9500'
+                      : 'var(--tg-color-subtitle, #888)',
+                }}
+              >
+                ⏱ {formatElapsed(elapsedSec)}
+                {isSlow && !isVerySlow && ' — дольше обычного'}
+                {isVerySlow && ' — вероятно, сбой нейросети'}
+              </div>
+            )}
+            {/* Подсказка при долгом ожидании */}
+            {isVerySlow && (
+              <div
+                className="text-xs p-2 rounded-lg mb-3 text-left"
+                style={{
+                  backgroundColor: 'rgba(255, 149, 0, 0.1)',
+                  color: '#ff9500',
+                }}
+              >
+                Сервис нейросети не отвечает достаточно долго. Подождите ещё
+                минуту или нажмите «Отменить» и попробуйте другой провайдер.
+              </div>
+            )}
             <div
               className="w-full h-2 rounded-full overflow-hidden"
               style={{
@@ -232,14 +317,34 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
               <div
                 className="h-full transition-all duration-500"
                 style={{
-                  width: `${summaryData.state.progress}%`,
-                  backgroundColor: 'var(--tg-color-button, #2481cc)',
+                  width: `${summaryData?.state.progress ?? 5}%`,
+                  backgroundColor: isVerySlow
+                    ? '#ff3b30'
+                    : isSlow
+                      ? '#ff9500'
+                      : 'var(--tg-color-button, #2481cc)',
                 }}
               />
             </div>
             <div className="text-xs opacity-60 mt-1">
-              {summaryData.state.progress}%
+              {summaryData?.state.progress ?? 5}%
             </div>
+            {/* Кнопка «Отменить» — после 60 сек ожидания */}
+            {elapsedSec > 60 && (
+              <button
+                onClick={() => {
+                  haptic('light')
+                  setStarted(false)
+                }}
+                className="mt-3 text-xs px-3 py-1.5 rounded-lg"
+                style={{
+                  backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+                  color: 'var(--tg-color-text, #000)',
+                }}
+              >
+                ✕ Отменить ожидание
+              </button>
+            )}
           </div>
         )}
 
