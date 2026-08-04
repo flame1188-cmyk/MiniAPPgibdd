@@ -753,6 +753,11 @@ def format_cross_tables_for_prompt(
         max_rows: int = 15,
     ) -> list[str]:
         """Форматирует таблицу {key: {dtp, deaths, injured}}."""
+        # Пропускаем пустые таблицы — не выводим даже заголовок.
+        # Раньше даже для пустой таблицы печаталось 3 строки заголовка,
+        # что раздувало промпт на ~45 строк мусора (× 32 таблицы).
+        if not cur_table:
+            return []
         rows = []
         rows.append(f"  {title}:")
         rows.append(f"  {'Категория':<20} | {'ДТП':>5} | {'Погибло':>7} | {'Ранено':>6}")
@@ -791,6 +796,8 @@ def format_cross_tables_for_prompt(
         max_rows: int = 10,
     ) -> list[str]:
         """Форматирует таблицу {key: {participants, deaths, injured, unhurt}}."""
+        if not cur_table:
+            return []
         rows = []
         rows.append(f"  {title}:")
         rows.append(f"  {'Категория':<20} | {'Всего':>5} | {'Погибло':>7} | {'Ранено':>6} | {'Без послед.':>11}")
@@ -821,6 +828,8 @@ def format_cross_tables_for_prompt(
         max_cols: int = 5,
     ) -> list[str]:
         """Форматирует таблицу {key: Counter(values)}."""
+        if not cur_counter:
+            return []
         rows = []
         rows.append(f"  {title}:")
 
@@ -842,6 +851,8 @@ def format_cross_tables_for_prompt(
         cur_table: dict[str, dict],
     ) -> list[str]:
         """Форматирует таблицу {lighting: {dtp_with_ped, total_dtp}}."""
+        if not cur_table:
+            return []
         rows = []
         rows.append(f"  {title}:")
         rows.append(f"  {'Освещение':<25} | {'Всего ДТП':>9} | {'С пешеходами':>13} | {'Доля, %':>7}")
@@ -881,6 +892,8 @@ def format_cross_tables_for_prompt(
         При show_category=True добавляет колонку с категорией дороги
         (Федеральные/Региональные/...), читаемой из bucket['road_value'].
         """
+        if not cur_table:
+            return []
         rows = []
         rows.append(f"  {title}:")
         cat_header = f" | {'Категория':>13}" if show_category else ""
@@ -932,6 +945,8 @@ def format_cross_tables_for_prompt(
         label_type: str = "weekday",
     ) -> list[str]:
         """Форматирует распределение опьянения по дням/часам."""
+        if not cur_counter:
+            return []
         rows = []
         rows.append(f"  {title}:")
 
@@ -970,6 +985,8 @@ def format_cross_tables_for_prompt(
         Для каждой локации показывает: всего ДТП, пьяных, долю пьяных в %.
         Сортировка — по абсолютному числу пьяных ДТП (важнее для адресных мер).
         """
+        if not cur_counter:
+            return []
         rows = []
         rows.append(f"  {title}:")
         rows.append(
@@ -1783,7 +1800,40 @@ async def _do_llm_request(
         f"total_chars={msgs_total_chars}, temperature={temperature}"
     )
 
-    retry_delays = [30, 60, 90, 120, 150]
+    # Разные стратегии ретраев для разных типов ошибок:
+    # - 429 (Rate Limit): длинные ретраи [30, 60, 90, 120, 150] — провайдер просит подождать
+    # - 5xx (Server Error): короткие ретраи [10, 30, 60] — серверу могло стать хуже,
+    #   долго ждать бессмысленно. НЕ ретраим 5+ раз — это приводило к 7.5 мин ожидания
+    #   и пользователь видел «Нейросеть анализирует...» 10 минут.
+    # - 4xx (кроме 429): НЕ ретраим — это ошибки клиента (плохой промпт, слишком
+    #   большой контекст, неверный API-ключ), повтор не поможет.
+    # - Timeout: ретраим как 5xx — короткие задержки.
+    retry_delays_429 = [30, 60, 90, 120, 150]
+    retry_delays_5xx = [10, 30, 60]
+    max_5xx_retries = min(3, max_retries)  # не более 3 ретраев для 5xx
+
+    def _parse_error_body(resp) -> str:
+        """Извлекает текст ошибки из тела ответа LLM API для диагностики."""
+        try:
+            body = resp.json()
+            # ZhipuAI/OpenAI формат: {"error": {"message": "...", "code": "..."}}
+            if isinstance(body, dict):
+                err = body.get("error")
+                if isinstance(err, dict):
+                    msg = err.get("message", "")
+                    code = err.get("code", "")
+                    return f"{msg} (code={code})" if code else msg
+                # Иногда просто строка
+                if "message" in body:
+                    return str(body["message"])
+                # DeepSeek формат: {"error": {"message": "..."}}
+                return str(body)[:300]
+        except Exception:
+            pass
+        try:
+            return resp.text[:300]
+        except Exception:
+            return ""
 
     for attempt in range(max_retries + 1):
         try:
@@ -1810,9 +1860,9 @@ async def _do_llm_request(
                         try:
                             wait = int(float(retry_after)) + 5
                         except (ValueError, TypeError):
-                            wait = retry_delays[attempt]
+                            wait = retry_delays_429[attempt]
                     else:
-                        wait = retry_delays[attempt]
+                        wait = retry_delays_429[attempt]
 
                     wait = max(wait, 30)
 
@@ -1831,17 +1881,56 @@ async def _do_llm_request(
                         response=response,
                     )
 
+            # 4xx (кроме 429) — не ретраим: это ошибки клиента (плохой запрос,
+            # слишком большой промпт, неверный ключ). Повтор не поможет.
+            if 400 <= response.status_code < 500:
+                err_body = _parse_error_body(response)
+                # Спец-обработка типичных ошибок — даём пользователю понятное сообщение
+                status = response.status_code
+                hint = ""
+                if status in (400, 413):
+                    hint = (
+                        " Вероятно, промпт превышает лимит контекста модели "
+                        "(после добавления 7 новых кросс-таблиц размер промпта вырос). "
+                        "Попробуйте платный провайдер или уменьшите период анализа."
+                    )
+                elif status in (401, 403):
+                    hint = " Проверьте корректность API-ключа в .env (LLM_API_KEY)."
+                logger.error(
+                    f"LLM {status} ({response.reason_phrase}): {err_body}. "
+                    f"Повтор не выполняется (4xx ошибка клиента)."
+                )
+                raise httpx.HTTPStatusError(
+                    f"LLM API вернул {status}: {err_body or response.reason_phrase}.{hint}",
+                    request=response.request,
+                    response=response,
+                )
+
             if response.status_code >= 500:
-                if attempt < max_retries:
-                    wait = retry_delays[attempt]
+                err_body = _parse_error_body(response)
+                if attempt < max_5xx_retries:
+                    wait = retry_delays_5xx[min(attempt, len(retry_delays_5xx) - 1)]
                     logger.warning(
-                        f"LLM {response.status_code} ({response.reason_phrase}). "
-                        f"Попытка {attempt + 1}/{max_retries}, "
+                        f"LLM {response.status_code} ({response.reason_phrase}): "
+                        f"{err_body}. "
+                        f"Попытка {attempt + 1}/{max_5xx_retries + 1} (5xx), "
                         f"ожидание {wait} сек..."
                     )
                     await asyncio.sleep(wait)
                     continue
-                response.raise_for_status()
+                # Исчерпаны 5xx-ретраи — падаем с понятным сообщением
+                logger.error(
+                    f"LLM {response.status_code} после {max_5xx_retries + 1} попыток: "
+                    f"{err_body}"
+                )
+                raise httpx.HTTPStatusError(
+                    f"LLM API вернул {response.status_code} после "
+                    f"{max_5xx_retries + 1} попыток: "
+                    f"{err_body or response.reason_phrase}. "
+                    f"Возможно, сервис временно недоступен или промпт слишком большой.",
+                    request=response.request,
+                    response=response,
+                )
 
             response.raise_for_status()
             _last_llm_call_time = time.monotonic()
@@ -1850,11 +1939,12 @@ async def _do_llm_request(
         except httpx.HTTPStatusError:
             raise
         except httpx.TimeoutException:
-            if attempt < max_retries:
-                wait = retry_delays[min(attempt, len(retry_delays) - 1)]
+            # Таймаут ретраим как 5xx — короткие задержки
+            if attempt < max_5xx_retries:
+                wait = retry_delays_5xx[min(attempt, len(retry_delays_5xx) - 1)]
                 logger.warning(
                     f"LLM таймаут. "
-                    f"Попытка {attempt + 1}/{max_retries}, "
+                    f"Попытка {attempt + 1}/{max_5xx_retries + 1}, "
                     f"ожидание {wait} сек..."
                 )
                 await asyncio.sleep(wait)
@@ -1929,6 +2019,7 @@ async def get_ai_summary(
     provider: LLMProvider = "free",
     current_cards: list[dict[str, Any]] | None = None,
     prev_cards: list[dict[str, Any]] | None = None,
+    max_retries: int = 3,
 ) -> str:
     """
     Генерирует аналитическое резюме с помощью LLM.
@@ -1944,6 +2035,8 @@ async def get_ai_summary(
         provider: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
         current_cards: Сырые карточки текущего периода (для платного метода)
         prev_cards: Сырые карточки предыдущего периода (для платного метода)
+        max_retries: Максимум ретраев для 429/5xx (по умолчанию 3 для summary —
+            меньше ждать, чем для Q&A, т.к. пользователь смотрит на прогресс-бар).
 
     Returns:
         Текст резюме от нейросети
@@ -1973,7 +2066,9 @@ async def get_ai_summary(
             news_context=news_context,
             clusters_context=clusters_context,
         )
-        return await ask_llm(user_message=prompt, provider=provider)
+        return await ask_llm(
+            user_message=prompt, provider=provider, max_retries=max_retries,
+        )
     else:
         # Бесплатный метод: агрегированные метрики + кросс-таблицы
         prompt = build_summary_prompt(
@@ -1983,7 +2078,9 @@ async def get_ai_summary(
             clusters_context=clusters_context,
             cross_tables_context=cross_tables_context,
         )
-        return await ask_llm(user_message=prompt, provider=provider)
+        return await ask_llm(
+            user_message=prompt, provider=provider, max_retries=max_retries,
+        )
 
 
 async def get_ai_answer(
