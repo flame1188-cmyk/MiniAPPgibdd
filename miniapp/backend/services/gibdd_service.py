@@ -845,13 +845,22 @@ async def start_clusters_calculation(task: Task) -> None:
         clusters_data = [_serialize_cluster(c) for c in clusters]
 
         # Статистика
-        current_only = [c for c in clusters if not c.get("_is_lost", False)]
+        # current_only — текущие очаги (без lost и без prev_matched,
+        # т.к. prev_matched — это очаг АППГ, повторённый в текущем;
+        # он показывается отдельной строкой, но не входит в «текущие»).
+        current_only = [
+            c for c in clusters
+            if not c.get("_is_lost", False) and not c.get("_is_prev_matched", False)
+        ]
         lost_clusters = [c for c in clusters if c.get("_is_lost", False)]
+        prev_matched_clusters = [c for c in clusters if c.get("_is_prev_matched", False)]
 
         # Динамика — агрегат по всем статусам.
         # Новые ключи (методология пикетаж + сосед):
         #   repeated_growing, repeated_shrinking, repeated_stable, repeated_merged,
-        #   new, new_with_neighbor, lost
+        #   new, new_with_neighbor, prev_matched, lost
+        # prev_matched — это очаг прошлого года, который повторился в текущем
+        # (отдельная строка в Excel/карте со ссылкой на текущий №).
         # Старые ключи (growing/shrinking/stable) оставлены для обратной совместимости
         # с сохранёнными задачами и старым фронтендом.
         dynamics_summary = {
@@ -861,6 +870,7 @@ async def start_clusters_calculation(task: Task) -> None:
             "repeated_merged": 0,
             "new": 0,
             "new_with_neighbor": 0,
+            "prev_matched": 0,
             "lost": 0,
         }
         for c in clusters:
@@ -883,6 +893,7 @@ async def start_clusters_calculation(task: Task) -> None:
         result = {
             "total_clusters": len(current_only),
             "total_lost": len(lost_clusters),
+            "total_prev_matched": len(prev_matched_clusters),
             "total_preclusters": len(preclusters),
             "current_total_dtp": sum(
                 c.get("total_accidents", 0) for c in current_only
@@ -917,6 +928,7 @@ async def start_clusters_calculation(task: Task) -> None:
         logger.info(
             f"Task {task.id}: clusters done — "
             f"{len(current_only)} очагов, "
+            f"{len(prev_matched_clusters)} АППГ-повторённых, "
             f"{len(preclusters)} предочагов, "
             f"{len(lost_clusters)} исчезнувших"
         )
@@ -946,12 +958,17 @@ def _serialize_cluster(c: dict) -> dict:
         "end_pos": c.get("end_pos"),
         "dates": c.get("dates", []),
         # dynamics теперь содержит расширенные поля:
-        # - status: repeated_*/new/new_with_neighbor/lost
+        # - status: repeated_*/new/new_with_neighbor/prev_matched/lost
         # - matched_prev_numbers: [int, ...] — для ссылки «Да, №N»
+        # - matched_curr_numbers: [int, ...] — для prev_matched,
+        #   на какие текущие № ссылается этот АППГ-очаг
         # - neighbors: [{prev_number, distance_m}, ...] — для new_with_neighbor
         # - prev_total, prev_deaths, prev_injured — суммы по сматченным
         "dynamics": c.get("dynamics", {}),
         "camera_match": c.get("camera_match"),
+        # Флаги для фильтрации на фронтенде/карте
+        "is_lost": c.get("_is_lost", False),
+        "is_prev_matched": c.get("_is_prev_matched", False),
     }
 
 
@@ -995,9 +1012,17 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
         # без слоёв, попапов, линейки и т.д. ReportGenerator.generate_cluster_map
         # умеет работать с пустым списком clusters и непустыми preclusters.
 
-        # Разделяем: текущие очаги + исчезнувшие (отдельно)
-        current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
+        # Разделяем: текущие очаги + АППГ-повторённые + исчезнувшие (отдельно)
+        # prev_matched — это очаги прошлого периода, которые повторились
+        # в текущем. Они отображаются на карте отдельным слоем (светло-голубые
+        # маркеры с пунктирной границей), чтобы пользователь видел, какие
+        # именно АППГ-очаги «превратились» в текущие.
+        current_only = [
+            c for c in raw_clusters
+            if not c.get("_is_lost", False) and not c.get("_is_prev_matched", False)
+        ]
         lost_clusters = [c for c in raw_clusters if c.get("_is_lost", False)]
+        prev_matched_clusters = [c for c in raw_clusters if c.get("_is_prev_matched", False)]
 
         # Предочаги — из отдельного поля task.raw_preclusters
         # (раньше брались из raw_clusters[0]["_preclusters"], что ломалось
@@ -1014,9 +1039,14 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
         except Exception as exc:
             logger.warning(f"Task {task.id}: camera load for map failed: {exc}")
 
-        # Добавляем исчезнувшие очаги в основной список с пометкой dynamics.status='lost'
-        # чтобы bot ReportGenerator отрисовал их как отдельный слой через dynamics
-        all_clusters_for_map = list(current_only) + list(lost_clusters)
+        # Добавляем исчезнувшие и АППГ-повторённые очаги в основной список
+        # с пометкой dynamics.status ('lost' или 'prev_matched'),
+        # чтобы ReportGenerator отрисовал их как отдельные слои через dynamics.
+        all_clusters_for_map = (
+            list(current_only)
+            + list(prev_matched_clusters)
+            + list(lost_clusters)
+        )
 
         # Генерируем карту через ReportGenerator
         gen = report_gen_module.ReportGenerator(
@@ -1054,7 +1084,9 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
 
         logger.info(
             f"Task {task.id}: clusters map generated — "
-            f"{len(current_only)} текущих, {len(lost_clusters)} исчезнувших, "
+            f"{len(current_only)} текущих, "
+            f"{len(prev_matched_clusters)} АППГ-повторённых, "
+            f"{len(lost_clusters)} исчезнувших, "
             f"{len(preclusters)} предочагов, {len(cameras)} камер"
         )
         return html
@@ -1073,14 +1105,17 @@ def _build_clusters_map_html(task: Task) -> str:
     clusters = result.get("clusters", [])
     preclusters = result.get("preclusters", [])
 
-    # Разделяем текущие и исчезнувшие очаги по dynamics.status == 'lost'
-    # Исчезнувшие рисуем светло-серым (#c0c0c0) в отдельном слое,
-    # который можно отключить через layer control.
+    # Разделяем: текущие / АППГ-повторённые / исчезнувшие
+    # по dynamics.status. Каждая группа — отдельный слой на карте.
     current_clusters = []
     lost_clusters = []
+    prev_matched_clusters = []
     for c in clusters:
-        if c.get("dynamics", {}).get("status") == "lost":
+        st = c.get("dynamics", {}).get("status")
+        if st == "lost":
             lost_clusters.append(c)
+        elif st == "prev_matched":
+            prev_matched_clusters.append(c)
         else:
             current_clusters.append(c)
 
@@ -1109,12 +1144,17 @@ def _build_clusters_map_html(task: Task) -> str:
         )
 
     markers_js = []
-    # Слои: current — обычные цвета по тяжести, lost — серый
-    # Layer groups позволяют включать/выключать исчезнувшие через UI Leaflet
+    # Слои: current — обычные цвета по тяжести, prev_matched — голубой,
+    # lost — серый. Layer groups позволяют включать/выключать группы через UI Leaflet.
     markers_js.append("var currentLayer = L.layerGroup().addTo(map);")
+    markers_js.append("var prevMatchedLayer = L.layerGroup().addTo(map);")
     markers_js.append("var lostLayer = L.layerGroup().addTo(map);")
     for c in current_clusters:
         markers_js.append(_build_marker_js(c, _color_for_severity(c), "currentLayer"))
+    for c in prev_matched_clusters:
+        # АППГ-повторённые — голубой (#5ac8fa), чтобы визуально отличить
+        # от текущих и от исчезнувших (серый).
+        markers_js.append(_build_marker_js(c, "#5ac8fa", "prevMatchedLayer"))
     for c in lost_clusters:
         # Исчезнувшие — светло-серый цвет, чтобы визуально отделить от активных очагов
         markers_js.append(_build_marker_js(c, "#c0c0c0", "lostLayer"))
@@ -1168,6 +1208,7 @@ html, body, #map {{ margin: 0; padding: 0; height: 100%; width: 100%; }}
 <body>
 <div id="map"></div>
 <div class="legend">
+<div class="legend-item"><span class="legend-dot" style="background:#5ac8fa;border:2px dashed #007aff;"></span>АППГ (повторён в текущем)</div>
 <div class="legend-item"><span class="legend-dot" style="background:#c0c0c0;border:2px dashed #9e9e9e;"></span>Исчезнувший очаг</div>
 <div class="legend-item"><span class="legend-dot" style="background:#2481cc"></span>Очаг (низкая тяжесть)</div>
 <div class="legend-item"><span class="legend-dot" style="background:#ff9500"></span>Очаг (высокая тяжесть)</div>
@@ -1181,6 +1222,7 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
 {chr(10).join(markers_js)}
 L.control.layers({{}}, {{
   "Текущие очаги": currentLayer,
+  "АППГ (повторённые)": prevMatchedLayer,
   "Исчезнувшие очаги": lostLayer
 }}, {{collapsed: false}}).addTo(map);
 </script>
@@ -1222,7 +1264,13 @@ async def generate_clusters_excel(task: Task) -> Optional[bytes]:
 
         raw_clusters = task.raw_clusters or []
         raw_preclusters = task.raw_preclusters or []
-        current_only = [c for c in raw_clusters if not c.get("_is_lost", False)]
+        # current_only — только текущие очаги (без lost и prev_matched)
+        # для листа 1 «Очаги ДТП». Лист 2 «Динамика очагов» использует
+        # raw_clusters целиком (текущие + prev_matched + lost).
+        current_only = [
+            c for c in raw_clusters
+            if not c.get("_is_lost", False) and not c.get("_is_prev_matched", False)
+        ]
         # Предочаги — из отдельного поля (раньше raw_clusters[0]["_preclusters"],
         # что ломалось при пустом списке очагов)
         preclusters = raw_preclusters
