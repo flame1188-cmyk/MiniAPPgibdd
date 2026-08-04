@@ -650,24 +650,34 @@ def format_clusters_for_prompt(
     """
     Форматирует данные об очагах концентрации ДТП для промпта LLM.
 
-    Сортирует очаги по тяжести (погибшие × 3 + раненые × 1 + ДТП),
-    выводит топ-N с краткой характеристикой.
+    ВАЖНО (вопрос #5): теперь метод разделяет очаги по категориям динамики,
+    чтобы LLM чётко понимала, какие очаги текущие, какие повторные,
+    какие новые, а какие исчезнувшие. Раньше в топ попадала «солянка»
+    из текущих и прошлых очагов, и LLM не могла корректно интерпретировать
+    изменения.
+
+    Категории (по полю dynamics.status или _is_lost / _is_prev_matched):
+      - ПОВТОРНЫЕ (repeated_growing / shrinking / stable / merged):
+        текущие очаги, которые были и в АППГ. Показываем динамику ДТП
+        (было X -> стало Y).
+      - НОВЫЕ (new / new_with_neighbor): текущие очаги, которых не было
+        в АППГ. Для new_with_neighbor указываем ближайший АППГ-очаг.
+      - ИСЧЕЗНУВШИЕ (_is_lost=True): очаги прошлого периода, которых
+        больше нет. Показываем только ДТП прошлого периода.
+      - АППГ-ПОВТОРЁННЫЕ (_is_prev_matched=True): дубликат повторного,
+        оставляем без отдельного блока (он уже учтён в «ПОВТОРНЫХ»).
+
+    В каждом блоке — топ-N по тяжести (погибшие × 3 + раненые + ДТП).
 
     Args:
-        clusters: Список словарей очагов (из calculate_concentration_points)
-        max_clusters: Максимальное количество очагов для включения
+        clusters: Список словарей очагов (с полями dynamics, is_lost, is_prev_matched)
+        max_clusters: Максимум очагов в КАЖДОЙ категории
 
     Returns:
-        Текстовый блок для вставки в промпт, или пустую строку если нет очагов
+        Текстовый блок для вставки в промпт, или пустая строка если нет очагов
     """
     if not clusters:
         return ""
-
-    # Сортируем по тяжести: погибшие × 3 + раненые × 1 + количество ДТП
-    def severity_score(c: dict) -> float:
-        return c.get("deaths", 0) * 3 + c.get("injured", 0) * 1 + c.get("total_accidents", 0)
-
-    sorted_clusters = sorted(clusters, key=severity_score, reverse=True)[:max_clusters]
 
     zone_labels = {
         "settlement_intersection": "Перекрёсток в НП",
@@ -676,45 +686,156 @@ def format_clusters_for_prompt(
         "nonsettlement": "Вне НП",
     }
 
-    lines = []
-    lines.append(f"ОЧАГИ КОНЦЕНТРАЦИИ ДТП (всего {len(clusters)}, показаны топ-{len(sorted_clusters)} по тяжести):")
+    # Сортируем по тяжести: погибшие × 3 + раненые × 1 + количество ДТП
+    def severity_score(c: dict) -> float:
+        return c.get("deaths", 0) * 3 + c.get("injured", 0) * 1 + c.get("total_accidents", 0)
+
+    # Разделяем очаги по категориям динамики
+    repeated_clusters: list[dict[str, Any]] = []
+    new_clusters: list[dict[str, Any]] = []
+    lost_clusters: list[dict[str, Any]] = []
+    # prev_matched не показываем отдельным блоком — это АППГ-копии
+    # повторных очагов; они уже учтены в repeated_clusters через matched_prev_numbers.
+
+    for c in clusters:
+        # Пропускаем АППГ-повторённые (дубликаты)
+        if c.get("_is_prev_matched") or c.get("is_prev_matched"):
+            continue
+        # Исчезнувшие — отдельный блок
+        if c.get("_is_lost") or c.get("is_lost"):
+            lost_clusters.append(c)
+            continue
+        # Текущие: делим на повторные и новые по dynamics.status
+        dyn = c.get("dynamics") or {}
+        status = dyn.get("status", "")
+        if status.startswith("repeated_"):
+            repeated_clusters.append(c)
+        elif status in ("new", "new_with_neighbor"):
+            new_clusters.append(c)
+        elif status == "lost":
+            lost_clusters.append(c)
+        else:
+            # Неизвестный статус (старая задача без динамики) — считаем новым
+            new_clusters.append(c)
+
+    def format_cluster_block(
+        title: str,
+        items: list[dict[str, Any]],
+        show_dynamics: bool = False,
+        is_lost_block: bool = False,
+    ) -> list[str]:
+        """Форматирует один блок очагов. Возвращает список строк."""
+        if not items:
+            return []
+        sorted_items = sorted(items, key=severity_score, reverse=True)[:max_clusters]
+        out = [title + f" (всего {len(items)}, показаны топ-{len(sorted_items)} по тяжести):", ""]
+
+        for i, c in enumerate(sorted_items, 1):
+            zone = zone_labels.get(c.get("zone_type", ""), c.get("zone_type", "?"))
+            road = c.get("road", "Не указана")
+            total = c.get("total_accidents", 0)
+            deaths = c.get("deaths", 0)
+            injured = c.get("injured", 0)
+            dominant = c.get("dominant_type") or ""
+
+            type_counter = c.get("type_counter", {})
+            types_str = ", ".join(
+                f"{t} ({cnt})" for t, cnt in sorted(type_counter.items(), key=lambda x: -x[1])[:3]
+            )
+
+            line = f"Очаг {i}: {road} ({zone}) | ДТП: {total}, погибло: {deaths}, ранено: {injured}"
+            if dominant:
+                line += f" | Доминирующий вид: {dominant}"
+            out.append(line)
+
+            if types_str:
+                out.append(f"  Виды ДТП: {types_str}")
+
+            start_pos = c.get("start_pos")
+            end_pos = c.get("end_pos")
+            if start_pos is not None and end_pos is not None:
+                out.append(f"  Пикетаж: {start_pos:.3f} - {end_pos:.3f} км")
+
+            dates = c.get("dates", [])
+            if len(dates) >= 2:
+                out.append(f"  Период: {dates[0]} — {dates[-1]}")
+
+            dyn = c.get("dynamics") or {}
+            if show_dynamics:
+                # Для повторных очагов: показываем АППГ-данные
+                prev_total = dyn.get("prev_total")
+                prev_deaths = dyn.get("prev_deaths")
+                prev_injured = dyn.get("prev_injured")
+                if prev_total is not None:
+                    dyn_parts = [f"АППГ ДТП: {prev_total}"]
+                    if prev_deaths is not None:
+                        dyn_parts.append(f"погибло: {prev_deaths}")
+                    if prev_injured is not None:
+                        dyn_parts.append(f"ранено: {prev_injured}")
+                    out.append(f"  Динамика: {' → '.join(dyn_parts)} → сейчас {total} ДТП")
+
+                # Ссылка на АППГ-номера (для repeated_*)
+                matched_prev = dyn.get("matched_prev_numbers") or []
+                if matched_prev:
+                    out.append(f"  Соответствует АППГ-очагам: №{', №'.join(str(n) for n in matched_prev)}")
+
+                # Соседи в АППГ (для new_with_neighbor)
+                neighbors = dyn.get("neighbors") or []
+                if neighbors:
+                    nb_str = ", ".join(
+                        f"№{n.get('prev_number')} ({int(n.get('distance_m', 0))}м)"
+                        for n in neighbors[:3]
+                    )
+                    out.append(f"  Ближайшие АППГ-очаги: {nb_str}")
+
+            if is_lost_block:
+                # Для исчезнувших — явно подписываем, что в текущем периоде их нет
+                out.append("  ⚠ В текущем периоде очаг исчез (ДТП ниже порога)")
+        out.append("")
+        return out
+
+    lines: list[str] = []
+    lines.append("ОЧАГИ КОНЦЕНТРАЦИИ ДТП (разделены по категориям динамики):")
     lines.append("")
 
-    for i, c in enumerate(sorted_clusters, 1):
-        zone = zone_labels.get(c["zone_type"], c["zone_type"])
-        road = c.get("road", "Не указана")
-        total = c["total_accidents"]
-        deaths = c.get("deaths", 0)
-        injured = c.get("injured", 0)
-        dominant = c.get("dominant_type") or ""
+    # Блок 1: Повторные (самые важные — показывают динамику)
+    if repeated_clusters:
+        lines.extend(format_cluster_block(
+            "■ ПОВТОРНЫЕ ОЧАГИ (были в АППГ и продолжаются в текущем периоде)",
+            repeated_clusters,
+            show_dynamics=True,
+        ))
 
-        # Формируем строку видов ДТП
-        type_counter = c.get("type_counter", {})
-        types_str = ", ".join(
-            f"{t} ({cnt})" for t, cnt in sorted(type_counter.items(), key=lambda x: -x[1])[:3]
-        )
+    # Блок 2: Новые
+    if new_clusters:
+        lines.extend(format_cluster_block(
+            "■ НОВЫЕ ОЧАГИ (появились в текущем периоде, в АППГ не было)",
+            new_clusters,
+            show_dynamics=True,  # для new_with_neighbor покажет соседей
+        ))
 
-        line = (
-            f"Очаг {i}: {road} ({zone}) | "
-            f"ДТП: {total}, погибло: {deaths}, ранено: {injured}"
-        )
-        if dominant:
-            line += f" | Доминирующий вид: {dominant}"
-        lines.append(line)
+    # Блок 3: Исчезнувшие
+    if lost_clusters:
+        lines.extend(format_cluster_block(
+            "■ ИСЧЕЗНУВШИЕ ОЧАГИ (были в АППГ, в текущем периоде исчезли)",
+            lost_clusters,
+            is_lost_block=True,
+        ))
 
-        if types_str:
-            lines.append(f"  Виды ДТП: {types_str}")
-
-        # Пикетаж (если есть)
-        start_pos = c.get("start_pos")
-        end_pos = c.get("end_pos")
-        if start_pos is not None and end_pos is not None:
-            lines.append(f"  Пикетаж: {start_pos:.3f} - {end_pos:.3f} км")
-
-        # Даты первого и последнего ДТП
-        dates = c.get("dates", [])
-        if len(dates) >= 2:
-            lines.append(f"  Период: {dates[0]} — {dates[-1]}")
+    if not (repeated_clusters or new_clusters or lost_clusters):
+        # Fallback — старый формат, если не удалось классифицировать
+        sorted_clusters = sorted(clusters, key=severity_score, reverse=True)[:max_clusters]
+        lines.append(f"Очаги (всего {len(clusters)}, показаны топ-{len(sorted_clusters)}):")
+        lines.append("")
+        for i, c in enumerate(sorted_clusters, 1):
+            zone = zone_labels.get(c.get("zone_type", ""), c.get("zone_type", "?"))
+            road = c.get("road", "Не указана")
+            total = c.get("total_accidents", 0)
+            deaths = c.get("deaths", 0)
+            injured = c.get("injured", 0)
+            lines.append(
+                f"Очаг {i}: {road} ({zone}) | ДТП: {total}, погибло: {deaths}, ранено: {injured}"
+            )
 
     return "\n".join(lines)
 
