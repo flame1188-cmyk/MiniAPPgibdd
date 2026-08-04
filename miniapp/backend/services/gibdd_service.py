@@ -821,6 +821,18 @@ async def start_clusters_calculation(task: Task) -> None:
                     ]
                     if lost:
                         conc_module.enrich_clusters_with_cameras(lost, cameras)
+                    # Предочаги тоже обогащаем камерами — раньше это делалось
+                    # только в Telegram-боте (bot.py:2574), а в MiniApp
+                    # пропускалось. Без этого пользователь MiniApp видел
+                    # предочаги без статуса «закрыт/открыт камерой».
+                    if preclusters_raw:
+                        conc_module.enrich_clusters_with_cameras(
+                            preclusters_raw, cameras,
+                        )
+                        logger.info(
+                            f"Task {task.id}: cameras attached to "
+                            f"{len(preclusters_raw)} preclusters"
+                        )
         except Exception as exc:
             logger.warning(
                 f"Task {task.id}: camera enrichment failed: {exc}"
@@ -836,14 +848,30 @@ async def start_clusters_calculation(task: Task) -> None:
         current_only = [c for c in clusters if not c.get("_is_lost", False)]
         lost_clusters = [c for c in clusters if c.get("_is_lost", False)]
 
-        # Динамика
-        dynamics_summary = {"new": 0, "growing": 0, "shrinking": 0,
-                            "stable": 0, "lost": 0}
+        # Динамика — агрегат по всем статусам.
+        # Новые ключи (методология пикетаж + сосед):
+        #   repeated_growing, repeated_shrinking, repeated_stable, repeated_merged,
+        #   new, new_with_neighbor, lost
+        # Старые ключи (growing/shrinking/stable) оставлены для обратной совместимости
+        # с сохранёнными задачами и старым фронтендом.
+        dynamics_summary = {
+            "repeated_growing": 0,
+            "repeated_shrinking": 0,
+            "repeated_stable": 0,
+            "repeated_merged": 0,
+            "new": 0,
+            "new_with_neighbor": 0,
+            "lost": 0,
+        }
         for c in clusters:
             d = c.get("dynamics") or {}
             status = d.get("status", "new")
             if status in dynamics_summary:
                 dynamics_summary[status] += 1
+            else:
+                # Неизвестный статус — добавим динамически,
+                # чтобы не потерять данные при будущих изменениях.
+                dynamics_summary[status] = 1
 
         # Предочаги — приходят отдельно от calculate_concentration_dynamics,
         # чтобы они не терялись, когда очагов нет (малые регионы).
@@ -917,6 +945,11 @@ def _serialize_cluster(c: dict) -> dict:
         "start_pos": c.get("start_pos"),
         "end_pos": c.get("end_pos"),
         "dates": c.get("dates", []),
+        # dynamics теперь содержит расширенные поля:
+        # - status: repeated_*/new/new_with_neighbor/lost
+        # - matched_prev_numbers: [int, ...] — для ссылки «Да, №N»
+        # - neighbors: [{prev_number, distance_m}, ...] — для new_with_neighbor
+        # - prev_total, prev_deaths, prev_injured — суммы по сматченным
         "dynamics": c.get("dynamics", {}),
         "camera_match": c.get("camera_match"),
     }
@@ -1366,6 +1399,11 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
     Асинхронная генерация LLM-резюме.
 
     provider: "free" (ZhipuAI/GLM) или "paid" (DeepSeek).
+
+    Внутри использует asyncio.wait_for с max duration (5 минут), чтобы
+    при зависании LLM (бесконечные 5xx-ретраи, потеря соединения)
+    операция гарантированно завершилась с понятной ошибкой, а не висела
+    в статусе RUNNING вечно.
     """
     state = task.llm_summary_state
     state.status = AnalysisStatus.RUNNING
@@ -1375,123 +1413,38 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
     state.error = None
     state.result = None
 
+    # Защита от зависания: максимум 5 минут на всю операцию.
+    # Если LLM не ответил за 5 мин — что-то не так (сервис недоступен,
+    # бесконечные ретраи,超大 промпт) — лучше упасть с понятной ошибкой.
+    MAX_LLM_DURATION_SEC = 300
+
     try:
-        config = _import_module("config")
-
-        # Проверяем доступность провайдера
-        if provider == "paid":
-            if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
-                raise RuntimeError(
-                    "Платный LLM-провайдер не настроен "
-                    "(LLM_PAID_API_KEY/LLM_PAID_API_URL)"
-                )
-        else:
-            if not config.LLM_API_KEY:
-                raise RuntimeError(
-                    "Бесплатный LLM-провайдер не настроен (LLM_API_KEY)"
-                )
-
-        state.progress = 10
-        state.stage = "Загрузка данных за прошлый год..."
-        if not task.prev_cards_loaded:
-            await ensure_prev_cards(task)
-
-        state.progress = 20
-        state.stage = "Расчёт сравнительных метрик..."
-        comp_result = await ensure_comparison(task)
-        if not comp_result.get("ok"):
-            raise RuntimeError(comp_result.get("error", "Не удалось рассчитать comparison"))
-        comparison = comp_result["comparison"]
-
-        state.progress = 35
-        state.stage = "Расчёт очагов ДТП для контекста..."
-
-        # Используем готовые очаги, если уже рассчитаны
-        clusters_ctx = ""
-        if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
-            llm_module = _import_module("llm_analyzer")
-            # Восстанавливаем минимальную структуру для format_clusters_for_prompt
-            fake_clusters = [
-                {
-                    "road": c.get("road", ""),
-                    "zone_type": c.get("zone_type", ""),
-                    "total_accidents": c.get("total_accidents", 0),
-                    "deaths": c.get("deaths", 0),
-                    "injured": c.get("injured", 0),
-                    # None (смешанный тип) -> пустая строка для UI
-                    "dominant_type": c.get("dominant_type") or "",
-                    "type_counter": c.get("type_counter", {}),
-                    "start_pos": c.get("start_pos"),
-                    "end_pos": c.get("end_pos"),
-                    "dates": c.get("dates", []),
-                }
-                for c in task.clusters_state.result.get("clusters", [])[:10]
-            ]
-            clusters_ctx = llm_module.format_clusters_for_prompt(
-                fake_clusters, max_clusters=10,
+        # Запускаем реальную работу в task и ограничиваем по времени.
+        # Используем shield, чтобы wait_for cancel не отменил сам task
+        # (он продолжит работать в фоне, но результат уже не запишется).
+        try:
+            await asyncio.wait_for(
+                _run_llm_summary_inner(task, provider, state),
+                timeout=MAX_LLM_DURATION_SEC,
             )
-
-        state.progress = 50
-        state.stage = "Формирование промпта..."
-
-        llm_module = _import_module("llm_analyzer")
-        analytics_module = _import_module("analytics")
-
-        # Кросс-таблицы (только для бесплатного метода)
-        cross_tables_ctx = ""
-        if provider == "free":
-            try:
-                current_cross = analytics_module.calculate_cross_tables(task.cards)
-                prev_cross = None
-                if task.prev_cards:
-                    prev_cross = analytics_module.calculate_cross_tables(
-                        task.prev_cards
-                    )
-                cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
-                    current_cross, prev_cross,
-                    task.period_label,
-                    task.prev_label or "",
-                )
-                # Этап 2: статистические метрики (severity rates, Z-score, χ²)
-                stats = analytics_module.calculate_statistical_metrics(current_cross)
-                stats_text = llm_module.format_statistical_metrics_for_prompt(stats)
-                if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
-                    cross_tables_ctx += "\n\n" + stats_text
-            except Exception as exc:
-                logger.warning(f"Cross-tables failed: {exc}")
-
-        state.progress = 60
-        state.stage = (
-            "Запрос к нейросети (15-60 сек)... "
-            "Не закрывайте вкладку."
-        )
-
-        # Вызываем LLM
-        summary = await llm_module.get_ai_summary(
-            comparison=comparison,
-            reg_name=task.region_name,
-            current_label=task.period_label,
-            prev_label=task.prev_label or "прошлый период",
-            raw_supplement="",
-            news_context="",
-            clusters_context=clusters_ctx,
-            cross_tables_context=cross_tables_ctx,
-            provider=provider,
-            current_cards=task.cards if provider == "paid" else None,
-            prev_cards=task.prev_cards if provider == "paid" else None,
-        )
-
-        state.result = {
-            "text": summary,
-            "provider": provider,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        state.status = AnalysisStatus.DONE
-        state.progress = 100
-        state.stage = "Готово"
-        state.finished_at = datetime.now(timezone.utc)
-
-        logger.info(f"Task {task.id}: LLM summary done ({provider})")
+        except asyncio.TimeoutError:
+            elapsed = int(
+                (datetime.now(timezone.utc) - state.started_at).total_seconds()
+            )
+            err_msg = (
+                f"LLM-анализ превысил максимально допустимое время "
+                f"({MAX_LLM_DURATION_SEC} сек, прошло {elapsed} сек). "
+                f"Возможно, сервис нейросети перегружен или промпт слишком большой. "
+                f"Попробуйте ещё раз через несколько минут или используйте "
+                f"другой провайдер."
+            )
+            logger.error(
+                f"Task {task.id}: LLM summary timeout after {elapsed}s"
+            )
+            state.status = AnalysisStatus.FAILED
+            state.error = err_msg
+            state.stage = "Превышено время ожидания"
+            state.finished_at = datetime.now(timezone.utc)
 
     except Exception as exc:
         logger.exception(f"Task {task.id}: LLM summary failed")
@@ -1499,6 +1452,144 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
         state.error = str(exc)
         state.stage = "Ошибка"
         state.finished_at = datetime.now(timezone.utc)
+
+
+async def _run_llm_summary_inner(
+    task: Task, provider: str, state: AnalysisState,
+) -> None:
+    """Внутренняя логика LLM-саммари — вынесена, чтобы можно было
+    обернуть в asyncio.wait_for для max duration."""
+    config = _import_module("config")
+
+    # Проверяем доступность провайдера
+    if provider == "paid":
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
+            raise RuntimeError(
+                "Платный LLM-провайдер не настроен "
+                "(LLM_PAID_API_KEY/LLM_PAID_API_URL)"
+            )
+    else:
+        if not config.LLM_API_KEY:
+            raise RuntimeError(
+                "Бесплатный LLM-провайдер не настроен (LLM_API_KEY)"
+            )
+
+    state.progress = 10
+    state.stage = "Загрузка данных за прошлый год..."
+    if not task.prev_cards_loaded:
+        await ensure_prev_cards(task)
+
+    state.progress = 20
+    state.stage = "Расчёт сравнительных метрик..."
+    comp_result = await ensure_comparison(task)
+    if not comp_result.get("ok"):
+        raise RuntimeError(comp_result.get("error", "Не удалось рассчитать comparison"))
+    comparison = comp_result["comparison"]
+
+    state.progress = 35
+    state.stage = "Расчёт очагов ДТП для контекста..."
+
+    # Используем готовые очаги, если уже рассчитаны
+    clusters_ctx = ""
+    if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
+        llm_module = _import_module("llm_analyzer")
+        # Восстанавливаем минимальную структуру для format_clusters_for_prompt
+        fake_clusters = [
+            {
+                "road": c.get("road", ""),
+                "zone_type": c.get("zone_type", ""),
+                "total_accidents": c.get("total_accidents", 0),
+                "deaths": c.get("deaths", 0),
+                "injured": c.get("injured", 0),
+                # None (смешанный тип) -> пустая строка для UI
+                "dominant_type": c.get("dominant_type") or "",
+                "type_counter": c.get("type_counter", {}),
+                "start_pos": c.get("start_pos"),
+                "end_pos": c.get("end_pos"),
+                "dates": c.get("dates", []),
+            }
+            for c in task.clusters_state.result.get("clusters", [])[:10]
+        ]
+        clusters_ctx = llm_module.format_clusters_for_prompt(
+            fake_clusters, max_clusters=10,
+        )
+
+    state.progress = 50
+    state.stage = "Формирование промпта..."
+
+    llm_module = _import_module("llm_analyzer")
+    analytics_module = _import_module("analytics")
+
+    # Кросс-таблицы (только для бесплатного метода)
+    cross_tables_ctx = ""
+    if provider == "free":
+        try:
+            current_cross = analytics_module.calculate_cross_tables(task.cards)
+            prev_cross = None
+            if task.prev_cards:
+                prev_cross = analytics_module.calculate_cross_tables(
+                    task.prev_cards
+                )
+            cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
+                current_cross, prev_cross,
+                task.period_label,
+                task.prev_label or "",
+            )
+            # Этап 2: статистические метрики (severity rates, Z-score, χ²)
+            stats = analytics_module.calculate_statistical_metrics(current_cross)
+            stats_text = llm_module.format_statistical_metrics_for_prompt(stats)
+            if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
+                cross_tables_ctx += "\n\n" + stats_text
+        except Exception as exc:
+            logger.warning(f"Cross-tables failed: {exc}")
+
+    state.progress = 60
+    state.stage = (
+        "Запрос к нейросети (15-60 сек)... "
+        "Не закрывайте вкладку."
+    )
+
+    # Диагностическое логирование: размер промпта и кросс-таблиц.
+    # После добавления 7 новых кросс-таблиц (БДД-факторы + профиль ТС)
+    # промпт может вырасти до ~50k+ символов, что вызывает 500-е ошибки
+    # у GLM-4.7-Flash. Логируем состав, чтобы видеть, какие таблицы
+    # раздули промпт.
+    logger.info(
+        f"Task {task.id}: LLM prompt sizes — "
+        f"clusters_ctx={len(clusters_ctx)} симв., "
+        f"cross_tables_ctx={len(cross_tables_ctx)} симв., "
+        f"provider={provider}"
+    )
+
+    # Вызываем LLM с уменьшенным числом ретраев (3 вместо 5) — для summary
+    # долгие ретраи (7.5 мин) плохой UX, лучше быстро упасть и дать
+    # пользователю кнопку «Повторить».
+    summary = await llm_module.get_ai_summary(
+        comparison=comparison,
+        reg_name=task.region_name,
+        current_label=task.period_label,
+        prev_label=task.prev_label or "прошлый период",
+        raw_supplement="",
+        news_context="",
+        clusters_context=clusters_ctx,
+        cross_tables_context=cross_tables_ctx,
+        provider=provider,
+        current_cards=task.cards if provider == "paid" else None,
+        prev_cards=task.prev_cards if provider == "paid" else None,
+        max_retries=3,
+    )
+
+    state.result = {
+        "text": summary,
+        "provider": provider,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    state.status = AnalysisStatus.DONE
+    state.progress = 100
+    state.stage = "Готово"
+    state.finished_at = datetime.now(timezone.utc)
+
+    logger.info(f"Task {task.id}: LLM summary done ({provider})")
 
 
 async def ask_llm_question(
