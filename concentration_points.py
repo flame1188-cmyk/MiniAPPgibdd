@@ -159,6 +159,10 @@ DYNAMICS_STATUS_LABELS = {
     "new_with_neighbor": "Новый (есть ближайший в АППГ)",
     # Исчезнувшие
     "lost": "Исчезнувший",
+    # Очаг прошлого периода, который повторился в текущем.
+    # Добавляется в список как отдельная строка, чтобы пользователь видел
+    # все очаги АППГ (как повторённые, так и исчезнувшие).
+    "prev_matched": "АППГ (повторён)",
     # Обратная совместимость (старые ключи, могут встречаться в сохранённых задачах)
     "growing": "Рост",
     "shrinking": "Снижение",
@@ -3026,25 +3030,18 @@ def _dtp_within_radius(
     Используется для очагов без пикетажа (в НП пикетаж часто пустой) —
     это эквивалент пересечения границ, но в координатах.
 
-    Оптимизация: если центры очагов дальше 2*radius + diameter, пропускаем
-    без проверки попарных расстояний (экономия на больших очагах).
+    ВНИМАНИЕ: ранее тут была оптимизация «если center-to-center >
+    2*radius + 500м — пропустить». Для вытянутых линейных очагов
+    (участок трассы 5км) center может быть далеко от center соседа,
+    при этом на концах участки подходят вплотную. Оптимизация убрана —
+    для типичных размеров кластеров (3-15 ДТП) попарная проверка
+    выполняется за <1мс.
     """
     curr_cards = curr.get("cards") or []
     prev_cards = prev.get("cards") or []
     if not curr_cards or not prev_cards:
         return False
 
-    # Быстрая предварительная проверка по центрам
-    cc = curr.get("center")
-    pc = prev.get("center")
-    if cc and pc:
-        center_dist = haversine_meters(cc[0], cc[1], pc[0], pc[1])
-        # Если центры дальше 2*radius + 500м (запас на диаметр очага),
-        # вряд ли есть близкая пара ДТП
-        if center_dist > 2 * radius_m + 500:
-            return False
-
-    # Попарная проверка всех ДТП
     # Берём координаты из карточек через _parse_coords
     curr_coords = []
     for card in curr_cards:
@@ -3065,6 +3062,39 @@ def _dtp_within_radius(
             if haversine_meters(clat, clon, plat, plon) <= radius_m:
                 return True
     return False
+
+
+def _min_dtp_distance(curr: dict, prev: dict) -> float:
+    """
+    Минимальное попарное расстояние между ДТП двух очагов (в метрах).
+
+    Используется для сортировки соседей: чем меньше мин. расстояние,
+    тем «ближе» прошлогодний очаг к текущему.
+
+    Если у одного из очагов нет координат — возвращает большое число
+    (чтобы такой сосед оказался в конце списка).
+    """
+    curr_cards = curr.get("cards") or []
+    prev_cards = prev.get("cards") or []
+    if not curr_cards or not prev_cards:
+        return float("inf")
+
+    curr_coords = [
+        c for c in (_parse_coords(card) for card in curr_cards) if c
+    ]
+    prev_coords = [
+        c for c in (_parse_coords(card) for card in prev_cards) if c
+    ]
+    if not curr_coords or not prev_coords:
+        return float("inf")
+
+    min_d = float("inf")
+    for clat, clon in curr_coords:
+        for plat, plon in prev_coords:
+            d = haversine_meters(clat, clon, plat, plon)
+            if d < min_d:
+                min_d = d
+    return min_d
 
 
 def _roads_compatible(curr: dict, prev: dict) -> bool:
@@ -3166,15 +3196,19 @@ def _match_clusters(
     )
 
     # === Проход 2: соседи для не-повторных ===
-    # Сначала соберём множество prev, уже занятых повторами —
-    # НЕТ, не делаем этого. Сосед может быть и «повторным» для другого
-    # текущего, и «соседом» для этого. Это разные роли.
+    # ВАЖНО: соседи ищутся БЕЗ проверки zone_type и БЕЗ проверки дороги.
+    # Логика: «новый (есть ближайший в АППГ)» — это про географическую
+    # близость, а не про совпадение дороги/зоны. Например, текущий очаг
+    # в НП может иметь ближайший прошлогодний очаг на прилегающей
+    # трассе (вне НП) — это всё равно «есть сосед в АППГ».
+    #
+    # ВАЖНО: используем _dtp_within_radius (попарная проверка ДТП),
+    # а не center-to-center. Для вытянутых линейных очагов (участок
+    # трассы длиной 5 км) center может быть далеко от center соседа,
+    # при этом на концах участки могут подходить вплотную.
+    neighborless_curr: list[tuple[int, float]] = []  # (ci, min_dist_to_any_prev)
     for ci, curr in enumerate(current_clusters):
         if matches[ci]:  # уже повторный
-            continue
-
-        cc = curr.get("center")
-        if not cc:
             continue
 
         curr_in_settlement = curr["zone_type"].startswith("settlement")
@@ -3184,21 +3218,28 @@ def _match_clusters(
             else NEIGHBOR_RADIUS_NONSETTLEMENT
         )
 
-        # Ищем ВСЕ прошлые в радиусе
+        # Ищем ВСЕ прошлые в радиусе (по ДТП-к-ДТП, не center-to-center)
         neighbors: list[tuple[int, float]] = []
+        # Для диагностики — минимальное расстояние до любого prev
+        min_dist_any: float | None = None
         for pi, prev in enumerate(prev_clusters):
-            # Zone_type по префиксу
-            prev_in_settlement = prev["zone_type"].startswith("settlement")
-            if curr_in_settlement != prev_in_settlement:
-                continue
-
+            # Для диагностики считаем center-to-center (мин. по всем prev).
+            # Раньше тут была отбраковка «cd > 2*radius + 500 → пропустить»,
+            # но для вытянутых очагов center может быть далеко, а ДТП на
+            # концах — близко. Отбраковка убрана, _dtp_within_radius
+            # проверяет все пары и сама принимает решение.
+            cc = curr.get("center")
             pc = prev.get("center")
-            if not pc:
-                continue
+            if cc and pc:
+                cd = haversine_meters(cc[0], cc[1], pc[0], pc[1])
+                if min_dist_any is None or cd < min_dist_any:
+                    min_dist_any = cd
 
-            dist = haversine_meters(cc[0], cc[1], pc[0], pc[1])
-            if dist <= radius:
-                neighbors.append((pi, dist))
+            # Точная проверка: есть ли пара ДТП в радиусе
+            if _dtp_within_radius(curr, prev, radius):
+                # Для соседа дистанция = минимальное попарное расстояние
+                d = _min_dtp_distance(curr, prev)
+                neighbors.append((pi, d))
 
         if neighbors:
             # Сортируем по расстоянию, берём до MAX_NEIGHBORS_TO_SHOW
@@ -3219,7 +3260,22 @@ def _match_clusters(
         else:
             # Нет ни соседей — оставляем curr без _neighbors
             # (статус будет «новый»)
-            pass
+            neighborless_curr.append((ci, min_dist_any or 0.0))
+
+    # Диагностика: если многие новые очаги не нашли соседей,
+    # логируем минимальные расстояния — это поможет понять,
+    # слишком ли мал радиус или другая причина.
+    if neighborless_curr:
+        # Топ-5 ближайших из «не нашедших соседей»
+        neighborless_curr.sort(key=lambda x: x[1])
+        top5 = neighborless_curr[:5]
+        dists_str = ", ".join(
+            f"#{ci}={d:.0f}м" for ci, d in top5
+        )
+        logger.info(
+            f"Соседи не найдены для {len(neighborless_curr)} новых очагов. "
+            f"Топ-5 ближайших (мин. dist до любого prev): {dists_str}"
+        )
 
     return matches
 
@@ -3447,69 +3503,112 @@ async def calculate_concentration_dynamics(
                 "neighbors": [],
             }
 
-    # --- Исчезнувшие очаги ---
+    # --- Прошлогодние очаги: исчезнувшие + повторённые ---
     # Прошлый очаг «исчез», если ни один текущий не сматчился с ним как повторный.
     # (Не путать с «соседом» — сосед не делает прошлый очаг не-исчезнувшим.)
     matched_prev_set: set[int] = set()
-    for indices in matches.values():
+    # Какой текущий очаг (индекс в current_clusters) сматчился с этим prev
+    # — нужно для prev_matched, чтобы показать «повторён в текущем №X».
+    prev_to_curr_matchers: dict[int, list[int]] = {}
+    for ci, indices in matches.items():
         if indices:  # только для повторных (не для соседей)
             matched_prev_set.update(indices)
+            for pi in indices:
+                prev_to_curr_matchers.setdefault(pi, []).append(ci)
 
-    lost_count = 0
-    # Сначала добавим все исчезнувшие в current_clusters,
-    # потом присвоим им номера (см. ниже).
-    lost_start_index = len(current_clusters)
+    # Сначала добавим ПОВТОРЁННЫЕ прошлые очаги (как отдельные строки).
+    # Раньше они вообще не попадали в Excel/карту — пользователь не видел,
+    # какие именно очаги АППГ «превратились» в текущие. Теперь они
+    # отображаются со статусом «АППГ (повторён)» и ссылкой на текущий №.
+    matched_count = 0
     for pi, prev in enumerate(prev_clusters):
         if pi not in matched_prev_set:
-            lost_count += 1
-            lost_cluster = dict(prev)
-            lost_cluster["dynamics"] = {
-                "status": "lost",
-                "matched_prev_indices": [],
-                "matched_prev_numbers": [],
-                "prev_total": prev["total_accidents"],
-                "prev_deaths": prev["deaths"],
-                "prev_injured": prev["injured"],
-                "match_distance": None,
-                "neighbors": [],
-            }
-            # Флаг для корректного отображения в Excel
-            lost_cluster["_is_lost"] = True
-            # Сохраняем оригинальный индекс в prev_clusters — нужен,
-            # чтобы текущие очаги могли ссылаться на номер исчезнувшего.
-            lost_cluster["_prev_index"] = pi
-            current_clusters.append(lost_cluster)
+            continue  # не повтора — обработаем ниже как lost
+        matched_count += 1
+        matched_prev_cluster = dict(prev)
+        matched_prev_cluster["dynamics"] = {
+            "status": "prev_matched",
+            "matched_prev_indices": [],
+            "matched_prev_numbers": [],
+            "prev_total": prev["total_accidents"],
+            "prev_deaths": prev["deaths"],
+            "prev_injured": prev["injured"],
+            "match_distance": None,
+            "neighbors": [],
+            # Индексы текущих очагов (в current_clusters ДО добавления
+            # prev_matched/lost), которые сматчились с этим prev.
+            # Заполняется числами (номерами в Excel) после нумерации.
+            "matched_curr_indices": prev_to_curr_matchers.get(pi, []),
+            "matched_curr_numbers": [],
+        }
+        matched_prev_cluster["_is_prev_matched"] = True
+        matched_prev_cluster["_prev_index"] = pi
+        current_clusters.append(matched_prev_cluster)
 
-    # --- Нумерация исчезнувших очагов для ссылок ---
+    # Теперь добавим ИСЧЕЗНУВШИЕ прошлые очаги (без матча в текущем).
+    lost_count = 0
+    for pi, prev in enumerate(prev_clusters):
+        if pi in matched_prev_set:
+            continue
+        lost_count += 1
+        lost_cluster = dict(prev)
+        lost_cluster["dynamics"] = {
+            "status": "lost",
+            "matched_prev_indices": [],
+            "matched_prev_numbers": [],
+            "prev_total": prev["total_accidents"],
+            "prev_deaths": prev["deaths"],
+            "prev_injured": prev["injured"],
+            "match_distance": None,
+            "neighbors": [],
+        }
+        # Флаг для корректного отображения в Excel
+        lost_cluster["_is_lost"] = True
+        # Сохраняем оригинальный индекс в prev_clusters — нужен,
+        # чтобы текущие очаги могли ссылаться на номер исчезнувшего.
+        lost_cluster["_prev_index"] = pi
+        current_clusters.append(lost_cluster)
+
+    # --- Нумерация очагов для ссылок ---
     # В Excel-таблице у каждого очага есть № (1-based, по порядку в списке).
-    # Текущие очаги идут первыми (1..N), исчезнувшие — после (N+1..N+M).
-    # Чтобы текущий очаг со статусом repeated мог ссылаться «Да, №5»,
-    # нам нужно знать, какой № в таблице у соответствующего prev.
-    # Если prev сматчен как repeated — его номер = номер текущего, который
-    # с ним сматчен (но это текущий, не прошлый!).
-    # Если prev исчез — его номер = его позиция в current_clusters после
-    # добавления всех исчезнувших.
+    # Порядок: текущие (1..N) → prev_matched (N+1..N+K) → lost (N+K+1..N+K+L).
     #
     # Строим маппинг: prev_index -> номер в Excel-таблице.
+    # ВАЖНО: теперь включает КАК lost, ТАК И prev_matched — иначе
+    # текущие очаги со статусом repeated не смогут сослаться на
+    # «Да, №X» (X = номер prev_matched в таблице), и столбец
+    # «Очаг в прошлом году» покажет «Нет» (баг #1 из production-логов).
     prev_index_to_excel_number: dict[int, int] = {}
     for i, c in enumerate(current_clusters, start=1):
-        if c.get("_is_lost"):
+        if c.get("_is_lost") or c.get("_is_prev_matched"):
             pi = c.get("_prev_index")
             if pi is not None:
                 prev_index_to_excel_number[pi] = i
 
-    # Заполняем matched_prev_numbers и neighbors[].prev_number
+    # Заполняем matched_prev_numbers (для текущих) и matched_curr_numbers
+    # (для prev_matched) и neighbors[].prev_number.
+    # Чтобы сослаться на текущий очаг из prev_matched, нужен обратный
+    # маппинг: curr_index -> excel_number. Текущие очаги идут первыми
+    # (1..N), поэтому excel_number = curr_index + 1.
+    n_current = len(current_clusters) - matched_count - lost_count
     for curr in current_clusters:
         dyn = curr.get("dynamics") or {}
         if not dyn:
             continue
-        # matched_prev_numbers
+        # matched_prev_numbers (для текущих очагов со статусом repeated_*)
         matched_indices = dyn.get("matched_prev_indices") or []
         if matched_indices:
             dyn["matched_prev_numbers"] = [
                 prev_index_to_excel_number.get(pi)
                 for pi in matched_indices
                 if pi in prev_index_to_excel_number
+            ]
+        # matched_curr_numbers (для prev_matched — на какие текущие № ссылается)
+        matched_curr_indices = dyn.get("matched_curr_indices") or []
+        if matched_curr_indices:
+            dyn["matched_curr_numbers"] = [
+                ci + 1 for ci in matched_curr_indices  # 1-based
+                if 0 <= ci < n_current
             ]
         # neighbors[].prev_number
         neighbors = dyn.get("neighbors") or []
@@ -3528,6 +3627,7 @@ async def calculate_concentration_dynamics(
         f"из них слияний={status_counts.get('repeated_merged', 0)}, "
         f"новых={status_counts.get('new', 0)}, "
         f"новых с соседом={status_counts.get('new_with_neighbor', 0)}, "
+        f"повторённых АППГ={status_counts.get('prev_matched', 0)}, "
         f"исчезнувших={lost_count}, "
         f"всего={len(current_clusters)}"
     )
@@ -3558,6 +3658,8 @@ DYNAMICS_COLUMNS = [
     # Новые столбцы (методология пикетаж + сосед)
     "Очаг в прошлом году",
     "Соседние очаги (пр. период)",
+    # Для prev_matched: на какой текущий № ссылается этот АППГ-очаг
+    "Повторён в текущем",
     "Виды ДТП (детализация)",
     "Доминирующий вид",
     "Погибло",
@@ -3601,10 +3703,11 @@ def _format_prev_year_field(dyn: dict) -> str:
     - «Да, №5» — для повторного очага с одним прошлогодним
     - «Да, №3, №4» — для слияния 2+ прошлогодних
     - «Нет» — для новых (с соседом и без)
-    - «» (пусто) — для исчезнувших (это и есть прошлогодний)
+    - «» (пусто) — для исчезнувших и prev_matched
+      (это и есть прошлогодний очаг, нечего на него ссылаться)
     """
     status = dyn.get("status", "")
-    if status == "lost":
+    if status in ("lost", "prev_matched"):
         return ""
 
     matched_numbers = dyn.get("matched_prev_numbers") or []
@@ -3617,6 +3720,27 @@ def _format_prev_year_field(dyn: dict) -> str:
         return "Да"  # сматчилось, но номера потерялись — редкий случай
 
     return "Да, №" + ", №".join(valid_numbers)
+
+
+def _format_matched_curr_field(dyn: dict) -> str:
+    """
+    Формирует текст для столбца «Повторён в текущем» (только prev_matched).
+
+    Возвращает:
+    - «№5» — один текущий
+    - «№3, №4» — несколько текущих (если один АППГ-очаг разнесён
+      по нескольким текущим)
+    - «» — для всех остальных статусов
+    """
+    status = dyn.get("status", "")
+    if status != "prev_matched":
+        return ""
+
+    matched_curr_numbers = dyn.get("matched_curr_numbers") or []
+    valid = [str(n) for n in matched_curr_numbers if n is not None]
+    if not valid:
+        return ""
+    return "№" + ", №".join(valid)
 
 
 def _format_neighbors_field(dyn: dict) -> str:
@@ -3662,6 +3786,9 @@ def build_dynamics_excel_data(
         dyn = cluster.get("dynamics", {})
         raw_status = dyn.get("status", "new")
         is_lost = cluster.get("_is_lost", False)
+        is_prev_matched = cluster.get("_is_prev_matched", False)
+        # lost и prev_matched — это «прошлогодние» очаги, у них нет ДТП текущего периода
+        is_prev_period = is_lost or is_prev_matched
 
         # Для слияния добавляем в метку номера слитых очагов
         if raw_status == "repeated_merged":
@@ -3671,6 +3798,15 @@ def build_dynamics_excel_data(
                 status = f"Повторный (слияние №" + ", №".join(valid_nums) + ")"
             else:
                 status = "Повторный (слияние)"
+        elif raw_status == "prev_matched":
+            # «АППГ (повторён в текущем №X)» — пользователь сразу видит,
+            # в каком текущем очаге «продолжился» этот АППГ-очаг.
+            curr_nums = dyn.get("matched_curr_numbers") or []
+            valid_curr = [str(n) for n in curr_nums if n is not None]
+            if valid_curr:
+                status = "АППГ (повторён в текущем №" + ", №".join(valid_curr) + ")"
+            else:
+                status = "АППГ (повторён)"
         else:
             status = DYNAMICS_STATUS_LABELS.get(raw_status, "?")
 
@@ -3680,8 +3816,8 @@ def build_dynamics_excel_data(
         ]
         types_str = "; ".join(types_parts)
 
-        # Координаты: для lost показываем центр прошлого очага
-        if is_lost:
+        # Координаты: для lost/prev_matched показываем центр прошлого очага
+        if is_prev_period:
             c = cluster.get("center")
             lat_str = f"{c[0]:.6f}" if c else ""
             lon_str = f"{c[1]:.6f}" if c else ""
@@ -3696,13 +3832,19 @@ def build_dynamics_excel_data(
         end_str = _format_piketazh(end_pos)
 
         # ДТП
-        current_total = 0 if is_lost else cluster["total_accidents"]
+        # Для prev_matched: текущих ДТП нет (это прошлогодний очаг),
+        # показываем только prev_total.
+        current_total = 0 if is_prev_period else cluster["total_accidents"]
         prev_total = dyn.get("prev_total")
-        if prev_total is not None and not is_lost:
+        if prev_total is not None and not is_prev_period:
             delta = current_total - prev_total
             delta_str = f"{delta:+d}"
         elif is_lost and prev_total is not None:
             delta_str = f"-{prev_total}"
+        elif is_prev_matched:
+            # Для prev_matched изменения нет (есть текущий counterpart,
+            # изменение показано в его строке).
+            delta_str = ""
         else:
             delta_str = ""
 
@@ -3720,6 +3862,7 @@ def build_dynamics_excel_data(
         # Новые столбцы
         prev_year_field = _format_prev_year_field(dyn)
         neighbors_field = _format_neighbors_field(dyn)
+        matched_curr_field = _format_matched_curr_field(dyn)
 
         rows.append({
             "№ очага": str(i),
@@ -3735,10 +3878,11 @@ def build_dynamics_excel_data(
             "Изменение ДТП": delta_str,
             "Очаг в прошлом году": prev_year_field,
             "Соседние очаги (пр. период)": neighbors_field,
+            "Повторён в текущем": matched_curr_field,
             "Виды ДТП (детализация)": types_str,
             "Доминирующий вид": cluster.get("dominant_type") or "",
-            "Погибло": str(0 if is_lost else cluster["deaths"]),
-            "Ранено": str(0 if is_lost else cluster["injured"]),
+            "Погибло": str(0 if is_prev_period else cluster["deaths"]),
+            "Ранено": str(0 if is_prev_period else cluster["injured"]),
             "Погибло (пр. период)": str(dyn["prev_deaths"]) if dyn.get("prev_deaths") is not None else "",
             "Ранено (пр. период)": str(dyn["prev_injured"]) if dyn.get("prev_injured") is not None else "",
             "Дата первого ДТП": first_date,
@@ -3766,7 +3910,9 @@ def build_dynamics_detail_data(
         dyn = cluster.get("dynamics", {})
         status = DYNAMICS_STATUS_LABELS.get(dyn.get("status", "new"), "?")
         is_lost = cluster.get("_is_lost", False)
-        period = prev_label if is_lost else current_label
+        is_prev_matched = cluster.get("_is_prev_matched", False)
+        # lost и prev_matched — оба из прошлого периода
+        period = prev_label if (is_lost or is_prev_matched) else current_label
 
         for card in cluster.get("cards", []):
             coords = _parse_coords(card)
@@ -3825,7 +3971,10 @@ def build_dynamics_summary(clusters: list[dict]) -> dict:
         status = dyn.get("status", "new")
         stats[status] = stats.get(status, 0) + 1
 
-        if not cluster.get("_is_lost", False):
+        # current_total_dtp — только для текущих очагов
+        # (lost и prev_matched — это очаги прошлого периода, их ДТП
+        # уже учтены в prev_total_dtp).
+        if not cluster.get("_is_lost", False) and not cluster.get("_is_prev_matched", False):
             stats["current_total_dtp"] += cluster["total_accidents"]
 
         prev_total = dyn.get("prev_total")

@@ -1786,6 +1786,10 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         has_lost = any(
             (c.get("dynamics") or {}).get("status") == "lost" for c in clusters
         )
+        has_prev_matched = any(
+            (c.get("dynamics") or {}).get("status") == "prev_matched"
+            for c in clusters
+        )
 
         summary_html = self._build_summary(
             total=total_dtp,
@@ -1827,7 +1831,7 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         )
 
         # Легенда для карты очагов
-        legend_html = self._build_cluster_legend(has_pre, has_lost)
+        legend_html = self._build_cluster_legend(has_pre, has_lost, has_prev_matched)
 
         # Фильтр камер по модели (если есть камеры)
         cam_models = sorted(set(
@@ -1910,12 +1914,14 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
                 # - status: для цвета маркера и метки в попапе
                 # - prev_total: «было N ДТП»
                 # - matched_prev_numbers: для повторных — «В прошлом году: №3, №4»
+                # - matched_curr_numbers: для prev_matched — «Повторён в текущем №5»
                 # - neighbors: для new_with_neighbor — список соседей с дистанциями
                 #   [{prev_number, distance_m}, ...]
                 dyn_info = {
                     "status": dynamics.get("status"),
                     "prev_total": dynamics.get("prev_total"),
                     "matched_prev_numbers": dynamics.get("matched_prev_numbers") or [],
+                    "matched_curr_numbers": dynamics.get("matched_curr_numbers") or [],
                     "neighbors": dynamics.get("neighbors") or [],
                 }
 
@@ -1944,12 +1950,14 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
 
         return json.dumps(result, ensure_ascii=False)
 
-    def _build_cluster_legend(self, has_preclusters: bool, has_lost: bool = False) -> str:
+    def _build_cluster_legend(self, has_preclusters: bool, has_lost: bool = False, has_prev_matched: bool = False) -> str:
         """Легенда для карты очагов."""
         pre_row = """
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#e0e0e0;border:2px dashed #9e9e9e;"></span></td><td>Зона предочага (пунктир)</td></tr>""" if has_preclusters else ""
         lost_row = """
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#c0c0c0;border:2px dashed #9e9e9e;"></span></td><td>Зона исчезнувшего очага (серый пунктир)</td></tr>""" if has_lost else ""
+        prev_matched_row = """
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#5ac8fa;border:2px dashed #007aff;"></span></td><td>АППГ (повторён в текущем) — голубой пунктир</td></tr>""" if has_prev_matched else ""
         # Статусы динамики (новая методология)
         dynamics_rows = """
     <tr><td colspan="2" style="padding:6px 8px 2px 0;font-weight:600;color:#424242;">Статус очага (vs АППГ):</td></tr>
@@ -1966,7 +1974,7 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>Очаг: 10+ ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>Очаг: 6–9 ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#fbc02d"></span></td><td>Очаг: 3–5 ДТП</td></tr>
-{lost_row}{pre_row}
+{lost_row}{prev_matched_row}{pre_row}
 {dynamics_rows}
     <tr><td colspan="2" style="padding:6px 8px 2px 0;font-weight:600;color:#424242;">Точки ДТП:</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td style="font-size:12px;">с погибшими</td></tr>
@@ -2186,9 +2194,11 @@ function clusterColor(count) {{
 var dtpClusterLayer = L.layerGroup();    // ДТП внутри текущих очагов
 var dtpPreclusterLayer = L.layerGroup(); // ДТП внутри предочагов
 var dtpLostLayer = L.layerGroup();       // ДТП внутри исчезнувших очагов
+var dtpPrevMatchedLayer = L.layerGroup();// ДТП внутри АППГ-повторённых очагов
 var clusterLayer = L.layerGroup();      // зоны и маркеры текущих очагов
 var preclusterLayer = L.layerGroup();   // зоны и маркеры предочагов
 var lostClusterLayer = L.layerGroup();  // зоны и маркеры исчезнувших очагов
+var prevMatchedClusterLayer = L.layerGroup(); // зоны и маркеры АППГ-повторённых
 
 // --- Камеры (кластеризация) ---
 var cameraIcon = L.divIcon({{
@@ -2216,8 +2226,9 @@ cameraDataFull.forEach(function(c) {{
 }});
 cameraCluster.addTo(map);
 
-// --- Функция отрисовки очага/предочага/исчезнувшего ---
-function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
+// --- Функция отрисовки очага/предочага/исчезнувшего/АППГ-повторённого ---
+function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost, isPrevMatched) {{
+    isPrevMatched = isPrevMatched || false;
     data.forEach(function(cl) {{
         if (cl.points.length === 0) return;
         var pts = cl.points;
@@ -2225,13 +2236,17 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
         // Convex hull (зона)
         var hull = convexHull(pts);
         var baseColor = clusterColor(cl.count);
-        var color = isLost ? '#9e9e9e' : baseColor;
+        var color = isLost ? '#9e9e9e' : (isPrevMatched ? '#5ac8fa' : baseColor);
         var zoneStyle = isPre ? {{
             color: '#9e9e9e', fillColor: '#e0e0e0', fillOpacity: 0.08,
             weight: 2, dashArray: '6,4'
         }} : isLost ? {{
             // Исчезнувший очаг — светло-серый, пунктирная рамка
             color: '#9e9e9e', fillColor: '#c0c0c0', fillOpacity: 0.10,
+            weight: 2, dashArray: '4,3'
+        }} : isPrevMatched ? {{
+            // АППГ-повторённый — голубой, пунктирная рамка
+            color: '#007aff', fillColor: '#5ac8fa', fillOpacity: 0.10,
             weight: 2, dashArray: '4,3'
         }} : {{
             color: color, fillColor: color, fillOpacity: 0.12, weight: 2
@@ -2242,10 +2257,11 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
         }}
 
         // Точки ДТП — в соответствующий DTP-слой
-        // Для исчезнувших очагов ДТП красим серым, чтобы визуально отделить
+        // Для исчезнувших и АППГ-повторённых ДТП красим серым/голубым
         pts.forEach(function(p) {{
+            var dtpColor = isLost ? '#9e9e9e' : (isPrevMatched ? '#5ac8fa' : p.color);
             L.circleMarker([p.lat, p.lon], {{
-                radius: 5, fillColor: isLost ? '#9e9e9e' : p.color, color: '#333',
+                radius: 5, fillColor: dtpColor, color: '#333',
                 weight: 1, fillOpacity: 0.9
             }}).bindPopup(p.popup, {{maxWidth: 320}}).addTo(dtpLayer);
         }});
@@ -2253,11 +2269,11 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
         // Линии между точками ДТП очага
         if (pts.length >= 2) {{
             var lineCoords = pts.map(function(p) {{ return [p.lat, p.lon]; }});
+            var lineColor = isPre ? '#757575' : (isLost ? '#9e9e9e' : (isPrevMatched ? '#5ac8fa' : '#000000'));
             var lineOpts = {{
-                color: isPre ? '#757575' : (isLost ? '#9e9e9e' : '#000000'),
-                weight: 3, opacity: 0.8
+                color: lineColor, weight: 3, opacity: 0.8
             }};
-            if (isPre || isLost) lineOpts.dashArray = '6,4';
+            if (isPre || isLost || isPrevMatched) lineOpts.dashArray = '6,4';
             L.polyline(lineCoords, lineOpts).addTo(zoneLayer);
         }}
 
@@ -2272,6 +2288,7 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
                 'repeated_merged': '🔄⊕ Повторный (слияние)',
                 'new': '🆕 Новый',
                 'new_with_neighbor': '🆕↔ Новый (есть ближайший в АППГ)',
+                'prev_matched': '🔄 АППГ (повторён в текущем)',
                 'lost': '❌ Исчез',
                 // Обратная совместимость
                 'growing': '📈 Растёт',
@@ -2285,6 +2302,10 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
             // Для повторного — покажем номера прошлогодних очагов
             if (cl.dynamics.matched_prev_numbers && cl.dynamics.matched_prev_numbers.length > 0) {{
                 dynText += '<br>↔ В прошлом году: №' + cl.dynamics.matched_prev_numbers.join(', №');
+            }}
+            // Для prev_matched — покажем, в какие текущие № он «продолжился»
+            if (cl.dynamics.matched_curr_numbers && cl.dynamics.matched_curr_numbers.length > 0) {{
+                dynText += '<br>↔ Повторён в текущем: №' + cl.dynamics.matched_curr_numbers.join(', №');
             }}
             // Для «новый с соседом» — покажем список соседей
             if (cl.dynamics.neighbors && cl.dynamics.neighbors.length > 0) {{
@@ -2324,19 +2345,26 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
             'repeated_merged': '#af52de',      // фиолетовый — слияние
             'new': '#34c759',                  // зелёный — новый
             'new_with_neighbor': '#ff9500',    // оранжевый — новый с соседом
+            'prev_matched': '#5ac8fa',         // голубой — АППГ-повторённый
             'lost': '#9e9e9e'                  // серый — исчезнувший
         }};
         var dynStatus = cl.dynamics ? cl.dynamics.status : null;
+        var isPrevMatched = dynStatus === 'prev_matched';
         var markerColor = isLost ? '#c0c0c0' :
+                          isPrevMatched ? '#5ac8fa' :
                           (dynStatus && dynamicsColors[dynStatus]) ? dynamicsColors[dynStatus] :
                           color;
         if (cl.center) {{
             var marker = L.circleMarker(cl.center, {{
                 radius: 10, fillColor: markerColor,
-                color: isLost ? '#757575' : '#000',
-                weight: 2, fillOpacity: isLost ? 0.5 : 0.4
+                color: isLost ? '#757575' : (isPrevMatched ? '#007aff' : '#000'),
+                weight: 2, fillOpacity: (isLost || isPrevMatched) ? 0.5 : 0.4,
+                dashArray: (isLost || isPrevMatched) ? '4,4' : undefined
             }});
-            var popupHtml = '<b>' + (isPre ? 'Предочаг' : (isLost ? 'Исчезнувший очаг' : 'Очаг')) + ' №' + cl.id + '</b>' +
+            var clusterLabel = isPre ? 'Предочаг' :
+                               isLost ? 'Исчезнувший очаг' :
+                               isPrevMatched ? 'АППГ (повторён)' : 'Очаг';
+            var popupHtml = '<b>' + clusterLabel + ' №' + cl.id + '</b>' +
                 '<br>' + cl.road +
                 '<br>ДТП: ' + cl.count +
                 (cl.deaths ? ' | 💀 ' + cl.deaths : '') +
@@ -2363,13 +2391,19 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
 
 // --- Отрисовка ---
 var clusterData = {clusters_js};
-// Разделяем: текущие очаги и исчезнувшие (по dynamics.status == 'lost')
+// Разделяем: текущие очаги / АППГ-повторённые / исчезнувшие
 var lostData = clusterData.filter(function(cl) {{ return cl.dynamics && cl.dynamics.status === 'lost'; }});
-var currentData = clusterData.filter(function(cl) {{ return !(cl.dynamics && cl.dynamics.status === 'lost'); }});
+var prevMatchedData = clusterData.filter(function(cl) {{ return cl.dynamics && cl.dynamics.status === 'prev_matched'; }});
+var currentData = clusterData.filter(function(cl) {{
+    return !(cl.dynamics && (cl.dynamics.status === 'lost' || cl.dynamics.status === 'prev_matched'));
+}});
 
-drawClusterGroup(currentData, clusterLayer, dtpClusterLayer, false, false);
+drawClusterGroup(currentData, clusterLayer, dtpClusterLayer, false, false, false);
+if (prevMatchedData.length > 0) {{
+    drawClusterGroup(prevMatchedData, prevMatchedClusterLayer, dtpPrevMatchedLayer, false, false, true);
+}}
 if (lostData.length > 0) {{
-    drawClusterGroup(lostData, lostClusterLayer, dtpLostLayer, false, true);
+    drawClusterGroup(lostData, lostClusterLayer, dtpLostLayer, false, true, false);
 }}
 
 // --- Линии связи для «новых с соседом» (new_with_neighbor) ---
@@ -2405,12 +2439,16 @@ currentData.forEach(function(cl) {{
 
 var preclusterData = {preclusters_js};
 if (preclusterData.length > 0) {{
-    drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true, false);
+    drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true, false, false);
 }}
 
-// Добавляем слои на карту (исчезнувшие по умолчанию включены, но можно выключить)
+// Добавляем слои на карту (исчезнувшие и АППГ-повторённые по умолчанию включены, но можно выключить)
 dtpClusterLayer.addTo(map);
 clusterLayer.addTo(map);
+if (prevMatchedData.length > 0) {{
+    prevMatchedClusterLayer.addTo(map);
+    dtpPrevMatchedLayer.addTo(map);
+}}
 if (lostData.length > 0) {{
     lostClusterLayer.addTo(map);
     dtpLostLayer.addTo(map);
@@ -2425,6 +2463,10 @@ var overlayLayers = {{
     "Очаги (зоны)": clusterLayer,
     "ДТП в очагах": dtpClusterLayer
 }};
+if (prevMatchedData.length > 0) {{
+    overlayLayers["АППГ (повторённые) — зоны"] = prevMatchedClusterLayer;
+    overlayLayers["ДТП в АППГ-повторённых"] = dtpPrevMatchedLayer;
+}}
 if (lostData.length > 0) {{
     overlayLayers["Исчезнувшие очаги (зоны)"] = lostClusterLayer;
     overlayLayers["ДТП в исчезнувших"] = dtpLostLayer;
