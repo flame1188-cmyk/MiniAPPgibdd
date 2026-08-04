@@ -1906,9 +1906,17 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
             dynamics = cl.get("dynamics")
             dyn_info = None
             if dynamics:
+                # Передаём в JS все поля, нужные для отображения:
+                # - status: для цвета маркера и метки в попапе
+                # - prev_total: «было N ДТП»
+                # - matched_prev_numbers: для повторных — «В прошлом году: №3, №4»
+                # - neighbors: для new_with_neighbor — список соседей с дистанциями
+                #   [{prev_number, distance_m}, ...]
                 dyn_info = {
                     "status": dynamics.get("status"),
                     "prev_total": dynamics.get("prev_total"),
+                    "matched_prev_numbers": dynamics.get("matched_prev_numbers") or [],
+                    "neighbors": dynamics.get("neighbors") or [],
                 }
 
             # Предочаг — критерий
@@ -1942,6 +1950,15 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#e0e0e0;border:2px dashed #9e9e9e;"></span></td><td>Зона предочага (пунктир)</td></tr>""" if has_preclusters else ""
         lost_row = """
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#c0c0c0;border:2px dashed #9e9e9e;"></span></td><td>Зона исчезнувшего очага (серый пунктир)</td></tr>""" if has_lost else ""
+        # Статусы динамики (новая методология)
+        dynamics_rows = """
+    <tr><td colspan="2" style="padding:6px 8px 2px 0;font-weight:600;color:#424242;">Статус очага (vs АППГ):</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#34c759"></span></td><td>Новый</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#ff9500"></span></td><td>Новый (есть ближайший в АППГ) — пунктирная линия связи</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#ff3b30"></span></td><td>Повторный (рост ДТП)</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#2481cc"></span></td><td>Повторный (снижение ДТП)</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#8e8e93"></span></td><td>Повторный (стабильно)</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#af52de"></span></td><td>Повторный (слияние 2+ очагов АППГ)</td></tr>"""
         return f"""
 <div class="legend">
   <div style="font-weight:600;margin-bottom:6px;">Условные обозначения</div>
@@ -1950,9 +1967,11 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>Очаг: 6–9 ДТП</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#fbc02d"></span></td><td>Очаг: 3–5 ДТП</td></tr>
 {lost_row}{pre_row}
-    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td style="font-size:12px;">— точка ДТП с погибшими</td></tr>
-    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td style="font-size:12px;">— точка ДТП с ранеными</td></tr>
-    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#9e9e9e"></span></td><td style="font-size:12px;">— ДТП в исчезнувшем очаге</td></tr>
+{dynamics_rows}
+    <tr><td colspan="2" style="padding:6px 8px 2px 0;font-weight:600;color:#424242;">Точки ДТП:</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td style="font-size:12px;">с погибшими</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td style="font-size:12px;">с ранеными</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#9e9e9e"></span></td><td style="font-size:12px;">в исчезнувшем очаге</td></tr>
     <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
   </table>
   <div style="margin-top:6px;color:#757575;font-size:12px;">Кликните на зону очага для подробностей. Включите/выключите слои через панель справа.</div>
@@ -2246,13 +2265,33 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
         var dynText = '';
         if (cl.dynamics) {{
             var statusMap = {{
-                'new': '🆕 Новый', 'lost': '❌ Исчез',
-                'growing': '📈 Растёт', 'shrinking': '📉 Снижается',
+                // Новая методология (пикетаж + сосед)
+                'repeated_growing': '🔄↑ Повторный (рост)',
+                'repeated_shrinking': '🔄↓ Повторный (снижение)',
+                'repeated_stable': '🔄→ Повторный (стабильно)',
+                'repeated_merged': '🔄⊕ Повторный (слияние)',
+                'new': '🆕 Новый',
+                'new_with_neighbor': '🆕↔ Новый (есть ближайший в АППГ)',
+                'lost': '❌ Исчез',
+                // Обратная совместимость
+                'growing': '📈 Растёт',
+                'shrinking': '📉 Снижается',
                 'stable': '➡️ Стабильный'
             }};
             dynText = '<br>Динамика: ' + (statusMap[cl.dynamics.status] || cl.dynamics.status);
-            if (cl.dynamics.prev_total !== null) {{
+            if (cl.dynamics.prev_total !== null && cl.dynamics.prev_total !== undefined) {{
                 dynText += ' (было ' + cl.dynamics.prev_total + ' ДТП)';
+            }}
+            // Для повторного — покажем номера прошлогодних очагов
+            if (cl.dynamics.matched_prev_numbers && cl.dynamics.matched_prev_numbers.length > 0) {{
+                dynText += '<br>↔ В прошлом году: №' + cl.dynamics.matched_prev_numbers.join(', №');
+            }}
+            // Для «новый с соседом» — покажем список соседей
+            if (cl.dynamics.neighbors && cl.dynamics.neighbors.length > 0) {{
+                var neighText = cl.dynamics.neighbors.map(function(n) {{
+                    return '№' + n.prev_number + ' (' + Math.round(n.distance_m) + 'м)';
+                }}).join(', ');
+                dynText += '<br>↔ Ближайшие в АППГ: ' + neighText;
             }}
         }}
         var preText = isPre ? '<br><i>' + cl.pre_criterion + '</i>' : '';
@@ -2277,11 +2316,25 @@ function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost) {{
         }}
 
         // Маркер центра с попапом очага
+        // Цвет маркера зависит от статуса динамики (если есть)
+        var dynamicsColors = {{
+            'repeated_growing': '#ff3b30',     // красный — рост
+            'repeated_shrinking': '#2481cc',   // синий — снижение
+            'repeated_stable': '#8e8e93',      // серый — стабильно
+            'repeated_merged': '#af52de',      // фиолетовый — слияние
+            'new': '#34c759',                  // зелёный — новый
+            'new_with_neighbor': '#ff9500',    // оранжевый — новый с соседом
+            'lost': '#9e9e9e'                  // серый — исчезнувший
+        }};
+        var dynStatus = cl.dynamics ? cl.dynamics.status : null;
+        var markerColor = isLost ? '#c0c0c0' :
+                          (dynStatus && dynamicsColors[dynStatus]) ? dynamicsColors[dynStatus] :
+                          color;
         if (cl.center) {{
             var marker = L.circleMarker(cl.center, {{
-                radius: 10, fillColor: isLost ? '#c0c0c0' : color, 
+                radius: 10, fillColor: markerColor,
                 color: isLost ? '#757575' : '#000',
-                weight: 2, fillOpacity: isLost ? 0.5 : 0.3
+                weight: 2, fillOpacity: isLost ? 0.5 : 0.4
             }});
             var popupHtml = '<b>' + (isPre ? 'Предочаг' : (isLost ? 'Исчезнувший очаг' : 'Очаг')) + ' №' + cl.id + '</b>' +
                 '<br>' + cl.road +
@@ -2319,6 +2372,37 @@ if (lostData.length > 0) {{
     drawClusterGroup(lostData, lostClusterLayer, dtpLostLayer, false, true);
 }}
 
+// --- Линии связи для «новых с соседом» (new_with_neighbor) ---
+// Пунктирная линия от текущего очага до каждого соседа в АППГ.
+// Помогает визуально понять: очаг новый, но рядом был прошлогодний.
+var neighborLinkLayer = L.layerGroup();
+currentData.forEach(function(cl) {{
+    if (!cl.dynamics || cl.dynamics.status !== 'new_with_neighbor') return;
+    if (!cl.dynamics.neighbors || cl.dynamics.neighbors.length === 0) return;
+    if (!cl.center) return;
+
+    cl.dynamics.neighbors.forEach(function(n) {{
+        // Находим исчезнувший очаг с этим номером
+        var neighborCluster = lostData.find(function(lc) {{ return lc.id === n.prev_number; }});
+        if (!neighborCluster || !neighborCluster.center) return;
+
+        // cl.center и neighborCluster.center — это [lat, lon] (массив, не объект)
+        L.polyline(
+            [cl.center, neighborCluster.center],
+            {{
+                color: '#ff9500', weight: 2, opacity: 0.6,
+                dashArray: '4,6'
+            }}
+        ).bindPopup(
+            '<b>Связь «новый ↔ АППГ»</b><br>' +
+            'Текущий очаг №' + cl.id + ' (новый)<br>' +
+            '↔ Ближайший в АППГ: №' + n.prev_number + '<br>' +
+            'Расстояние: ' + Math.round(n.distance_m) + ' м',
+            {{maxWidth: 280}}
+        ).addTo(neighborLinkLayer);
+    }});
+}});
+
 var preclusterData = {preclusters_js};
 if (preclusterData.length > 0) {{
     drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true, false);
@@ -2331,6 +2415,10 @@ if (lostData.length > 0) {{
     lostClusterLayer.addTo(map);
     dtpLostLayer.addTo(map);
 }}
+// Линии связи показываем только если они есть
+if (neighborLinkLayer.getLayers().length > 0) {{
+    neighborLinkLayer.addTo(map);
+}}
 
 // --- Управление слоями ---
 var overlayLayers = {{
@@ -2340,6 +2428,9 @@ var overlayLayers = {{
 if (lostData.length > 0) {{
     overlayLayers["Исчезнувшие очаги (зоны)"] = lostClusterLayer;
     overlayLayers["ДТП в исчезнувших"] = dtpLostLayer;
+}}
+if (neighborLinkLayer.getLayers().length > 0) {{
+    overlayLayers["Связи новых с АППГ"] = neighborLinkLayer;
 }}
 if (preclusterData.length > 0) {{
     overlayLayers["Предочаги (зоны)"] = preclusterLayer;
