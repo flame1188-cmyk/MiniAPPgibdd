@@ -40,6 +40,8 @@ const DYNAMICS_LABELS: Record<string, { label: string; color: string; icon: stri
   repeated_merged: { label: 'Повторный (слияние)', color: '#af52de', icon: '🔄⊕' },
   new: { label: 'Новый', color: '#34c759', icon: '🆕' },
   new_with_neighbor: { label: 'Новый (есть ближайший в АППГ)', color: '#ff9500', icon: '🆕↔' },
+  // АППГ-очаг, повторённый в текущем (отдельная строка со ссылкой на текущий №)
+  prev_matched: { label: 'АППГ (повторён)', color: '#5ac8fa', icon: '🔄' },
   lost: { label: 'Исчезнувший', color: '#9e9e9e', icon: '✗' },
   // Обратная совместимость (старые ключи из сохранённых задач)
   growing: { label: 'Растущие', color: '#ff3b30', icon: '↑' },
@@ -244,6 +246,11 @@ export function ClustersView({ task }: ClustersViewProps) {
               Исчезнувших очагов: <b>{summary.total_lost}</b>
             </div>
           )}
+          {summary.total_prev_matched != null && summary.total_prev_matched > 0 && (
+            <div className="text-xs opacity-70 text-center mt-1">
+              АППГ-очагов, повторённых в текущем: <b>{summary.total_prev_matched}</b>
+            </div>
+          )}
         </div>
 
         {/* Динамика */}
@@ -255,6 +262,7 @@ export function ClustersView({ task }: ClustersViewProps) {
             summary.dynamics.repeated_merged > 0 ||
             summary.dynamics.new > 0 ||
             summary.dynamics.new_with_neighbor > 0 ||
+            summary.dynamics.prev_matched > 0 ||
             summary.dynamics.lost > 0 ||
             // обратная совместимость (старые ключи)
             summary.dynamics.growing > 0 ||
@@ -543,6 +551,43 @@ function ClusterCard({
               {cluster.dates[0]} — {cluster.dates[cluster.dates.length - 1]}
             </div>
           )}
+          {/* Для prev_matched: показываем, в какие текущие № он «продолжился» */}
+          {cluster.dynamics?.matched_curr_numbers &&
+            cluster.dynamics.matched_curr_numbers.length > 0 && (
+              <div>
+                <span className="opacity-60">Повторён в текущем:</span>{' '}
+                <b>
+                  {cluster.dynamics.matched_curr_numbers
+                    .map((n: number) => `№${n}`)
+                    .join(', ')}
+                </b>
+              </div>
+            )}
+          {/* Для repeated_*: показываем, какие АППГ-очаги сматчились */}
+          {cluster.dynamics?.matched_prev_numbers &&
+            cluster.dynamics.matched_prev_numbers.length > 0 && (
+              <div>
+                <span className="opacity-60">В прошлом году:</span>{' '}
+                <b>
+                  {cluster.dynamics.matched_prev_numbers
+                    .map((n: number) => `№${n}`)
+                    .join(', ')}
+                </b>
+              </div>
+            )}
+          {/* Для new_with_neighbor: показываем ближайших соседей в АППГ */}
+          {cluster.dynamics?.neighbors &&
+            cluster.dynamics.neighbors.length > 0 && (
+              <div>
+                <span className="opacity-60">Ближайшие в АППГ:</span>{' '}
+                {cluster.dynamics.neighbors
+                  .map(
+                    (n: { prev_number: number; distance_m: number }) =>
+                      `№${n.prev_number} (${Math.round(n.distance_m)}м)`,
+                  )
+                  .join(', ')}
+              </div>
+            )}
           {cluster.center && (
             <div className="opacity-60">
               📍 {cluster.center.lat.toFixed(5)}, {cluster.center.lon.toFixed(5)}

@@ -242,6 +242,7 @@ export interface ClusterItem {
 export interface ClustersSummary {
   total_clusters: number
   total_lost: number
+  total_prev_matched?: number
   total_preclusters: number
   current_total_dtp: number
   current_deaths: number
