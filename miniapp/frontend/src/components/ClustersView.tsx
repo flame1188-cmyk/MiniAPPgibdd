@@ -33,11 +33,18 @@ const ZONE_LABELS: Record<string, string> = {
 }
 
 const DYNAMICS_LABELS: Record<string, { label: string; color: string; icon: string }> = {
-  new: { label: 'Новые', color: '#34c759', icon: '🆕' },
+  // Новая методология (пикетаж + сосед)
+  repeated_growing: { label: 'Повторный (рост)', color: '#ff3b30', icon: '🔄↑' },
+  repeated_shrinking: { label: 'Повторный (снижение)', color: '#2481cc', icon: '🔄↓' },
+  repeated_stable: { label: 'Повторный (стабильно)', color: '#8e8e93', icon: '🔄→' },
+  repeated_merged: { label: 'Повторный (слияние)', color: '#af52de', icon: '🔄⊕' },
+  new: { label: 'Новый', color: '#34c759', icon: '🆕' },
+  new_with_neighbor: { label: 'Новый (есть ближайший в АППГ)', color: '#ff9500', icon: '🆕↔' },
+  lost: { label: 'Исчезнувший', color: '#9e9e9e', icon: '✗' },
+  // Обратная совместимость (старые ключи из сохранённых задач)
   growing: { label: 'Растущие', color: '#ff3b30', icon: '↑' },
   shrinking: { label: 'Снижение', color: '#2481cc', icon: '↓' },
   stable: { label: 'Стабильные', color: '#8e8e93', icon: '→' },
-  lost: { label: 'Исчезнувшие', color: '#ff9500', icon: '✗' },
 }
 
 export function ClustersView({ task }: ClustersViewProps) {
@@ -242,10 +249,17 @@ export function ClustersView({ task }: ClustersViewProps) {
         {/* Динамика */}
         {summary.has_prev_data &&
           summary.prev_label &&
-          (summary.dynamics.new > 0 ||
+          (summary.dynamics.repeated_growing > 0 ||
+            summary.dynamics.repeated_shrinking > 0 ||
+            summary.dynamics.repeated_stable > 0 ||
+            summary.dynamics.repeated_merged > 0 ||
+            summary.dynamics.new > 0 ||
+            summary.dynamics.new_with_neighbor > 0 ||
+            summary.dynamics.lost > 0 ||
+            // обратная совместимость (старые ключи)
             summary.dynamics.growing > 0 ||
             summary.dynamics.shrinking > 0 ||
-            summary.dynamics.lost > 0) && (
+            summary.dynamics.stable > 0) && (
             <div className="tg-card">
               <div className="tg-section-header mb-3">
                 Динамика vs {summary.prev_label}
