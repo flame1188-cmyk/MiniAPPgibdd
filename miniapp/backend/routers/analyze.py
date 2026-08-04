@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
@@ -91,6 +92,10 @@ class AnalysisStatusResponse(BaseModel):
 class ClustersSummary(BaseModel):
     total_clusters: int
     total_lost: int
+    # total_prev_matched — очаги прошлого года, повторённые в текущем
+    # (отдельная строка в Excel/карте со ссылкой на текущий №).
+    # Опционально для обратной совместимости со старыми сохранёнными задачами.
+    total_prev_matched: Optional[int] = 0
     total_preclusters: int
     current_total_dtp: int
     current_deaths: int
@@ -117,6 +122,15 @@ class ClusterItem(BaseModel):
     dates: List[str] = []
     dynamics: Dict[str, Any] = {}
     camera_match: Optional[Dict[str, Any]] = None
+    # Флаги для фильтрации на фронтенде:
+    #   is_lost=True — очаг прошлого периода, в текущем исчез (ДТП ниже порога).
+    #     В Top-10 текущих очагов не должен попадаться.
+    #   is_prev_matched=True — АППГ-очаг, повторённый в текущем (дубликат
+    #     повторного). Тоже исключается из Top-10 текущих.
+    # Без этих полей Pydantic молча отбрасывает их при ClusterItem(**c),
+    # и фронтенд видит is_lost=undefined → фильтр !is_lost всегда true.
+    is_lost: bool = False
+    is_prev_matched: bool = False
 
 
 class ClustersResult(BaseModel):
@@ -289,12 +303,14 @@ async def get_clusters_status(
     task = _require_done_task(task_id, user)
     state = task.clusters_state
 
-    # Long polling: ждём, пока статус running, до `wait` секунд
+    # Long polling: ждём, пока статус running, до `wait` секунд.
+    # time.monotonic() предпочтительнее asyncio.get_event_loop().time()
+    # (тот устарел в Python 3.10+ и выдаёт DeprecationWarning).
     if wait > 0 and state.status == AnalysisStatus.RUNNING:
-        deadline = asyncio.get_event_loop().time() + min(wait, 60)
+        deadline = time.monotonic() + min(wait, 60)
         while (
             state.status == AnalysisStatus.RUNNING
-            and asyncio.get_event_loop().time() < deadline
+            and time.monotonic() < deadline
         ):
             await asyncio.sleep(1)
 
@@ -621,12 +637,14 @@ async def get_llm_summary_status(
     task = _require_done_task(task_id, user)
     state = task.llm_summary_state
 
-    # Long polling: ждём, пока статус running, до `wait` секунд
+    # Long polling: ждём, пока статус running, до `wait` секунд.
+    # time.monotonic() предпочтительнее asyncio.get_event_loop().time()
+    # (тот устарел в Python 3.10+ и выдаёт DeprecationWarning).
     if wait > 0 and state.status == AnalysisStatus.RUNNING:
-        deadline = asyncio.get_event_loop().time() + min(wait, 60)
+        deadline = time.monotonic() + min(wait, 60)
         while (
             state.status == AnalysisStatus.RUNNING
-            and asyncio.get_event_loop().time() < deadline
+            and time.monotonic() < deadline
         ):
             await asyncio.sleep(1)
 
@@ -721,6 +739,7 @@ def _clusters_result_to_response(result: Optional[dict]) -> Optional[ClustersRes
     summary = ClustersSummary(
         total_clusters=result.get("total_clusters", 0),
         total_lost=result.get("total_lost", 0),
+        total_prev_matched=result.get("total_prev_matched", 0),
         total_preclusters=result.get("total_preclusters", 0),
         current_total_dtp=result.get("current_total_dtp", 0),
         current_deaths=result.get("current_deaths", 0),
