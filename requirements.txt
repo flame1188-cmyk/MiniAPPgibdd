@@ -27,6 +27,16 @@ shapely==2.0.6
 # отсюда (а не из miniapp/backend/requirements.txt).
 psycopg[binary,pool]>=3.2,<4
 
+# --- Rate limiting (Фаза 1.5) ---
+# slowapi — лимит запросов на пользователя (60 req/min по умолчанию).
+# Защищает от зацикленных клиентов и bug-induced retry storms.
+slowapi>=0.1.9
+
+# --- Prometheus metrics (Фаза 1.6) ---
+# prometheus-fastapi-instrumentator — автометрики HTTP-запросов + кастомные.
+# /metrics endpoint для Prometheus scrape.
+prometheus-fastapi-instrumentator>=7.0.0
+
 # --- НП БДД module ---
 # jsonschema — для валидации freeze/history/plans/vehicles JSON.
 # openpyxl — уже выше (для converter.py, читает Excel).
