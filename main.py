@@ -276,6 +276,19 @@ async def lifespan(app: FastAPI):
                         f"Cleanup: удалено {removed} старых задач "
                         f"(старше 24 часов)"
                     )
+                # Этап 3: чистим протухшие карточки в dtp_cards_cache.
+                # Записи с expires_at < NOW() игнорируются при SELECT,
+                # но физически занимают место — удаляем.
+                try:
+                    from miniapp.backend.db.cards_cache import cleanup_old_cards
+                    cards_removed = await cleanup_old_cards()
+                    if cards_removed > 0:
+                        logger.info(
+                            f"Cleanup: удалено {cards_removed} протухших "
+                            f"записей кэша карточек"
+                        )
+                except Exception as ce:
+                    logger.warning(f"Cleanup cards_cache error: {ce}")
             except asyncio.CancelledError:
                 logger.info("Cleanup loop cancelled")
                 break
@@ -434,6 +447,24 @@ async def health_db():
     """Детальный health-check пула PostgreSQL (для диагностики)."""
     from miniapp.backend.db.connection import health_check as db_health_check
     return await db_health_check()
+
+
+@app.get("/health/db/cards")
+async def health_db_cards():
+    """
+    Статистика кэша карточек ДТП в PostgreSQL (Этап 3).
+
+    Возвращает:
+    - configured / ready — состояние БД
+    - total_entries — всего записей в dtp_cards_cache (включая протухшие)
+    - valid_entries — валидных записей (expires_at > NOW())
+    - total_cards_cached — суммарное количество ДТП в валидных записях
+    - regions_cached — сколько регионов имеют валидные записи
+    - oldest_expiry / newest_expiry — диапазон TTL
+    - top_regions — топ-5 регионов по размеру кэша
+    """
+    from miniapp.backend.db.cards_cache import get_cache_stats
+    return await get_cache_stats()
 
 
 @app.get("/")

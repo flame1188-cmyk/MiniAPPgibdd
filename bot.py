@@ -185,7 +185,18 @@ def _log_memory(label: str) -> int:
 # ========================
 # Глобальный кэш данных выгрузки (модуль data_cache.py)
 # ========================
+# data_cache.get_async/put_async/invalidate_by_region_async — async-обёртки
+# (Этап 3): сначала БД PostgreSQL, потом in-memory LRU fallback.
+# data_cache.get/put/invalidate_by_region — sync-методы (in-memory only),
+# оставлены для мест, где нельзя использовать await (например, в
+# _get_analytics_cards/_get_analytics_prev_cards — это не async-функции).
 from data_cache import data_cache  # noqa: E402
+from data_cache import (  # noqa: E402
+    get_async as data_cache_get_async,
+    put_async as data_cache_put_async,
+    invalidate_by_region_async as data_cache_invalidate_region_async,
+    has_async as data_cache_has_async,
+)
 
 # ========================
 # Защита от гонок при concurrent_updates=True (БАГ 5)
@@ -368,8 +379,8 @@ async def _fetch_cards_for_period(
     """
     import httpx as _httpx
 
-    # --- Глобальный кэш: проверяем перед скачиванием ---
-    cached = data_cache.get(reg_code, dat_list)
+    # --- Глобальный кэш: проверяем перед скачиванием (БД + in-memory) ---
+    cached = await data_cache_get_async(reg_code, dat_list)
     if cached is not None:
         cards, errors = cached
         logger.info(
@@ -485,9 +496,9 @@ async def _fetch_cards_for_period(
                         f"[{type(e).__name__}] {error_brief(e)}"
                     )
 
-    # --- Глобальный кэш: сохраняем результат ---
+    # --- Глобальный кэш: сохраняем результат (БД + in-memory) ---
     if cache_result and cards:
-        data_cache.put(reg_code, dat_list, cards, errors)
+        await data_cache_put_async(reg_code, dat_list, cards, errors)
 
     return cards, errors
 
@@ -1036,9 +1047,10 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _clear_analytics_data(context.user_data)
                 if _old_reg and _old_reg != reg_code:
                     # Удаляем ВСЕ записи старого региона из data_cache
-                    # (используем invalidate_by_region вместо selective
-                    #  invalidate — надёжнее, не зависит от формата дат)
-                    removed = data_cache.invalidate_by_region(_old_reg)
+                    # (используем invalidate_by_region_async вместо selective
+                    #  invalidate — надёжнее, не зависит от формата дат.
+                    #  Чистит и БД, и in-memory LRU.)
+                    removed = await data_cache_invalidate_region_async(_old_reg)
                     _freed = gc.collect()
                     logger.info(
                         f"Смена региона: {_old_reg} -> {reg_code}, "
@@ -1393,12 +1405,13 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 _mem_before = _log_memory("Смена данных: ПАМЯТЬ ДО очистки")
 
                 if _old_reg_for_cache:
-                    removed = data_cache.invalidate_by_region(_old_reg_for_cache)
+                    removed = await data_cache_invalidate_region_async(_old_reg_for_cache)
                     logger.info(
                         f"Смена данных: из кэша удалено {removed} записей региона {_old_reg_for_cache}"
                     )
                 else:
-                    # reg_code отсутствует — очищаем весь кэш на всякий случай
+                    # reg_code отсутствует — очищаем весь in-memory кэш на всякий случай.
+                    # (БД не трогаем — там могут быть валидные записи других пользователей.)
                     data_cache.clear()
                     logger.info("Смена данных: reg_code отсутствует, кэш полностью очищен")
 
@@ -1827,8 +1840,8 @@ async def _preload_prev_year(
     prev_year = period.year - 1
     dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
 
-    # Не скачиваем, если уже в кэше
-    if data_cache.get(reg_code, dat_list_prev) is not None:
+    # Не скачиваем, если уже в кэше (БД или in-memory)
+    if await data_cache_has_async(reg_code, dat_list_prev):
         logger.info(
             f"Preload: данные за прошлый год уже в кэше "
             f"(reg={reg_code}, {len(dat_list_prev)} мес)"
@@ -1962,9 +1975,9 @@ async def _run_analysis(
     cached_prev = context.user_data.get("analytics_prev_cards", [])
     cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
-    # Также проверяем глобальный кэш (может заполнен preload-задачей)
+    # Также проверяем глобальный кэш (БД + in-memory; может быть заполнен preload-задачей)
     if (not cached_prev or cached_prev_label != prev_label):
-        global_cached = data_cache.get(reg_code, dat_list_prev)
+        global_cached = await data_cache_get_async(reg_code, dat_list_prev)
         if global_cached is not None:
             cached_prev, _ = global_cached
             cached_prev_label = prev_label
@@ -2451,7 +2464,7 @@ async def _run_concentration_points(
         cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
         if (not cached_prev or cached_prev_label != prev_label):
-            global_cached = data_cache.get(reg_code, dat_list_prev)
+            global_cached = await data_cache_get_async(reg_code, dat_list_prev)
             if global_cached is not None:
                 cached_prev, _ = global_cached
                 cached_prev_label = prev_label

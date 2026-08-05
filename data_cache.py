@@ -162,3 +162,88 @@ class _DataCache:
 
 # Глобальный экземпляр
 data_cache = _DataCache()
+
+
+# ============================================================
+# Async-обёртки для PostgreSQL (Этап 3)
+# ============================================================
+# Эти функции пытаются сначала обратиться к БД через
+# miniapp.backend.db.cards_cache. Если БД готова и запись есть —
+# возвращают её. Если БД не готова — прозрачный fallback на
+# существующий in-memory LRU (data_cache.get/put/etc).
+#
+# In-memory LRU всегда обновляется параллельно с БД (см. реализацию
+# в cards_cache.py: put_cached_cards пишет и в БД, и в _memory_cache).
+# Это даёт двухуровневый кэш:
+#   L1 = in-memory (быстро, per-process, ограничен 100 записями)
+#   L2 = PostgreSQL (персистентно, разделяется между воркерами)
+#
+# Все bot._fetch_cards_for_period и preload-функции переведены
+# на эти async-обёртки.
+async def get_async(reg_code: str, dat_list: list[str]) -> tuple[list[dict], list[str]] | None:
+    """
+    Async-версия get(): сначала БД, потом in-memory fallback.
+
+    Возвращает (cards, errors) или None.
+    """
+    # 1. Сначала проверяем БД (L2) — там могут быть данные, которых
+    #    ещё нет в in-memory L1 (например, после рестарта или если
+    #    другой воркер их сохранил).
+    try:
+        from miniapp.backend.db.cards_cache import get_cached_cards
+        db_result = await get_cached_cards(reg_code, dat_list)
+        if db_result is not None:
+            return db_result
+    except Exception as e:
+        logger.debug(f"data_cache.get_async: DB lookup failed: {e}")
+
+    # 2. Fallback на in-memory LRU (L1)
+    return data_cache.get(reg_code, dat_list)
+
+
+async def put_async(
+    reg_code: str,
+    dat_list: list[str],
+    cards: list[dict],
+    errors: list[str],
+    source: str = "api",
+) -> None:
+    """
+    Async-версия put(): пишет и в БД (L2), и в in-memory (L1).
+
+    Если БД недоступна — пишет только в in-memory, поведение
+    идентично тому, что было до Этапа 3.
+    """
+    # 1. In-memory LRU — всегда (быстрый путь, не зависит от БД)
+    data_cache.put(reg_code, dat_list, cards, errors)
+
+    # 2. БД — если готова
+    try:
+        from miniapp.backend.db.cards_cache import put_cached_cards
+        await put_cached_cards(reg_code, dat_list, cards, errors, source=source)
+    except Exception as e:
+        logger.debug(f"data_cache.put_async: DB write failed: {e}")
+
+
+async def invalidate_by_region_async(reg_code: str) -> int:
+    """
+    Async-версия invalidate_by_region(): чистит БД и in-memory.
+
+    Возвращает количество удалённых записей (max из DB/memory).
+    """
+    # 1. In-memory — синхронно, быстро
+    memory_removed = data_cache.invalidate_by_region(reg_code)
+
+    # 2. БД — если готова
+    try:
+        from miniapp.backend.db.cards_cache import invalidate_region
+        db_removed = await invalidate_region(reg_code)
+        return max(db_removed, memory_removed)
+    except Exception as e:
+        logger.debug(f"data_cache.invalidate_by_region_async: DB failed: {e}")
+        return memory_removed
+
+
+async def has_async(reg_code: str, dat_list: list[str]) -> bool:
+    """Async-проверка наличия валидной записи в кэше."""
+    return await get_async(reg_code, dat_list) is not None
