@@ -26,7 +26,16 @@ logger = logging.getLogger(__name__)
 # Настройки кэша
 # ========================
 _MAX_ENTRIES = 100       # максимум записей в кэше
-_TTL_SECONDS = 3600      # время жизни записи (1 час)
+
+# TTL берётся из env CARDS_CACHE_TTL_SECONDS (по умолчанию 3600 = 1 час),
+# чтобы in-memory LRU и PostgreSQL-кэш использовали одинаковое время жизни.
+# Это важно: если TTL рассинхронизируется, в L1 будут записи, которых
+# уже нет в L2 (и наоборот) — плохо для диагностики.
+try:
+    from config import CARDS_CACHE_TTL_SECONDS
+    _TTL_SECONDS = CARDS_CACHE_TTL_SECONDS
+except Exception:
+    _TTL_SECONDS = 3600
 
 
 class _DataCache:
