@@ -911,16 +911,19 @@ async def start_clusters_calculation(task: Task) -> None:
                     continue
 
             from ..db.clusters_cache import get_cached_clusters
-            cached_result = await get_cached_clusters(
+            cached = await get_cached_clusters(
                 reg_code=task.region_code,
                 current_dat_list=task.dat_list,
                 prev_dat_list=prev_dat_list_for_cache if prev_dat_list_for_cache else None,
             )
-            if cached_result is not None:
+            if cached is not None:
                 # Кэш хит — подставляем result и выходим.
-                # raw_clusters остаются пустыми — они нужны только для
-                # Excel-выгрузки и продвинутой карты, при их запросе
-                # будет сделан перерасчёт (cache miss).
+                # Если в кэше есть raw_clusters / raw_preclusters —
+                # восстанавливаем их тоже, иначе карта/Excel упадут в fallback.
+                cached_result = cached["result"]
+                cached_raw_clusters = cached.get("raw_clusters")
+                cached_raw_preclusters = cached.get("raw_preclusters")
+
                 task.clusters_state.result = cached_result
                 task.clusters_state.status = AnalysisStatus.DONE
                 task.clusters_state.progress = 100
@@ -928,10 +931,20 @@ async def start_clusters_calculation(task: Task) -> None:
                 task.clusters_state.started_at = datetime.now(timezone.utc)
                 task.clusters_state.finished_at = datetime.now(timezone.utc)
 
+                # Восстанавливаем raw-данные для карты/Excel.
+                # Если они None (старая запись без raw_clusters) — оставляем
+                # пустыми, generate_clusters_map_html сам упадёт в simple map.
+                if cached_raw_clusters is not None:
+                    task.raw_clusters = cached_raw_clusters
+                if cached_raw_preclusters is not None:
+                    task.raw_preclusters = cached_raw_preclusters
+
+                has_raw = bool(cached_raw_clusters or cached_raw_preclusters)
                 logger.info(
                     f"Task {task.id}: clusters loaded from cache — "
                     f"{cached_result.get('total_clusters', 0)} очагов, "
-                    f"{cached_result.get('total_preclusters', 0)} предочагов"
+                    f"{cached_result.get('total_preclusters', 0)} предочагов, "
+                    f"raw={'yes' if has_raw else 'no (fallback to simple map)'}"
                 )
                 return
         except Exception as exc:
@@ -1089,11 +1102,16 @@ async def start_clusters_calculation(task: Task) -> None:
         state.stage = "Готово"
         state.finished_at = datetime.now(timezone.utc)
 
-        # === Этап 4: сохраняем result в кэш очагов ===
+        # === Этап 4: сохраняем result + raw_clusters в кэш очагов ===
         # Ключ: (reg_code, current_dat_hash, prev_dat_hash).
         # prev_dat_list вычислен в начале функции (prev_dat_list_for_cache).
         # Если совпадёт с повторным запросом — следующий пользователь
         # получит результат мгновенно (cache hit).
+        #
+        # Важно: сохраняем не только result, но и raw_clusters +
+        # raw_preclusters. Иначе при cache hit карта упадёт в
+        # fallback (simple map без слоёв), а Excel вернёт None —
+        # оба метода итерируют cluster["cards"], которых в result нет.
         try:
             from ..db.clusters_cache import put_cached_clusters
             await put_cached_clusters(
@@ -1101,6 +1119,8 @@ async def start_clusters_calculation(task: Task) -> None:
                 current_dat_list=task.dat_list,
                 prev_dat_list=prev_dat_list_for_cache if prev_dat_list_for_cache else None,
                 result=result,
+                raw_clusters=clusters,
+                raw_preclusters=preclusters_raw,
             )
         except Exception as exc:
             logger.debug(
