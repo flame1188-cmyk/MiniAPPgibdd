@@ -146,3 +146,64 @@ CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_expires
 -- Для invalidate_by_region — быстрое удаление всех записей региона.
 CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_reg
     ON dtp_cards_cache(reg_code);
+
+
+-- ============================================================
+-- clusters_cache: кэш очагов концентрации ДТП (Этап 4).
+-- Хранит финальный сериализованный result расчёта очагов
+-- (clusters_state.result), чтобы повторные запросы по тому же
+-- региону+периоду не пересчитывали 15-30 секунд.
+--
+-- Ключ кэша: (reg_code, current_dat_hash, prev_dat_hash) где
+--   current_dat_hash = MD5(sorted(current_dat_list).join(','))
+--   prev_dat_hash    = MD5(sorted(prev_dat_list).join(',')) или NULL
+--
+-- Размер записи: 50-200 KB (зависит от количества очагов).
+-- TTL: expires_at = created_at + TTL_SECONDS (по умолчанию 6 часов,
+--      настраивается через env CLUSTERS_CACHE_TTL_SECONDS).
+--
+-- Что НЕ кэшируется:
+--   - raw_clusters (с координатами всех карточек) — остаются in-memory,
+--     пересчитываются из task.cards + result при необходимости.
+--   - HTML-карта — генерируется из result при запросе.
+--   - OSM-полигоны — кэшируются отдельно в data/osm_cache/.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clusters_cache (
+    id                  BIGSERIAL    PRIMARY KEY,
+    reg_code            VARCHAR(16)  NOT NULL,
+    current_dat_hash    CHAR(32)     NOT NULL,
+    prev_dat_hash       CHAR(32),                          -- NULL если без АППГ
+    current_dat_list    JSONB        NOT NULL,             -- ["1.2026","2.2026",...]
+    prev_dat_list       JSONB,                             -- ["1.2025","2.2025",...] или NULL
+    payload             JSONB        NOT NULL,             -- финальный result (clusters_state.result)
+    total_clusters      INT          NOT NULL DEFAULT 0,
+    total_preclusters   INT          NOT NULL DEFAULT 0,
+    has_prev_data       BOOLEAN      NOT NULL DEFAULT FALSE,
+    current_label       TEXT,
+    prev_label          TEXT,
+    region_name         TEXT,
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    expires_at          TIMESTAMPTZ  NOT NULL
+);
+
+-- Уникальный индекс на составной ключ с COALESCE для NULL-безопасности.
+-- Важно: prev_dat_hash может быть NULL (АППГ не используется),
+-- и без COALESCE уникальность NULL-NULL не сработала бы (NULL != NULL
+-- в SQL). Используем COALESCE(prev_dat_hash, '') для индекса.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_clusters_cache_keys
+    ON clusters_cache(reg_code, current_dat_hash,
+                      COALESCE(prev_dat_hash, ''::text));
+
+-- Для частого запроса GET:
+--   WHERE reg_code=? AND current_dat_hash=? AND prev_dat_hash=?
+--   AND expires_at > NOW()
+CREATE INDEX IF NOT EXISTS idx_clusters_cache_keys_expires
+    ON clusters_cache(reg_code, current_dat_hash, prev_dat_hash, expires_at);
+
+-- Для cleanup_old_clusters — быстрый поиск протухших.
+CREATE INDEX IF NOT EXISTS idx_clusters_cache_expires
+    ON clusters_cache(expires_at);
+
+-- Для invalidate_by_region — быстрое удаление всех записей региона.
+CREATE INDEX IF NOT EXISTS idx_clusters_cache_reg
+    ON clusters_cache(reg_code);
