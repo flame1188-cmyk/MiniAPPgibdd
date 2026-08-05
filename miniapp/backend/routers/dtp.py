@@ -23,7 +23,7 @@ from ..services.gibdd_service import (
     TaskStatus,
     create_task,
     execute_task,
-    get_task,
+    get_task_async,
     list_user_tasks,
     parse_user_query,
 )
@@ -168,6 +168,20 @@ async def create_dtp_task(
         raw_query=raw_query,
     )
 
+    # Аудит обращения к ПДн (152-ФЗ): пользователь создал задачу выгрузки.
+    # Логируем регион/период — этого достаточно для журнала доступа.
+    try:
+        from ..db.repository import log_access
+        await log_access(
+            user_id=user.id,
+            action="create_task",
+            region_code=region_code,
+            period_label=period_label,
+            task_id=task.id,
+        )
+    except Exception:
+        pass  # аудит не должен ронять создание задачи
+
     # Асинхронный запуск в фоне — execute_task сам обновляет статус
     asyncio_create_task(task.id)
 
@@ -196,7 +210,7 @@ async def list_tasks(
     limit: int = 20,
 ):
     """Возвращает последние N задач пользователя."""
-    tasks = list_user_tasks(user.id, limit=limit)
+    tasks = await list_user_tasks(user.id, limit=limit)
     return [_task_to_response(t) for t in tasks]
 
 
@@ -206,7 +220,7 @@ async def get_task_status(
     user: TelegramUser = Depends(get_current_user),
 ):
     """Возвращает статус задачи (для polling из frontend)."""
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if not task:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -226,7 +240,7 @@ async def list_task_files(
     user: TelegramUser = Depends(get_current_user),
 ):
     """Возвращает список файлов, сгенерированных задачей."""
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
     return [TaskFileSchema(**f) for f in task.files]
@@ -241,7 +255,7 @@ async def get_task_map(
     Отдаёт HTML-карту (inline Leaflet с кластеризацией).
     Используется в <iframe> на frontend.
     """
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -270,7 +284,7 @@ async def download_file(
 
     file_type: 'dtp_cards' | 'dtp_participants' | 'map_html'
     """
-    task = get_task(task_id)
+    task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 

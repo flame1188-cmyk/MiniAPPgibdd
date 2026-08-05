@@ -246,7 +246,12 @@ def create_task(
     dat_list: List[str],
     raw_query: str,
 ) -> Task:
-    """Создаёт новую задачу и возвращает её объект."""
+    """Создаёт новую задачу и возвращает её объект.
+
+    Задача сохраняется:
+    - В in-memory _tasks (для совместимости со старым кодом)
+    - В БД через repository.save_task (если DATABASE_URL задан)
+    """
     task_id = uuid.uuid4().hex[:12]
     task = Task(
         id=task_id,
@@ -258,19 +263,111 @@ def create_task(
         raw_query=raw_query,
     )
     _tasks[task_id] = task
+
+    # Асинхронно сохраняем в БД (если доступна).
+    # Fire-and-forget — задача уже в in-memory и доступна сразу.
+    try:
+        from ..db.repository import save_task
+        asyncio.create_task(save_task(task))
+    except Exception as exc:
+        logger.debug(f"create_task: DB save skipped: {exc}")
+
     return task
 
 
+async def get_task_async(task_id: str) -> Optional[Task]:
+    """Асинхронная версия get_task — проверяет и БД, и in-memory."""
+    # Сначала in-memory (быстро + есть тяжёлые поля)
+    if task_id in _tasks:
+        return _tasks[task_id]
+
+    # Потом БД (если есть)
+    try:
+        from ..db.connection import is_db_ready
+        from ..db.repository import load_task, attach_heavy_state
+        if not is_db_ready():
+            return None
+        task = await load_task(task_id, _task_factory)
+        if task is not None:
+            attach_heavy_state(task)
+            _tasks[task_id] = task  # кэшируем
+        return task
+    except Exception as exc:
+        logger.debug(f"get_task_async: DB load failed: {exc}")
+        return _tasks.get(task_id)
+
+
 def get_task(task_id: str) -> Optional[Task]:
-    """Возвращает задачу по ID или None."""
+    """Возвращает задачу по ID или None (синхронная версия).
+
+    ВНИМАНИЕ: проверяет только in-memory кэш. Если задача существует
+    только в БД (например, после рестарта процесса) — вернёт None.
+    Используйте get_task_async() для полной проверки (БД + memory).
+    """
     return _tasks.get(task_id)
 
 
-def list_user_tasks(user_id: int, limit: int = 20) -> List[Task]:
-    """Возвращает последние N задач пользователя."""
-    user_tasks = [t for t in _tasks.values() if t.user_id == user_id]
-    user_tasks.sort(key=lambda t: t.created_at, reverse=True)
-    return user_tasks[:limit]
+def _task_factory(
+    id: str,
+    user_id: int,
+    region_code: str,
+    region_name: str,
+    period_label: str,
+    dat_list: List[str],
+    raw_query: str,
+) -> Task:
+    """Фабрика Task для repository.load_task (без циклического импорта)."""
+    return Task(
+        id=id,
+        user_id=user_id,
+        region_code=region_code,
+        region_name=region_name,
+        period_label=period_label,
+        dat_list=dat_list,
+        raw_query=raw_query,
+    )
+
+
+async def list_user_tasks(user_id: int, limit: int = 20) -> List[Task]:
+    """Возвращает последние N задач пользователя.
+
+    При наличии БД — из БД (consistent между воркерами).
+    Иначе — из in-memory _tasks.
+    """
+    # Сначала in-memory (быстро + содержит тяжёлые поля)
+    user_tasks_in_memory = [
+        t for t in _tasks.values() if t.user_id == user_id
+    ]
+    user_tasks_in_memory.sort(key=lambda t: t.created_at, reverse=True)
+
+    # Проверяем готовность БД (lazy import чтобы избежать циклов)
+    try:
+        from ..db.connection import is_db_ready
+    except Exception:
+        is_db_ready = lambda: False  # noqa: E731
+
+    if not is_db_ready():
+        return user_tasks_in_memory[:limit]
+
+    try:
+        from ..db.repository import list_user_tasks_from_db, attach_heavy_state
+        db_tasks = await list_user_tasks_from_db(user_id, limit, _task_factory)
+        # Присоединяем тяжёлые поля из кэша (если есть)
+        for t in db_tasks:
+            attach_heavy_state(t)
+
+        # Если в БД задач больше, чем в памяти (например, после рестарта) —
+        # дополняем список из БД. Если в памяти есть задача, которой нет в БД
+        # (например, только что создана, save_task ещё не завершился) —
+        # включаем её в результат, убирая дубли.
+        seen_ids = {t.id for t in db_tasks}
+        for t in user_tasks_in_memory:
+            if t.id not in seen_ids:
+                db_tasks.insert(0, t)  # свежие — первыми
+        return db_tasks[:limit]
+    except Exception as exc:
+        logger.debug(f"list_user_tasks: DB query failed: {exc}")
+        return user_tasks_in_memory[:limit]
 
 
 def _task_dir(task_id: str) -> Path:
@@ -290,16 +387,32 @@ async def execute_task(task_id: str) -> None:
     2. PARSING — генерация Excel-данных через gibdd_parser
     3. ANALYTICS — расчёт метрик через analytics.calculate_metrics
     4. GENERATING — запись Excel-файлов и HTML-карты
+
+    На каждом переходе статуса — сохранение в БД через repository.save_task
+    (если DATABASE_URL задан; иначе работает только in-memory).
     """
     task = _tasks.get(task_id)
     if not task:
-        return
+        # Возможно, задача создана в другом воркере и есть в БД.
+        task = await get_task_async(task_id)
+        if not task:
+            return
+        _tasks[task_id] = task
+
+    # Локальный helper дляpersist-апдейтов
+    async def _persist() -> None:
+        try:
+            from ..db.repository import save_task
+            await save_task(task)
+        except Exception as exc:
+            logger.debug(f"execute_task: persist failed: {exc}")
 
     try:
         # === 1. FETCHING ===
         task.status = TaskStatus.FETCHING
         task.progress = 10
         task.updated_at = datetime.now(timezone.utc)
+        await _persist()
 
         bot_module = _import_module("bot")
 
@@ -324,6 +437,7 @@ async def execute_task(task_id: str) -> None:
                 f"Ошибки: {'; '.join(errors[:3]) if errors else 'нет данных'}"
             )
             task.updated_at = datetime.now(timezone.utc)
+            await _persist()
             return
 
         # Сводная статистика для отображения
@@ -339,6 +453,7 @@ async def execute_task(task_id: str) -> None:
         task.status = TaskStatus.PARSING
         task.progress = 45
         task.updated_at = datetime.now(timezone.utc)
+        await _persist()
 
         gibdd_parser = _import_module("gibdd_parser")
         file1_data = gibdd_parser.build_file1_data(cards)
@@ -348,6 +463,7 @@ async def execute_task(task_id: str) -> None:
         task.status = TaskStatus.ANALYTICS
         task.progress = 65
         task.updated_at = datetime.now(timezone.utc)
+        await _persist()
 
         try:
             analytics_module = _import_module("analytics")
@@ -389,11 +505,13 @@ async def execute_task(task_id: str) -> None:
                 "total_injured": task.total_injured,
                 "has_prev_data": False,
             }
+        await _persist()  # сохраняем analytics в БД
 
         # === 4. GENERATING ===
         task.status = TaskStatus.GENERATING
         task.progress = 80
         task.updated_at = datetime.now(timezone.utc)
+        await _persist()
 
         out_dir = _task_dir(task_id)
         region_safe = "".join(
@@ -495,6 +613,7 @@ async def execute_task(task_id: str) -> None:
         task.status = TaskStatus.DONE
         task.progress = 100
         task.updated_at = datetime.now(timezone.utc)
+        await _persist()
 
         logger.info(
             f"Task {task_id} done: {task.total_dtp} ДТП, "
@@ -507,6 +626,7 @@ async def execute_task(task_id: str) -> None:
         task.status = TaskStatus.FAILED
         task.error = str(exc)
         task.updated_at = datetime.now(timezone.utc)
+        await _persist()
 
 
 # ============================================================
@@ -925,6 +1045,13 @@ async def start_clusters_calculation(task: Task) -> None:
         state.stage = "Готово"
         state.finished_at = datetime.now(timezone.utc)
 
+        # Персистим clusters_result в БД (чтобы пережил рестарт)
+        try:
+            from ..db.repository import save_task
+            await save_task(task)
+        except Exception as exc:
+            logger.debug(f"Task {task.id}: clusters persist failed: {exc}")
+
         logger.info(
             f"Task {task.id}: clusters done — "
             f"{len(current_only)} очагов, "
@@ -939,6 +1066,12 @@ async def start_clusters_calculation(task: Task) -> None:
         state.error = str(exc)
         state.stage = "Ошибка"
         state.finished_at = datetime.now(timezone.utc)
+        # Персистим failed-статус
+        try:
+            from ..db.repository import save_task
+            await save_task(task)
+        except Exception:
+            pass
 
 
 def _serialize_cluster(c: dict) -> dict:
@@ -1808,14 +1941,30 @@ def get_llm_providers_status() -> Dict[str, bool]:
 # ============================================================
 # Очистка старых задач (для периодического вызова)
 # ============================================================
-def cleanup_old_tasks(max_age_hours: int = 24) -> int:
+async def cleanup_old_tasks(max_age_hours: int = 24) -> int:
     """
     Удаляет задачи старше max_age_hours.
+
+    Удаляет из:
+    - In-memory _tasks и тяжёлого state (db/repository._TASKS_HEAVY_STATE)
+    - БД (если доступна) — через repository.delete_old_tasks
+    - Диска — data/tasks/{task_id}/
+
     Возвращает количество удалённых задач.
     """
+    # 1. Через repository (БД + memory + диск)
+    deleted = 0
+    try:
+        from ..db.repository import delete_old_tasks, drop_heavy_state
+        deleted = await delete_old_tasks(max_age_hours, _PROJECT_ROOT)
+    except Exception as exc:
+        logger.warning(f"cleanup_old_tasks: repository call failed: {exc}")
+
+    # 2. In-memory _tasks очистка (дублирует, но безопасно — на случай
+    # если repository не подхватил что-то, или БД недоступна и fallback
+    # в repository отработал не полностью)
     now = datetime.now(timezone.utc)
     cutoff = now.timestamp() - max_age_hours * 3600
-
     to_delete = [
         tid for tid, task in _tasks.items()
         if task.created_at.timestamp() < cutoff
@@ -1823,13 +1972,11 @@ def cleanup_old_tasks(max_age_hours: int = 24) -> int:
     for tid in to_delete:
         task = _tasks.pop(tid, None)
         if task:
-            # Удаляем файлы с диска
             for f in task.files:
                 try:
                     Path(f["path"]).unlink(missing_ok=True)
                 except Exception:
                     pass
-            # Удаляем директорию задачи
             try:
                 task_dir = _PROJECT_ROOT / "data" / "tasks" / tid
                 if task_dir.exists():
@@ -1837,6 +1984,8 @@ def cleanup_old_tasks(max_age_hours: int = 24) -> int:
             except Exception:
                 pass
 
-    if to_delete:
-        logger.info(f"Cleaned up {len(to_delete)} old tasks")
-    return len(to_delete)
+    if to_delete or deleted:
+        logger.info(
+            f"Cleaned up: in-memory={len(to_delete)}, total(inc. DB)={deleted}"
+        )
+    return max(deleted, len(to_delete))
