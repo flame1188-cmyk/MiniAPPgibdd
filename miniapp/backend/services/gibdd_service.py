@@ -522,10 +522,55 @@ async def execute_task(task_id: str) -> None:
         )[:20]
 
         # Excel: карточки ДТП + участники (генерируем оба файла одной функцией)
-        excel_gen = _import_module("excel_generator")
-        file1_bytes, file2_bytes = excel_gen.generate_both_files(
-            file1_data, file2_data
-        )
+        #
+        # === Этап 5: проверяем кэш готовых Excel-байтов в PostgreSQL ===
+        # Ключ (reg_code, dat_hash) совпадает с ключом dtp_cards_cache —
+        # это безопасно: Excel — производное от cards, если cards
+        # идентичны, то и Excel побайтово идентичен.
+        #
+        # Cache hit → пропускаем 5-8 сек excel_generator.generate_both_files()
+        # и сразу пишем байты на диск. Cache miss → генерируем как раньше,
+        # сохраняем в кэш для следующих пользователей.
+        file1_bytes: Optional[bytes] = None
+        file2_bytes: Optional[bytes] = None
+        try:
+            from ..db.excel_cache import get_cached_excel
+            cached_excel = await get_cached_excel(
+                reg_code=task.region_code,
+                dat_list=task.dat_list,
+            )
+            if cached_excel is not None:
+                file1_bytes, file2_bytes, _meta = cached_excel
+                logger.info(
+                    f"Task {task_id}: Excel loaded from cache — "
+                    f"~{(len(file1_bytes) + len(file2_bytes)) // 1024} KB"
+                )
+        except Exception as exc:
+            logger.debug(f"Task {task_id}: excel cache lookup failed: {exc}")
+
+        # Если кэш промахнулся — генерируем Excel штатно (5-8 сек).
+        if file1_bytes is None or file2_bytes is None:
+            excel_gen = _import_module("excel_generator")
+            file1_bytes, file2_bytes = excel_gen.generate_both_files(
+                file1_data, file2_data
+            )
+
+            # === Этап 5: сохраняем в кэш для следующих пользователей ===
+            try:
+                from ..db.excel_cache import put_cached_excel
+                await put_cached_excel(
+                    reg_code=task.region_code,
+                    dat_list=task.dat_list,
+                    file1_bytes=file1_bytes,
+                    file2_bytes=file2_bytes,
+                    total_dtp=task.total_dtp,
+                    total_dead=task.total_dead,
+                    total_injured=task.total_injured,
+                    region_name=task.region_name,
+                    period_label=task.period_label,
+                )
+            except Exception as exc:
+                logger.debug(f"Task {task_id}: excel cache put failed: {exc}")
 
         cards_path = out_dir / f"dtp_cards_{region_safe}_{period_safe}.xlsx"
         cards_path.write_bytes(file1_bytes)
