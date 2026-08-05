@@ -64,6 +64,25 @@ class Settings(BaseSettings):
         description="Домен вида bot1234.bothost.tech, который выдал bothost",
     )
 
+    # === Database (опционально) ===
+    database_url: str = Field(
+        default="",
+        description=(
+            "Connection string PostgreSQL. Если задан — задачи и аудит-лог "
+            "персистятся в БД; иначе работает in-memory fallback."
+        ),
+    )
+    db_pool_min: int = Field(default=1, description="Минимальный размер пула")
+    db_pool_max: int = Field(default=5, description="Максимальный размер пула")
+    db_connect_timeout: int = Field(
+        default=30, description="Таймаут подключения (сек)"
+    )
+
+    @property
+    def db_enabled(self) -> bool:
+        """True если DATABASE_URL задан и пул должен быть создан."""
+        return bool(self.database_url.strip())
+
     # === Вычисляемые ===
     @property
     def allowed_user_ids_list(self) -> List[int]:

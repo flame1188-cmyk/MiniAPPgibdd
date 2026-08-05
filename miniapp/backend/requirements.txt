@@ -20,6 +20,10 @@ python-dotenv==1.0.1
 # Geo (для concentration_points.py)
 shapely==2.0.6
 
+# Database (PostgreSQL через async-pool; opционально — если DATABASE_URL задан,
+# задачи и аудит-лог персистятся в БД; иначе работает in-memory fallback)
+psycopg[binary,pool]>=3.2,<4
+
 # Optional: LLM (включается, если нужен AI-анализ)
 # zhipuai==2.1.0
 
