@@ -222,3 +222,62 @@ CREATE INDEX IF NOT EXISTS idx_clusters_cache_expires
 -- Для invalidate_by_region — быстрое удаление всех записей региона.
 CREATE INDEX IF NOT EXISTS idx_clusters_cache_reg
     ON clusters_cache(reg_code);
+
+
+-- ============================================================
+-- excel_cache: кэш готовых Excel-файлов в PostgreSQL (Этап 5).
+-- Хранит байты двух файлов (Файл 1 «ДТП» + Файл 2 «Участники»),
+-- чтобы повторные запросы по тому же региону+периоду не пересчитывали
+-- 5-8 секунд excel_generator.generate_both_files().
+--
+-- Ключ кэша: (reg_code, dat_hash) — СОВПАДАЕТ с ключом dtp_cards_cache.
+-- Это не случайно: Excel — производное от cards (через gibdd_parser),
+-- поэтому одинаковый ключ гарантирует консистентность. Если cards
+-- инвалидированы — Excel тоже нужно инвалидировать (см. хук в cards_cache).
+--
+-- Размер записи: 1-2 MB (Файл 1 ~500 KB + Файл 2 ~1 MB).
+-- TTL: expires_at = created_at + TTL_SECONDS (по умолчанию 24 часа,
+--      настраивается через env EXCEL_CACHE_TTL_SECONDS).
+--
+-- Что НЕ кэшируется:
+--   - HTML-карта ДТП (generate_dtp_map) — генерируется по запросу.
+--   - Excel «Очаги» (generate_clusters_excel) — ключ другой:
+--     (reg_code, current_dat_hash, prev_dat_hash), кэш в clusters_cache.
+--   - analytics JSON — малый объём, генерируется быстро (~50 мс),
+--     кэшируется в tasks.analytics (persist в БД).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS excel_cache (
+    id              BIGSERIAL    PRIMARY KEY,
+    reg_code        VARCHAR(16)  NOT NULL,
+    dat_hash        CHAR(32)     NOT NULL,            -- MD5 hash (как в dtp_cards_cache)
+    dat_list        JSONB        NOT NULL,            -- ["1.2026","2.2026",...] для диагностики
+    file1_bytes     BYTEA        NOT NULL,            -- Файл 1 (ДТП) — XLSX
+    file2_bytes     BYTEA        NOT NULL,            -- Файл 2 (участники) — XLSX
+    file1_size      INT          NOT NULL DEFAULT 0,  -- размер Файла 1 в байтах
+    file2_size      INT          NOT NULL DEFAULT 0,  -- размер Файла 2 в байтах
+    total_dtp       INT          NOT NULL DEFAULT 0,
+    total_dead      INT          NOT NULL DEFAULT 0,
+    total_injured   INT          NOT NULL DEFAULT 0,
+    region_name     TEXT,
+    period_label    TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ  NOT NULL
+);
+
+-- Уникальный индекс: одна запись на (reg_code, dat_hash).
+-- На INSERT конфликтов (DO UPDATE) обновляем file*_bytes/expires_at.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_excel_cache_reg_dat
+    ON excel_cache(reg_code, dat_hash);
+
+-- Для частого запроса GET:
+--   WHERE reg_code=? AND dat_hash=? AND expires_at > NOW()
+CREATE INDEX IF NOT EXISTS idx_excel_cache_reg_dat_expires
+    ON excel_cache(reg_code, dat_hash, expires_at);
+
+-- Для cleanup_old_excel — быстрый поиск протухших.
+CREATE INDEX IF NOT EXISTS idx_excel_cache_expires
+    ON excel_cache(expires_at);
+
+-- Для invalidate_by_region — быстрое удаление всех записей региона.
+CREATE INDEX IF NOT EXISTS idx_excel_cache_reg
+    ON excel_cache(reg_code);
