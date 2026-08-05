@@ -25,6 +25,8 @@ Telegram-бот и веб-Mini App для выгрузки и анализа д�
 - **НП БДД (Национальный проект «Безопасные качественные дороги»):** история погибших, прогноз с сезонными коэффициентами, коридор прогноза, KPI-статус (ok/warning/danger), frozen-годы
 - **Web-fallback:** при ошибке API (5xx, ConnectionError) автоматически переключается на экспорт через сайт stat.gibdd.ru (POST генерация + GET скачивание XML)
 - **4-уровневый fallback справочника регионов:** API → файловый кэш → встроенный хардкод (82 региона) → пустой список
+- **Трёхуровневый кэш данных ДТП:** L1 in-memory LRU → L2 PostgreSQL (cards/clusters/excel) → L3 файловый кэш. Экономия до 18-28 сек на повторных запросах того же региона+периода
+- **Персистентность задач в PostgreSQL:** задачи выгрузки, кластеры и аудит-лог доступа к ПДн (152-ФЗ) хранятся в БД, переживают рестарт
 - **Ограничение доступа:** optional whitelist по Telegram user ID
 
 ### Очаги концентрации ДТП (методология v2)
@@ -149,6 +151,51 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
      .xlsx      .xlsx     .xlsx
 ```
 
+### Трёхуровневый кэш данных ДТП (L1 + L2 + L3)
+
+После загрузки и обработки данные кэшируются на трёх уровнях. На повторных запросах того же региона+периода генерация полностью пропускается:
+
+```
+Запрос (reg_code, dat_hash)
+       │
+       ▼
+┌─────────────────────────────────────────────────────┐
+│ L1: In-memory LRU (data_cache.py, 100 записей)       │
+│    cards + prev_cards in-process, мгновенный HIT     │
+└─────────────┬───────────────────────────────────────┘
+              │ miss
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ L2: PostgreSQL (модуль miniapp/backend/db/)          │
+│    • cards_cache    — JSONB с карточками ДТП          │
+│    • clusters_cache — JSONB с raw_clusters + metrics  │
+│    • excel_cache    — BYTEA с готовыми xlsx-файлами   │
+│    TTL=86400s (24ч), фоновая очистка каждые 2 часа    │
+└─────────────┬───────────────────────────────────────┘
+              │ miss
+              ▼
+┌─────────────────────────────────────────────────────┐
+│ L3: Файловый кэш (regions_cache, cameras, osm_cache)  │
+└─────────────┬───────────────────────────────────────┘
+              │ miss
+              ▼
+        Полная выгрузка из API/сайта ГИБДД
+```
+
+**Ключи кэша:**
+- `cards_cache`, `excel_cache`: `(reg_code, dat_hash)` — хэш списка dat (месяцев)
+- `clusters_cache`: `(reg_code, current_dat_hash, prev_dat_hash)` — зависит от пары периодов
+
+**Экономия на повторных запросах** (подтверждено в проде):
+
+| Stage | Что закэшировано | Экономия на HIT |
+|-------|------------------|-----------------|
+| Stage 3 | Карточки ДТП (cards_cache) | ~3-5 сек |
+| Stage 4 | Кластеры + raw_clusters (clusters_cache) | ~8-15 сек (DBSCAN) |
+| Stage 5 | Excel Файл 1 + Файл 2 (excel_cache) | ~7-8 сек |
+
+Совокупная экономия: **~18-28 сек** на повторном запросе. Кэш особенно эффективен, когда несколько сотрудников ГИБДД выгружают один регион за тот же период.
+
 ### Загрузка справочника регионов
 
 ```
@@ -241,6 +288,12 @@ cp .env.example .env
 | `PORT` | Порт FastAPI (bothost передаёт через `$PORT`) | Для production |
 | `CORS_ORIGINS` | Origins для CORS (URL Mini App + web.telegram.org) | Для production |
 | `ALLOWED_USER_IDS` | ID пользователей через запятую (пустое = доступ всем) | Нет |
+| `DATABASE_URL` | Connection string PostgreSQL (`postgresql://user:pass@host:port/db`). Если пусто — in-memory fallback | Для кэшей L2 |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | Размеры пула соединений (по умолчанию `1` / `5`) | Нет |
+| `DB_CONNECT_TIMEOUT` | Таймаут подключения к БД в секундах (по умолчанию `10`) | Нет |
+| `CARDS_CACHE_TTL_SECONDS` | TTL кэша карточек ДТП в PostgreSQL (по умолчанию `86400` = 24ч) | Нет |
+| `CLUSTERS_CACHE_TTL_SECONDS` | TTL кэша кластеров в PostgreSQL (по умолчанию `86400` = 24ч) | Нет |
+| `EXCEL_CACHE_TTL_SECONDS` | TTL кэша Excel-файлов в PostgreSQL (по умолчанию `86400` = 24ч) | Нет |
 | `LLM_API_KEY` | API-ключ [ZhipuAI](https://open.bigmodel.cn) для AI-анализа | Нет |
 | `LLM_MODEL` | Модель GLM (по умолчанию `glm-4.7-flash`) | Нет |
 | `ENABLE_NEWS_SEARCH` | Поиск новостей для контекста LLM (`true`/`false`, по умолчанию `true`) | Нет |
@@ -354,9 +407,17 @@ gibdd-bot/
 │   │   ├── config.py       ← Pydantic-settings
 │   │   ├── telegram_auth.py← Проверка подписи initData (HMAC-SHA256)
 │   │   ├── routers/        ← regions, parse, dtp, point, cameras, analyze, np_bdd
-│   │   └── services/
-│   │       ├── gibdd_service.py  ← Мост к модулям gibdd-bot
-│   │       └── np_bdd_service.py ← Сервис НП БДД
+│   │   ├── services/
+│   │   │   ├── gibdd_service.py  ← Мост к модулям gibdd-bot
+│   │   │   └── np_bdd_service.py ← Сервис НП БДД
+│   │   └── db/             ← Слой PostgreSQL (Этап 2-5)
+│   │       ├── connection.py     ← Async-пул (psycopg), init_pool/close_pool/health_check
+│   │       ├── schema.sql        ← CREATE TABLE IF NOT EXISTS: tasks, access_log,
+│   │       │                       dtp_cards_cache, clusters_cache, excel_cache
+│   │       ├── repository.py     ← TaskRepository: save/load/list/delete, log_access
+│   │       ├── cards_cache.py    ← L2-кэш карточек ДТП (Этап 3)
+│   │       ├── clusters_cache.py ← L2-кэш кластеров + raw_clusters (Этап 4)
+│   │       └── excel_cache.py    ← L2-кэш Excel-файлов (BYTEA, Этап 5)
 │   └── frontend/           ← Vite + React + TypeScript + Tailwind
 │       ├── src/
 │       │   ├── App.tsx     ← Главный layout с табами
@@ -382,7 +443,11 @@ gibdd-bot/
 
 | Метод | Путь | Описание |
 |---|---|---|
-| GET | `/health` | Health-check (статус бота, версия) |
+| GET | `/health` | Health-check (статус бота, версия, БД) |
+| GET | `/health/db` | Детальная диагностика PostgreSQL (пул, latency, schema) |
+| GET | `/health/db/cards` | Статистика cards_cache: записи, hits/misses, размер |
+| GET | `/health/db/clusters` | Статистика clusters_cache: записи, hits/misses, размер |
+| GET | `/health/db/excel` | Статистика excel_cache: записи, hits/misses, размер |
 | GET | `/api/regions` | Список регионов с кодами |
 | GET | `/api/regions/search?q=` | Поиск регионов (autocomplete) |
 | POST | `/api/parse` | Парсинг естественного языка → `{region_code, period}` |
@@ -441,7 +506,9 @@ gibdd-bot/
 
 | Endpoint | Что проверяет | Ожидаемый ответ |
 |----------|---------------|-----------------|
-| `https://<DOMAIN>/health` | Сервер жив | `{"status":"ok",...}` |
+| `https://<DOMAIN>/health` | Сервер жив, БД готова | `{"status":"ok","database":{"ready":true}}` |
+| `https://<DOMAIN>/health/db` | Диагностика PostgreSQL | `pool`, `latency_ms`, `tables` |
+| `https://<DOMAIN>/health/db/excel` | Статистика excel_cache | `entries`, `hits`, `misses` |
 | `https://<DOMAIN>/api/regions` | Авторизация | 401 (нужен initData) |
 | `https://<DOMAIN>/app/` | Frontend | HTML страница |
 | `https://<DOMAIN>/docs` | Swagger UI | Документация API |
@@ -463,6 +530,7 @@ gibdd-bot/
 | `python-dotenv` | 1.0.1 | Загрузка .env |
 | `shapely` | 2.0.6 | Геометрические операции (полигоны НП) |
 | `pydantic-settings` | 2.x | Конфигурация Mini App |
+| `psycopg[binary,pool]` | 3.2+ | Async-драйвер PostgreSQL + пул соединений (Этап 2-5) |
 | `pytz` | 2024.x | Таймзоны для НП БДД |
 
 Опционально (для AI-анализа):
@@ -533,6 +601,19 @@ npm run build
 
 ---
 
+## Требования 152-ФЗ
+
+⚠️ Mini App обрабатывает ПДн (данные участников ДТП). Для соответствия 152-ФЗ:
+
+1. **Хостинг в РФ**: bothost.ru / Timeweb Cloud / Selectel / Beget (все в реестре Минцифры)
+2. **TLS обязателен** (Let's Encrypt — бесплатно, на bothost включён автоматически)
+3. **Политика обработки ПДн** + **Согласие** при первом открытии Mini App
+4. **Уведомление Роскомнадзора** об обработке ПДн (через Госуслуги)
+5. **Журнал аудита доступа** к ПДн (логировать все запросы `user_id → region_code, period`)
+6. **Шифрование БД при rest** (LUKS для диска VPS, на bothost — на стороне хостера)
+
+---
+
 ## Устранение неполадок
 
 ### Бот не отвечает после деплоя
@@ -570,6 +651,20 @@ CORS_ORIGINS=https://bot1234.bothost.tech,https://web.telegram.org,https://a.tel
 ### Frontend не обновляется после деплоя
 
 Vite добавляет хэш к именам файлов (`index-AbCd1234.js`). Если старый `index.html` закеширован — он будет ссылаться на несуществующий файл. Решение: убедитесь, что bothost не кэширует `/app/` агрессивно, или добавьте version-busting.
+
+### PostgreSQL: кэш не срабатывает (всегда MISS)
+
+1. Проверьте `DATABASE_URL` в `.env` — без него приложение работает в in-memory режиме
+2. Откройте `/health/db` — `ready: true` и `pool` не `null`
+3. Проверьте логи на `cards_cache: TTL=86400s` — должно появляться при первом запросе
+4. Проверьте, что в логах есть `PUT` и `HIT` записи, а не только `MISS`
+5. При нехватке места в БД старые записи могут не очищаться — проверьте `/health/db/excel` на размер `entries`
+
+### PostgreSQL: ConnectionError / pool timeout
+
+1. Проверьте `DB_POOL_MAX` (по умолчанию 5) — при высоком RPS увеличьте
+2. Проверьте `DB_CONNECT_TIMEOUT` (по умолчанию 10с)
+3. На bothost.ru PostgreSQL иногда уходит на обслуживание — приложение автоматически переключится на in-memory fallback, но кэш будет менее эффективным
 
 ---
 

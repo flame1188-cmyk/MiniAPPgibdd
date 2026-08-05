@@ -944,3 +944,201 @@ Stage Summary:
 - miniapp/README.md оставлен без изменений (он детализирует Mini App-специфичные вопросы: архитектура, установка, привязка к боту, переход на production-архитектуру с Celery/PostgreSQL/S3).
 - README_DEPLOY_BOTHOST.md оставлен без изменений (он детализирует bothost-специфичный деплой: webhook, Dockerfile, переменные, troubleshooting bothost).
 - README.md теперь является единой точкой входа: общее описание + ссылки на детальные документы.
+
+---
+Task ID: cluster-top10-lost-fix
+Agent: main
+Task: Bug: Top-10 очагов по тяжести в Mini App всё ещё содержит исчезнувшие очаги (со статусом «✗ Исчезнувший»), несмотря на ранее добавленный фильтр !is_lost в ClustersView.tsx.
+
+Work Log:
+- Пользователь прислал скриншот Top-10 по Республике Дагестан: на позициях 6 и 7 — очаги со статусом «✗ Исчезнувший» (ДТП: 3, Ран: 5), которые не должны попадать в Top-10 текущих.
+- Проверил deployed JS (index-ed80nthf.js): фильтр `g.filter(j=>!j.is_lost&&!j.is_prev_matched)` присутствует.
+- Проверил deployed gibdd_service.py: _serialize_cluster добавляет `"is_lost": c.get("_is_lost", False)` в dict.
+- Проверил deployed concentration_points.py: `lost_cluster["_is_lost"] = True` корректно выставляется.
+- НАЙДЕН КОРНЕВОЙ БАГ: Pydantic-модель `ClusterItem` в `miniapp/backend/routers/analyze.py` (строки 106-120) НЕ включала поля `is_lost` и `is_prev_matched`. При вызове `ClusterItem(**c)` Pydantic по умолчанию молча отбрасывает неизвестные поля. В результате:
+  * _serialize_cluster корректно кладёт is_lost в dict
+  * ClusterItem(**c) молча выбрасывает is_lost
+  * JSON-ответ API не содержит is_lost
+  * Фронтенд получает is_lost=undefined
+  * Фильтр !is_lost === !undefined === true — ничего не исключается
+- Дополнительно: `ClustersSummary` не содержал поле `total_prev_matched`, хотя `_serialize_cluster` его добавлял. В результате блок «АППГ-очагов, повторённых в текущем» в UI никогда не отображался.
+
+Fix:
+- miniapp/backend/routers/analyze.py:
+  * ClusterItem: добавлены `is_lost: bool = False` и `is_prev_matched: bool = False` с подробными комментариями, объясняющими почему без них фильтр на фронтенде бесполезен.
+  * ClustersSummary: добавлено `total_prev_matched: Optional[int] = 0` (опционально для обратной совместимости со старыми сохранёнными задачами).
+  * _clusters_result_to_response: добавлена передача `total_prev_matched=result.get("total_prev_matched", 0)` в summary.
+
+Stage Summary:
+- Корень бага — не в алгоритме (concentration_points.py корректно ставит _is_lost=True) и не во фронтенде (фильтр присутствует), а в промежуточном Pydantic-слое API, который молча отбрасывал поля.
+- Урок: при добавлении новых полей в _serialize_cluster нужно также добавлять их в Pydantic-модель ClusterItem в analyze.py. Pydantic v1/v2 по умолчанию выбрасывает extra-поля без предупреждения (можно было бы включить extra='allow' или forbid, но явное объявление полей надёжнее).
+- Архив: /home/z/my-project/download/cluster-top10-fix.zip (9.5 KB, 1 файл + README).
+- Файлы изменены: miniapp/backend/routers/analyze.py.
+- После деплоя: фильтр !is_lost заработает сразу (без перерасчёта очагов), т.к. исправление в API-сериализации, а не в расчёте. Но для применения к уже сохранённым задачам нужно, чтобы gibdd_service.py отдавал is_lost в dict (это уже работает) — теперь Pydantic его не отбросит.
+
+---
+Task ID: 9
+Agent: Main Agent
+Task: Этап 1-2 миграции на PostgreSQL (bothost.ru) — персистентное хранилище задач + аудит-лог 152-ФЗ
+
+Work Log:
+- Изучена текущая архитектура хранения: _tasks: dict (gibdd_service.py:141), data_cache.py (in-memory LRU), camera_cache.py (файлы), .cache/ для OSM
+- Подтверждена недоступность PostGIS на bothost.ru (CREATE EXTENSION postgis → SQL Error [0A000])
+- Скорректирован план: 90% выгод доступны на обычном PostgreSQL, PostGIS не нужен
+- Этап 1 (подготовка):
+  * Добавлен psycopg[binary,pool]>=3.2,<4 в miniapp/backend/requirements.txt
+  * Добавлены DATABASE_URL, DB_POOL_MIN/MAX, DB_CONNECT_TIMEOUT в .env.example и config.py (с db_enabled property)
+  * Создана структура miniapp/backend/db/:
+    - __init__.py — пакетный файл
+    - connection.py — async-пул (psycopg_pool.AsyncConnectionPool) с init_pool/close_pool/health_check; проверяет подключение и применяет schema.sql при старте; флаг _DB_READY для fallback
+    - schema.sql — CREATE TABLE IF NOT EXISTS для tasks (18 колонок, включая JSONB для dat_list/files/analytics/clusters_result) и access_log; 4 индекса; триггер trg_tasks_updated_at для авто-обновления updated_at
+    - repository.py — TaskRepository с операциями save_task (UPSERT), load_task (SELECT), list_user_tasks_from_db, delete_old_tasks (cleanup), log_access; in-memory кэш _TASKS_MEMORY для тяжёлых полей (cards, raw_clusters и т.д. — НЕ персистятся на Этапе 2); transparent fallback на in-memory если БД недоступна
+    - init_schema.py — standalone скрипт для проверки инициализации схемы
+  * В main.py добавлены: импорты db_init_pool/db_close_pool/db_is_ready; вызов db_init_pool в lifespan startup (с graceful fallback при ошибке); db_close_pool в shutdown; эндпоинт /health/db для детальной диагностики; поле database в /health
+- Этап 2 (миграция _tasks dict):
+  * В gibdd_service.py: create_task теперь асинхронно сохраняет задачу в БД через repository.save_task (fire-and-forget через asyncio.create_task); добавлена get_task_async (проверяет memory → БД); list_user_tasks стала async, сливает задачи из БД и in-memory (для свежесозданных, где fire-and-forget ещё не отработал); cleanup_old_tasks стала async, удаляет и из БД, и из memory, и с диска
+  * В execute_task добавлены await _persist() в 6 ключевых точках: FETCHING, FAILED (empty cards), PARSING, ANALYTICS, GENERATING, DONE, FAILED (exception) — статус и прогресс видны из всех воркеров сразу
+  * В start_clusters_calculation: добавлено await save_task(task) после DONE и FAILED — clusters_result персистится как JSONB, переживает рестарт
+  * В routers/dtp.py: get_task → get_task_async (с await) в 5 эндпоинтах; list_user_tasks с await
+  * В routers/analyze.py: _require_done_task стала async; 12 вызовов обновлены на await _require_done_task(...)
+  * В routers/dtp.py: добавлен вызов log_access(action="create_task", ...) после create_task — аудит 152-ФЗ
+- Сохранение connection string: DATABASE_URL добавлен в /home/z/my-project/gibdd-bot/.env (файл в .gitignore — не попадёт в git)
+- Тестирование:
+  * init_schema.py: пул поднялся, тестовый SELECT 1 прошёл, schema.sql применилась → 2 таблицы (tasks, access_log), 6 индексов, 1 триггер
+  * test_repository_e2e.py: save_task → load_task → list_user_tasks_from_db → log_access → UPSERT (ON CONFLICT DO UPDATE) → cleanup — ВСЕ ТЕСТЫ ПРОШЛИ
+  * test_fallback.py: с пустым DATABASE_URL — init_pool возвращает False, is_db_ready False, get_pool None, create_task в in-memory, get_task/get_task_async/list_user_tasks/cleanup_old_tasks работают в fallback-режиме — ВСЕ ТЕСТЫ ПРОШЛИ
+  * Синтаксис всех 10 изменённых файлов — OK
+
+Stage Summary:
+- Создан новый пакет miniapp/backend/db/ (5 файлов, ~700 строк): __init__.py, connection.py (~180 строк), schema.sql (~95 строк), repository.py (~440 строк), init_schema.py (~55 строк)
+- Изменены: requirements.txt (+1 зависимость), .env.example (+8 строк DATABASE_URL/DB_POOL_*), config.py (+18 строк database_url/db_pool_min/db_pool_max/db_connect_timeout/db_enabled), main.py (+25 строк: импорты, init_pool/close_pool в lifespan, /health/db эндпоинт, database в /health), gibdd_service.py (~80 строк: create_task save_task, get_task_async, list_user_tasks merge, cleanup_old_tasks async, _persist() helper в execute_task + start_clusters_calculation), routers/dtp.py (get_task → await get_task_async в 5 местах + log_access в create), routers/analyze.py (_require_done_task async + 12 await)
+- Connection string сохранён в .env (в .gitignore)
+- Обратная совместимость: если DATABASE_URL не задан или БД недоступна — приложение работает в in-memory режиме (как раньше), ничего не сломано
+- Что работает сейчас: персистентность метаданных задач, история выгрузок переживает рестарт, аудит обращений к ПДн (152-ФЗ), консистентность между воркерами, кэш clusters_result survives restart
+- Что НЕ работает пока (Этап 3-4, не делали): кэш карточек ДТП в JSONB (Этап 3), история очагов в отдельной таблице (Этап 4), гео-оптимизации без PostGIS (Этап 5-6)
+- Тяжёлые поля Task (cards, prev_cards, raw_clusters, raw_preclusters, comparison, llm_qa_history, last_point_*) остаются in-memory — после рестарта они теряются, пользователь может пере-открыть вкладку (lazy reload через ensure_prev_cards и т.д.) или пересоздать задачу. Этап 3 (cards cache) закроет это.
+- Деплой: git pull на bothost → pip install -r requirements.txt (установит psycopg) → перезапуск. При первом запуске schema.sql применится автоматически в init_pool.
+
+---
+Task ID: stage3-cards-cache
+Agent: Main Agent
+Task: Этап 3 — PostgreSQL кэш карточек ДТП (cards_cache) для устранения повторных выгрузок одного региона+периода разными пользователями.
+
+Work Log:
+- Изучена архитектура Этапа 1-2 (Task ID: 9): miniapp/backend/db/ содержит connection.py (async-пул psycopg), schema.sql, repository.py. БД готова, но тяжёлые поля (cards, prev_cards) in-memory только.
+- Создан miniapp/backend/db/cards_cache.py (~300 строк) по образцу repository.py:
+  * Таблица dtp_cards_cache: reg_code TEXT, dat_hash TEXT, cards JSONB, prev_cards JSONB, total_dtp INT, total_dead INT, total_injured INT, expires_at TIMESTAMPTZ, created_at/updated_at
+  * Асинхронные функции: get_cards_cache(reg_code, dat_hash), put_cards_cache(reg_code, dat_hash, cards, prev_cards, totals), invalidate_cards_cache(reg_code, dat_hash), get_cards_cache_stats(), cleanup_old_cards()
+  * Idempotent UPSERT через ON CONFLICT (reg_code, dat_hash) DO UPDATE
+  * TTL через expires_at = NOW() + interval, фоновая очистка cleanup_old_cards()
+  * Graceful fallback: при недоступности БД возвращает None, приложение продолжает работу
+- Обновлён schema.sql: добавлен блок CREATE TABLE IF NOT EXISTS dtp_cards_cache + индексы (reg_code, dat_hash) + индекс expires_at для cleanup
+- Обновлён config.py: добавлены CARDS_CACHE_TTL_SECONDS (env, по умолчанию 86400)
+- Интеграция в gibdd_service.py:
+  * В execute_task после завершения fetching всех месяцев — GET cards_cache перед парсингом
+  * При HIT: пропуск загрузки и парсинга, использование закэшированных cards + prev_cards
+  * При MISS: после успешного fetching + parsing — PUT cards_cache
+  * Логирование: "cards_cache: HIT reg=X hash=Y (N ДТП)" / "cards_cache: PUT reg=X hash=Y (N ДТП, TTL=86400s)"
+- В main.py добавлен эндпоинт /health/db/cards со статистикой: {entries, hits, misses, oldest}
+- В фоновую задачу очистки (каждые 2 часа) добавлен вызов cleanup_old_cards()
+- Архив: /home/z/my-project/download/stage3-cards-cache.zip
+
+Stage Summary:
+- Создан файл: miniapp/backend/db/cards_cache.py (~300 строк)
+- Изменены: schema.sql (+15 строк), config.py (+3 строки), gibdd_service.py (~50 строк интеграции), main.py (+10 строк эндпоинт)
+- Ключ кэша: (reg_code, dat_hash) где dat_hash = sha256("|".join(sorted(dat_list)))[:16]
+- Размер записи: 500-1500 KB JSONB на 12 месяцев региона
+- Экономия: 3-5 сек на каждом повторном запросе (пропуск fetching + parsing 12 месяцев)
+- Подтверждено в проде: "cards_cache: HIT reg=1182 hash=... [cache: 1/100]" — второй пользователь мгновенно получает данные
+
+---
+Task ID: stage4-clusters-cache
+Agent: Main Agent
+Task: Этап 4 — PostgreSQL кэш кластеров (clusters_cache) с сырыми геометками raw_clusters/raw_preclusters для пропуска DBSCAN при повторных запросах.
+
+Work Log:
+- Изучена проблема: расчёт очагов ДТП через concentration_points.py занимает 8-15 сек (DBSCAN + OSM Overpass). При повторных запросах того же региона+периода — полная регенерация.
+- Создан miniapp/backend/db/clusters_cache.py (~320 строк):
+  * Таблица clusters_cache: reg_code TEXT, current_dat_hash TEXT, prev_dat_hash TEXT, result JSONB, raw_clusters JSONB, raw_preclusters JSONB, expires_at TIMESTAMPTZ, created_at/updated_at
+  * Составной ключ: (reg_code, current_dat_hash, prev_dat_hash) — кэширует пару периодов (текущий vs АППГ)
+  * Асинхронные функции: get_clusters_cache, put_clusters_cache, invalidate_clusters_cache, get_clusters_cache_stats, cleanup_old_clusters
+  * _json_safe() helper: рекурсивная конвертация tuple → list для JSONB-совместимости (Shapely возвращает tuple координат)
+  * Idempotent UPSERT через ON CONFLICT (reg_code, current_dat_hash, prev_dat_hash)
+- Обновлён schema.sql: добавлен блок CREATE TABLE IF NOT EXISTS clusters_cache + индексы
+- Обновлён config.py: добавлены CLUSTERS_CACHE_TTL_SECONDS (env, по умолчанию 86400)
+- Интеграция в gibdd_service.py → start_clusters_calculation:
+  * Перед запуском concentration_points.calculate_concentration_points — GET clusters_cache
+  * При HIT: возврат закэшированных {result, raw_clusters, raw_preclusters} без расчётов
+  * При MISS: после расчёта — PUT clusters_cache со всеми тремя полями
+  * Логирование: "clusters_cache: HIT reg=X cur=... prev=... (N clusters)" / "PUT ... raw=yes, ~N KB"
+- В main.py добавлен эндпоинт /health/db/clusters со статистикой
+- В фоновую задачу очистки добавлен вызов cleanup_old_clusters()
+- Архив: /home/z/my-project/download/stage4-clusters-cache.zip
+
+Stage Summary:
+- Создан файл: miniapp/backend/db/clusters_cache.py (~320 строк)
+- Изменены: schema.sql (+18 строк), config.py (+3 строки), gibdd_service.py (~40 строк интеграции), main.py (+10 строк)
+- Ключ кэша: (reg_code, current_dat_hash, prev_dat_hash) — пара периодов
+- Размер записи: 800-2000 KB JSONB (включая raw_clusters с координатами всех точек)
+- Экономия: 8-15 сек на повторных запросах (DBSCAN полностью пропускается)
+- ВАЖНОЕ ИСПРАВЛЕНИЕ (отдельный коммит в рамках Stage 4): первая версия clusters_cache хранила только result без raw_clusters/raw_preclusters → при HIT карта очагов падала в fallback "simple map", т.к. для генерации HTML-карты нужны raw_clusters. Добавлены JSONB-колонки raw_clusters/raw_preclusters + _json_safe() конвертер. После исправления HIT работает корректно: карта генерируется с полным набором метрик (4/0/7/44/281 — repeat/new_with_neighbor/new/lost/preclusters).
+- Подтверждено в проде: "PUT ... raw=yes, ~1670 KB" → "HIT ... raw=yes" → карта генерируется без WARNING fallback
+
+---
+Task ID: stage5-excel-cache
+Agent: Main Agent
+Task: Этап 5 — PostgreSQL кэш готовых Excel-файлов (excel_cache) для пропуска генерации xlsx при повторных запросах. Файл 1 (карточки ДТП) + Файл 2 (участники) = 5-8 сек генерации.
+
+Work Log:
+- Изучена проблема: excel_generator.generate_excel_files() генерирует два xlsx-файла (Файл 1 ~500KB за 1.4-2.5с, Файл 2 ~1MB за 3.8-6.3с) — итого 5.3-8.8 сек на каждый запрос. Второй пользователь ждёт ту же генерацию.
+- Создан miniapp/backend/db/excel_cache.py (~280 строк):
+  * Таблица excel_cache: reg_code TEXT, dat_hash TEXT, file1_bytes BYTEA, file2_bytes BYTEA, total_dtp INT, total_dead INT, total_injured INT, expires_at TIMESTAMPTZ, created_at/updated_at
+  * BYTEA-колонки для хранения готовых байтов xlsx-файлов
+  * Асинхронные функции: get_excel_cache, put_excel_cache, invalidate_excel_cache, get_excel_cache_stats, cleanup_old_excel
+  * Возврат: {file1_bytes, file2_bytes, total_dtp, total_dead, total_injured}
+  * Idempotent UPSERT через ON CONFLICT (reg_code, dat_hash)
+- Обновлён schema.sql: добавлен блок CREATE TABLE IF NOT EXISTS excel_cache + индексы
+- Обновлён config.py: добавлены EXCEL_CACHE_TTL_SECONDS (env, по умолчанию 86400)
+- Интеграция в gibdd_service.py → execute_task после analytics built:
+  * Перед вызовом excel_generator.generate_excel_files() — GET excel_cache
+  * При HIT: использование закэшированных bytes, пропуск генерации, лог "Excel loaded from cache — ~N KB"
+  * При MISS: после генерации — PUT excel_cache с обоими файлами
+  * Логирование: "excel_cache: HIT reg=X hash=Y (Файл 1=N байт, Файл 2=M байт, всего ~K KB)" / "PUT ... (Файл 1=N байт, Файл 2=M байт, всего ~K KB, N ДТП, TTL=86400s)"
+- В main.py добавлен эндпоинт /health/db/excel со статистикой
+- В фоновую задачу очистки добавлен вызов cleanup_old_excel()
+- Архив: /home/z/my-project/download/stage5-excel-cache.zip
+
+Stage Summary:
+- Создан файл: miniapp/backend/db/excel_cache.py (~280 строк)
+- Изменены: schema.sql (+15 строк), config.py (+3 строки), gibdd_service.py (~40 строк интеграции), main.py (+10 строк)
+- Ключ кэша: (reg_code, dat_hash) — совпадает с cards_cache (Excel генерируется из тех же cards)
+- Размер записи: 1-2 MB BYTEA на 12 месяцев региона (~500KB Файл 1 + ~1MB Файл 2)
+- Экономия: 5-8 сек на каждом повторном запросе (генерация xlsx полностью пропускается)
+- Подтверждено в проде (2026-08-05 16:26-16:27):
+  * Пользователь 1 (MISS): генерация 7.8с → PUT (Файл 1=700964 байт, Файл 2=1457761 байт, всего ~2108 KB)
+  * Пользователь 2 (HIT): мгновенно из кэша, генерация полностью пропущена
+  * Размеры файлов совпадают бит-в-бит между PUT и HIT
+- Решено НЕ кэшировать Excel «Очаги» (4 листа из raw_clusters): ROI низкий (~1-3 сек), т.к. raw_clusters уже закэшированы в clusters_cache (Stage 4). Узкое место сместилось на загрузку из API ГИБДД (~12 сек на 12 месяцев).
+
+---
+Task ID: readme-worklog-actualize-2
+Agent: Main Agent
+Task: Актуализация README.md и worklog.md после завершения Этапов 3-5 (PostgreSQL кэши L2).
+
+Work Log:
+- Изучены текущие файлы: README.md (591 строк, заканчивается на Stage 1-2), worklog.md (1020 строк, заканчивается на Task ID 9 — Stage 1-2).
+- README.md обновлён:
+  * Раздел «Возможности»: добавлены 2 пункта — трёхуровневый кэш данных ДТП (L1+L2+L3), персистентность задач в PostgreSQL
+  * Добавлен новый раздел «Трёхуровневый кэш данных ДТП (L1 + L2 + L3)» с ASCII-диаграммой, описанием ключей кэша, таблицей экономии по Stage 3/4/5 (3-5с / 8-15с / 7-8с, итого 18-28с)
+  * Таблица env-переменных: добавлены DATABASE_URL, DB_POOL_MIN/MAX, DB_CONNECT_TIMEOUT, CARDS_CACHE_TTL_SECONDS, CLUSTERS_CACHE_TTL_SECONDS, EXCEL_CACHE_TTL_SECONDS
+  * Структура проекта: расширена директория miniapp/backend/db/ — добавлены cards_cache.py, clusters_cache.py, excel_cache.py с описаниями
+  * API Endpoints: добавлены /health/db, /health/db/cards, /health/db/clusters, /health/db/excel
+  * Зависимости: добавлен psycopg[binary,pool] 3.2+
+  * Проверка работоспособности: добавлены строки для /health/db и /health/db/excel
+  * Устранение неполадок: добавлены 2 новых сценария — «PostgreSQL: кэш не срабатывает (всегда MISS)» и «PostgreSQL: ConnectionError / pool timeout»
+- worklog.md дополнен 4 новыми записями: stage3-cards-cache, stage4-clusters-cache (+raw_clusters fix), stage5-excel-cache, текущая readme-worklog-actualize-2.
+
+Stage Summary:
+- README.md: 591 → ~670 строк, охватывает полную трёхуровневую архитектуру кэширования (in-memory LRU + PostgreSQL L2 + файловый L3), все env-переменные для БД, новые health-эндпоинты, troubleshooting для PostgreSQL.
+- worklog.md: 1020 → ~1100 строк, охватывает все изменения вплоть до Stage 5 (Excel cache).
+- Документация теперь консистентна с production-состоянием: все три PostgreSQL-кэша (cards/clusters/excel) описаны и подтверждены логами от 2026-08-05.
