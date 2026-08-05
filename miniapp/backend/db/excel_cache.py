@@ -137,6 +137,12 @@ async def get_cached_excel(
             row = await cur.fetchone()
 
         if row is None:
+            # === Фаза 1.6: Prometheus metric — MISS ===
+            try:
+                from ..middleware.metrics import record_cache_miss
+                record_cache_miss("excel")
+            except Exception:
+                pass
             return None
 
         file1_bytes = bytes(row["file1_bytes"])
@@ -166,6 +172,12 @@ async def get_cached_excel(
             f"Файл 2={row['file2_size']} байт, всего ~{total_kb} KB, "
             f"{row['total_dtp']} ДТП)"
         )
+        # === Фаза 1.6: Prometheus metric ===
+        try:
+            from ..middleware.metrics import record_cache_hit
+            record_cache_hit("excel")
+        except Exception:
+            pass
         return file1_bytes, file2_bytes, metadata
 
     except Exception as exc:

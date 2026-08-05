@@ -62,8 +62,13 @@ async def init_pool() -> bool:
         return False
 
     try:
-        # min_size/max_size: лёгкая нагрузка (~10-50 одновременных
-        # пользователей), 1-5 соединений в пуле достаточно.
+        # min_size/max_size: пул соединений к PostgreSQL.
+        # По умолчанию min=2, max=15 (см. config.py).
+        # 15 соединений достаточно для 10-15 одновременных пользователей:
+        #   - long-poll эндпоинты держат соединение 25-60 сек
+        #   - _persist() в execute_task делает 6 коротких запросов
+        #   - hits/misses кэшей — кратковременные соединения
+        # При росте до 30 пользователей — увеличьте DB_POOL_MAX до 30-40.
         # timeout: на shared-хостинге PG может тормозить — даём 30 сек.
         _pool = AsyncConnectionPool(
             conninfo=settings.database_url,

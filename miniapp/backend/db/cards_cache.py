@@ -102,6 +102,12 @@ async def get_cached_cards(
             row = await cur.fetchone()
 
         if row is None:
+            # === Фаза 1.6: Prometheus metric — MISS ===
+            try:
+                from ..middleware.metrics import record_cache_miss
+                record_cache_miss("cards")
+            except Exception:
+                pass
             return None
 
         cards = list(row["payload"]) if row["payload"] else []
@@ -119,6 +125,12 @@ async def get_cached_cards(
             f"cards_cache: HIT reg={reg_code} hash={dat_hash[:8]}.. "
             f"({len(cards)} ДТП)"
         )
+        # === Фаза 1.6: Prometheus metric — HIT ===
+        try:
+            from ..middleware.metrics import record_cache_hit
+            record_cache_hit("cards")
+        except Exception:
+            pass
         return cards, errors
 
     except Exception as exc:

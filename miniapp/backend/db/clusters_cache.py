@@ -210,6 +210,12 @@ async def get_cached_clusters(
             row = await cur.fetchone()
 
         if row is None:
+            # === Фаза 1.6: Prometheus metric — MISS ===
+            try:
+                from ..middleware.metrics import record_cache_miss
+                record_cache_miss("clusters")
+            except Exception:
+                pass
             return None
 
         payload = row["payload"]
@@ -228,6 +234,12 @@ async def get_cached_clusters(
             f"{row['total_preclusters']} предочагов, "
             f"raw={'yes' if has_raw else 'no'})"
         )
+        # === Фаза 1.6: Prometheus metric — HIT ===
+        try:
+            from ..middleware.metrics import record_cache_hit
+            record_cache_hit("clusters")
+        except Exception:
+            pass
         return {
             "result": dict(payload),
             "raw_clusters": list(raw_clusters) if raw_clusters else None,
