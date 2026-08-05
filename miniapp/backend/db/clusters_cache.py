@@ -24,12 +24,18 @@
   prev_dat_hash = NULL если АППГ не используется.
 
 Что кэшируется:
-  ТОЛЬКО финальный сериализованный result (clusters_state.result) —
-  словарь с clusters/preclusters/dynamics_summary/... Размер 50-200 KB.
+  1. payload — финальный сериализованный result (clusters_state.result),
+     словарь с clusters/preclusters/dynamics_summary/... Размер 50-200 KB.
+  2. raw_clusters — сырые очаги с cards внутри (нужны для продвинутой
+     карты со слоями/попапами и Excel-выгрузки с детализацией ДТП).
+     Размер 1-2 MB.
+  3. raw_preclusters — сырые предочаги с cards внутри. Размер 0.5-1 MB.
 
-  raw_clusters (с координатами всех карточек) НЕ кэшируются —
-  они нужны только для Excel-выгрузки и продвинутой карты,
-  их можно пересчитать из task.cards + result.
+  Если raw_clusters/raw_preclusters не закэшированы (старая запись
+  или сбой сериализации) — при cache hit вернётся только payload,
+  карта упадёт в fallback (simple map), Excel вернёт None. Это
+  самовосстанавливается: после протухания TTL следующий PUT сохранит
+  всё целиком.
 
 TTL:
   По умолчанию 6 часов (21600 сек) — очаги стабильнее карточек,
@@ -43,6 +49,7 @@ Fallback:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from typing import Any, List, Optional, Tuple
 
@@ -117,9 +124,17 @@ async def get_cached_clusters(
     prev_dat_list: Optional[List[str]] = None,
 ) -> Optional[dict]:
     """
-    Возвращает сохранённый result из БД или None, если записи нет / протухла.
+    Возвращает сохранённый результат из БД или None, если записи нет / протухла.
 
-    Что вернётся:
+    Что вернётся (dict с тремя ключами):
+        {
+            "result": {...},          # task.clusters_state.result
+            "raw_clusters": [...],    # сырые очаги с cards внутри (или None)
+            "raw_preclusters": [...], # сырые предочаги с cards внутри (или None)
+        }
+
+    Где result — это именно тот dict, который кладётся в
+    task.clusters_state.result:
         {
             "total_clusters": int,
             "total_lost": int,
@@ -137,7 +152,9 @@ async def get_cached_clusters(
             "region_name": str,
         }
 
-    Это именно тот dict, который кладётся в task.clusters_state.result.
+    raw_clusters / raw_preclusters могут быть None для старых записей
+    (созданных до добавления этих колонок). В этом случае caller
+    должен либо упасть в fallback, либо пересчитать raw-данные.
     """
     if not current_dat_list:
         return None
@@ -159,7 +176,8 @@ async def get_cached_clusters(
             if prev_hash is None:
                 cur = await conn.execute(
                     """
-                    SELECT payload, total_clusters, total_preclusters,
+                    SELECT payload, raw_clusters, raw_preclusters,
+                           total_clusters, total_preclusters,
                            has_prev_data
                     FROM clusters_cache
                     WHERE reg_code = %(reg)s
@@ -173,7 +191,8 @@ async def get_cached_clusters(
             else:
                 cur = await conn.execute(
                     """
-                    SELECT payload, total_clusters, total_preclusters,
+                    SELECT payload, raw_clusters, raw_preclusters,
+                           total_clusters, total_preclusters,
                            has_prev_data
                     FROM clusters_cache
                     WHERE reg_code = %(reg)s
@@ -197,13 +216,23 @@ async def get_cached_clusters(
         if not payload:
             return None
 
+        # raw_clusters / raw_preclusters могут быть NULL для старых записей
+        raw_clusters = row["raw_clusters"] or None
+        raw_preclusters = row["raw_preclusters"] or None
+
+        has_raw = bool(raw_clusters or raw_preclusters)
         logger.info(
             f"clusters_cache: HIT reg={reg_code} "
             f"curr={current_hash[:8]}.. prev={prev_hash[:8] if prev_hash else 'none'}.. "
             f"({row['total_clusters']} очагов, "
-            f"{row['total_preclusters']} предочагов)"
+            f"{row['total_preclusters']} предочагов, "
+            f"raw={'yes' if has_raw else 'no'})"
         )
-        return dict(payload)
+        return {
+            "result": dict(payload),
+            "raw_clusters": list(raw_clusters) if raw_clusters else None,
+            "raw_preclusters": list(raw_preclusters) if raw_preclusters else None,
+        }
 
     except Exception as exc:
         logger.warning(
@@ -215,17 +244,55 @@ async def get_cached_clusters(
 # ====================================================================
 # PUT — сохранение в кэш
 # ====================================================================
+def _json_safe(obj: Any) -> Any:
+    """
+    Рекурсивно конвертирует объект в JSON-безопасную форму.
+
+    Проблема: raw_clusters содержит tuples (center, first_coords,
+    last_coords) и, теоретически, может содержать datetime/Decimal
+    в cards. json.dumps падает на таких типах.
+
+    Решение: deep-copy с заменой tuple → list и fallback на str()
+    для неизвестных типов. Это безопасно для round-trip через JSONB,
+    т.к. код-потребитель (_serialize_cluster, build_*_excel_data,
+    report_generator) использует индексацию [0]/[1], а не tuple-сравнения.
+    """
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, tuple):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, list):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    # datetime, Decimal, set, etc. — конвертируем в строку
+    return str(obj)
+
+
 async def put_cached_clusters(
     reg_code: str,
     current_dat_list: List[str],
     prev_dat_list: Optional[List[str]],
     result: dict,
+    raw_clusters: Optional[List[dict]] = None,
+    raw_preclusters: Optional[List[dict]] = None,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> None:
     """
-    Сохраняет result в БД (upsert: INSERT ... ON CONFLICT DO UPDATE).
+    Сохраняет result + raw_clusters + raw_preclusters в БД
+    (upsert: INSERT ... ON CONFLICT DO UPDATE).
 
-    result — это task.clusters_state.result (полный сериализованный dict).
+    Параметры:
+      result          — task.clusters_state.result (полный сериализованный dict).
+      raw_clusters    — task.raw_clusters (сырые очаги с cards внутри).
+                        Нужны для продвинутой карты и Excel.
+      raw_preclusters — task.raw_preclusters (сырые предочаги с cards).
+      ttl_seconds     — срок жизни записи.
+
+    Если raw_clusters/raw_preclusters не переданы (None) — сохраняем
+    только result. Это обратный сценарий: при cache hit caller получит
+    result, но карта/Excel упадут в fallback. Такое допустимо только
+    для legacy-вызовов; новый код должен всегда передавать raw-данные.
     """
     if not current_dat_list or not result:
         return
@@ -248,6 +315,25 @@ async def put_cached_clusters(
     prev_label = result.get("prev_label")
     region_name = str(result.get("region_name", "") or "")
 
+    # Конвертируем raw-данные в JSON-безопасную форму.
+    # _json_safe делает deep-copy + конвертирует tuples/Decimal/datetime.
+    # Если что-то пошло не так — логируем warning и сохраняем только result
+    # (карта упадёт в fallback, но кэш самого result валиден).
+    raw_clusters_json: Optional[dict] = None
+    raw_preclusters_json: Optional[dict] = None
+    try:
+        if raw_clusters:
+            raw_clusters_json = Json(_json_safe(raw_clusters))
+        if raw_preclusters:
+            raw_preclusters_json = Json(_json_safe(raw_preclusters))
+    except Exception as exc:
+        logger.warning(
+            f"clusters_cache: _json_safe failed (reg={reg_code}): {exc}. "
+            f"Saving result without raw_clusters."
+        )
+        raw_clusters_json = None
+        raw_preclusters_json = None
+
     try:
         async with pool.connection() as conn:
             await conn.execute(
@@ -255,14 +341,14 @@ async def put_cached_clusters(
                 INSERT INTO clusters_cache (
                     reg_code, current_dat_hash, prev_dat_hash,
                     current_dat_list, prev_dat_list,
-                    payload,
+                    payload, raw_clusters, raw_preclusters,
                     total_clusters, total_preclusters, has_prev_data,
                     current_label, prev_label, region_name,
                     created_at, expires_at
                 ) VALUES (
                     %(reg)s, %(curr)s, %(prev)s,
                     %(curr_list)s, %(prev_list)s,
-                    %(payload)s,
+                    %(payload)s, %(raw_c)s, %(raw_p)s,
                     %(tc)s, %(tpc)s, %(hpd)s,
                     %(cl)s, %(pl)s, %(rn)s,
                     NOW(),
@@ -274,6 +360,8 @@ async def put_cached_clusters(
                     current_dat_list = EXCLUDED.current_dat_list,
                     prev_dat_list = EXCLUDED.prev_dat_list,
                     payload = EXCLUDED.payload,
+                    raw_clusters = EXCLUDED.raw_clusters,
+                    raw_preclusters = EXCLUDED.raw_preclusters,
                     total_clusters = EXCLUDED.total_clusters,
                     total_preclusters = EXCLUDED.total_preclusters,
                     has_prev_data = EXCLUDED.has_prev_data,
@@ -290,6 +378,8 @@ async def put_cached_clusters(
                     "curr_list": Json(current_dat_list),
                     "prev_list": Json(prev_dat_list) if prev_dat_list else None,
                     "payload": Json(result),
+                    "raw_c": raw_clusters_json,
+                    "raw_p": raw_preclusters_json,
                     "tc": total_clusters,
                     "tpc": total_preclusters,
                     "hpd": has_prev_data,
@@ -301,11 +391,25 @@ async def put_cached_clusters(
             )
             await conn.commit()
 
+        # Размер raw-данных для лога (грубо — длина JSON-строки)
+        raw_size = 0
+        if raw_clusters:
+            try:
+                raw_size += len(json.dumps(_json_safe(raw_clusters), default=str))
+            except Exception:
+                pass
+        if raw_preclusters:
+            try:
+                raw_size += len(json.dumps(_json_safe(raw_preclusters), default=str))
+            except Exception:
+                pass
+
         logger.info(
             f"clusters_cache: PUT reg={reg_code} "
             f"curr={current_hash[:8]}.. prev={prev_hash[:8] if prev_hash else 'none'}.. "
             f"({total_clusters} очагов, {total_preclusters} предочагов, "
-            f"TTL={ttl_seconds}s)"
+            f"raw={'yes' if raw_clusters_json or raw_preclusters_json else 'no'}, "
+            f"~{raw_size // 1024} KB, TTL={ttl_seconds}s)"
         )
 
     except Exception as exc:

@@ -158,14 +158,19 @@ CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_reg
 --   current_dat_hash = MD5(sorted(current_dat_list).join(','))
 --   prev_dat_hash    = MD5(sorted(prev_dat_list).join(',')) или NULL
 --
--- Размер записи: 50-200 KB (зависит от количества очагов).
+-- Размер записи: 1-3 MB (result ~50-200 KB + raw_clusters с cards
+-- внутри ~1-2 MB + raw_preclusters ~0.5-1 MB). Кэшируем raw_clusters
+-- и raw_preclusters, иначе при cache hit не работают:
+--   - generate_clusters_map_html (продвинутая карта со слоями/попапами)
+--   - generate_clusters_excel (4 листа с детализацией ДТП)
+-- Оба метода итерируют cluster["cards"] — без кэша raw_clusters они
+-- падают в fallback (простая карта без слоёв / None вместо Excel).
+--
 -- TTL: expires_at = created_at + TTL_SECONDS (по умолчанию 6 часов,
 --      настраивается через env CLUSTERS_CACHE_TTL_SECONDS).
 --
 -- Что НЕ кэшируется:
---   - raw_clusters (с координатами всех карточек) — остаются in-memory,
---     пересчитываются из task.cards + result при необходимости.
---   - HTML-карта — генерируется из result при запросе.
+--   - HTML-карта — генерируется из raw_clusters при запросе.
 --   - OSM-полигоны — кэшируются отдельно в data/osm_cache/.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS clusters_cache (
@@ -176,6 +181,8 @@ CREATE TABLE IF NOT EXISTS clusters_cache (
     current_dat_list    JSONB        NOT NULL,             -- ["1.2026","2.2026",...]
     prev_dat_list       JSONB,                             -- ["1.2025","2.2025",...] или NULL
     payload             JSONB        NOT NULL,             -- финальный result (clusters_state.result)
+    raw_clusters        JSONB,                             -- сырые очаги с cards внутри (для карты/Excel)
+    raw_preclusters     JSONB,                             -- сырые предочаги с cards внутри
     total_clusters      INT          NOT NULL DEFAULT 0,
     total_preclusters   INT          NOT NULL DEFAULT 0,
     has_prev_data       BOOLEAN      NOT NULL DEFAULT FALSE,
@@ -185,6 +192,14 @@ CREATE TABLE IF NOT EXISTS clusters_cache (
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     expires_at          TIMESTAMPTZ  NOT NULL
 );
+
+-- ============================================================
+-- Миграция: для уже существующих таблиц добавляем новые колонки.
+-- ADD COLUMN IF NOT EXISTS поддерживается PostgreSQL 9.6+.
+-- Идемпотентно — безопасно при каждом запуске приложения.
+-- ============================================================
+ALTER TABLE clusters_cache ADD COLUMN IF NOT EXISTS raw_clusters    JSONB;
+ALTER TABLE clusters_cache ADD COLUMN IF NOT EXISTS raw_preclusters JSONB;
 
 -- Уникальный индекс на составной ключ с COALESCE для NULL-безопасности.
 -- Важно: prev_dat_hash может быть NULL (АППГ не используется),
