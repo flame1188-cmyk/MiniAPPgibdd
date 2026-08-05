@@ -30,8 +30,19 @@ from .connection import get_pool, is_db_ready
 
 logger = logging.getLogger(__name__)
 
-# TTL по умолчанию — 1 час (в секундах). Должен совпадать с data_cache.py.
-DEFAULT_TTL_SECONDS = 3600
+# TTL берётся из env CARDS_CACHE_TTL_SECONDS (по умолчанию 3600 = 1 час).
+# См. config.py → раздел «PostgreSQL-кэш (Этап 3+)».
+try:
+    from config import CARDS_CACHE_TTL_SECONDS
+    DEFAULT_TTL_SECONDS = CARDS_CACHE_TTL_SECONDS
+except Exception:
+    # На случай если config.py недоступен (например, в изолированном тесте)
+    DEFAULT_TTL_SECONDS = 3600
+
+logger.info(
+    f"cards_cache: TTL={DEFAULT_TTL_SECONDS}s "
+    f"(env CARDS_CACHE_TTL_SECONDS)"
+)
 
 
 # ====================================================================
