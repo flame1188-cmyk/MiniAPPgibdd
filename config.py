@@ -22,6 +22,16 @@ _raw_allowed = os.getenv("ALLOWED_USER_IDS", "")
 if _raw_allowed:
     ALLOWED_USER_IDS = [int(uid.strip()) for uid in _raw_allowed.split(",")]
 
+# ID администраторов для системных уведомлений (через запятую).
+# Сюда будут падать алерты от monitor_cards_cache.sh и других
+# внешних скриптов мониторинга (через Telegram Bot API).
+# Узнать свой ID можно у @userinfobot.
+# Оставьте пустым, чтобы отключить уведомления.
+ADMIN_TELEGRAM_IDS: list[int] = []
+_raw_admins = os.getenv("ADMIN_TELEGRAM_IDS", "")
+if _raw_admins:
+    ADMIN_TELEGRAM_IDS = [int(uid.strip()) for uid in _raw_admins.split(",")]
+
 
 # ========================
 # Сеть
@@ -79,6 +89,23 @@ ENABLE_NEWS_SEARCH: bool = os.getenv("ENABLE_NEWS_SEARCH", "true").lower() == "t
 # Логирование
 # ========================
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+
+
+# ========================
+# PostgreSQL-кэш (Этап 3+)
+# ========================
+# TTL кэша карточек ДТП в секундах.
+# По умолчанию 1 час (3600 сек) — баланс между актуальностью и хитами.
+# Рекомендации:
+#   3600     (1 час)   — production, текущий период (данные могут обновиться)
+#   86400    (24 часа) — закрытые периоды прошлого месяца/года (данные стабильны)
+#   604800   (7 дней)  — демо/презентации,ARCHIVE-режим
+#   300      (5 мин)   — отладка/тестирование
+CARDS_CACHE_TTL_SECONDS: int = int(os.getenv("CARDS_CACHE_TTL_SECONDS", "3600"))
+
+# Будущее: TTL кэша очагов (Этап 4 — пока не используется).
+# Очаги стабильнее карточек — TTL по умолчанию 6 часов.
+CLUSTERS_CACHE_TTL_SECONDS: int = int(os.getenv("CLUSTERS_CACHE_TTL_SECONDS", "21600"))
 
 
 # ========================
