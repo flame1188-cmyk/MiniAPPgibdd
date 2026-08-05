@@ -24,6 +24,12 @@ shapely==2.0.6
 # задачи и аудит-лог персистятся в БД; иначе работает in-memory fallback)
 psycopg[binary,pool]>=3.2,<4
 
+# Rate limiting (Фаза 1.5) — лимит запросов на пользователя
+slowapi>=0.1.9
+
+# Prometheus metrics (Фаза 1.6) — /metrics endpoint
+prometheus-fastapi-instrumentator>=7.0.0
+
 # Optional: LLM (включается, если нужен AI-анализ)
 # zhipuai==2.1.0
 
