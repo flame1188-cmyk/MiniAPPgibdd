@@ -72,8 +72,16 @@ class Settings(BaseSettings):
             "персистятся в БД; иначе работает in-memory fallback."
         ),
     )
-    db_pool_min: int = Field(default=1, description="Минимальный размер пула")
-    db_pool_max: int = Field(default=5, description="Максимальный размер пула")
+    db_pool_min: int = Field(default=2, description="Минимальный размер пула")
+    db_pool_max: int = Field(
+        default=15,
+        description=(
+            "Максимальный размер пула соединений PostgreSQL. "
+            "Раньше было 5 — критично мало при 10+ одновременных "
+            "пользователях: long-poll эндпоинты держат соединение "
+            "по 25-60 сек. Для 10 пользователей — 15, для 30 — 30-40."
+        ),
+    )
     db_connect_timeout: int = Field(
         default=30, description="Таймаут подключения (сек)"
     )
