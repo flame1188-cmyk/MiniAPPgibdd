@@ -60,6 +60,11 @@ from telegram.ext import Application
 # Mini App backend
 from miniapp.backend.main import app as miniapp_app
 from miniapp.backend.config import settings as miniapp_settings
+from miniapp.backend.db.connection import (
+    init_pool as db_init_pool,
+    close_pool as db_close_pool,
+    is_db_ready as db_is_ready,
+)
 
 
 # ============================================================
@@ -234,10 +239,71 @@ async def lifespan(app: FastAPI):
     # (API ГИБДД может тормозить с ретраями до 20 сек).
     logger.info("Mini App: стартовая инициализация пропущена — lazy loading")
 
+    # === Инициализация пула PostgreSQL (опционально) ===
+    # Если DATABASE_URL задан — создаём пул и применяем схему.
+    # Если нет или не удалось подключиться — приложение продолжает работу
+    # с in-memory хранилищем (см. db/repository.py).
+    try:
+        db_ready = await db_init_pool()
+        if db_ready:
+            logger.info("PostgreSQL: пул готов, задачи и аудит-лог персистятся")
+        else:
+            logger.info(
+                "PostgreSQL: in-memory fallback активирован "
+                "(DATABASE_URL не задан или подключение не удалось)"
+            )
+    except Exception as exc:
+        logger.warning(
+            f"PostgreSQL init failed: {exc} — продолжаем с in-memory fallback"
+        )
+
+    # === Фоновая задача: периодическая очистка старых задач ===
+    # In-memory хранилище _tasks растёт без ограничений — каждая задача
+    # держит мегабайты карточек ДТП, prev_cards, raw_clusters и т.д.
+    # Без очистки долгоживущий сервер упадёт по OOM после ~50-100 задач.
+    # Запускаем очистку каждые 2 часа, удаляем задачи старше 24 часов.
+    # При наличии БД — очистка идёт и в in-memory, и в БД (см. db/repository.py).
+    async def _cleanup_loop():
+        while True:
+            try:
+                await asyncio.sleep(7200)  # 2 часа
+                from miniapp.backend.services.gibdd_service import (
+                    cleanup_old_tasks,
+                )
+                removed = await cleanup_old_tasks(max_age_hours=24)
+                if removed > 0:
+                    logger.info(
+                        f"Cleanup: удалено {removed} старых задач "
+                        f"(старше 24 часов)"
+                    )
+            except asyncio.CancelledError:
+                logger.info("Cleanup loop cancelled")
+                break
+            except Exception as exc:
+                # Не роняем цикл при случайной ошибке
+                logger.warning(f"Cleanup loop error: {exc}")
+                await asyncio.sleep(60)
+
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    logger.info("Запущена фоновая очистка старых задач (каждые 2 часа)")
+
     yield
 
     # === Graceful shutdown ===
     logger.info("Останавливаемся...")
+
+    # Останавливаем фоновую очистку
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+    # Закрываем пул PostgreSQL
+    try:
+        await db_close_pool()
+    except Exception as exc:
+        logger.warning(f"Ошибка при закрытии пула БД: {exc}")
 
     if tg_app:
         try:
@@ -359,7 +425,15 @@ async def health():
         "version": "1.0.0",
         "telegram_bot": "running" if tg_app else "stopped",
         "bothost_domain": BOTHOST_DOMAIN or "not_set",
+        "database": "ready" if db_is_ready() else "fallback (in-memory)",
     }
+
+
+@app.get("/health/db")
+async def health_db():
+    """Детальный health-check пула PostgreSQL (для диагностики)."""
+    from miniapp.backend.db.connection import health_check as db_health_check
+    return await db_health_check()
 
 
 @app.get("/")
