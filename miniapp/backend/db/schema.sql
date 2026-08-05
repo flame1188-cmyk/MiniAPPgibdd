@@ -126,12 +126,18 @@ CREATE TABLE IF NOT EXISTS dtp_cards_cache (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_dtp_cards_cache_reg_dat
     ON dtp_cards_cache(reg_code, dat_hash);
 
--- Для выборки «валидных» записей (partial index — только не протухшие).
--- Ускоряет самый частый запрос:
+-- Для самого частого запроса:
 --   SELECT ... WHERE reg_code=%s AND dat_hash=%s AND expires_at > NOW()
-CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_valid
-    ON dtp_cards_cache(reg_code, dat_hash, expires_at)
-    WHERE expires_at > NOW();
+-- ВАЖНО: НЕ используем partial index (WHERE expires_at > NOW()),
+-- потому что NOW() — функция STABLE, а не IMMUTABLE. PostgreSQL
+-- запрещает STABLE-функции в предикате partial index:
+--   ERROR: functions in index predicate must be marked IMMUTABLE
+-- Это рушит весь init_pool() и переводит приложение в in-memory fallback.
+-- Обычный композитный индекс тоже эффективен: фильтр по expires_at > NOW()
+-- применяется после индексного поиска по (reg_code, dat_hash) — для одной
+-- записи это O(1).
+CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_reg_dat_expires
+    ON dtp_cards_cache(reg_code, dat_hash, expires_at);
 
 -- Для cleanup_old_cards() — быстрый поиск протухших записей.
 CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_expires
