@@ -21,6 +21,12 @@ python-dotenv==1.0.1
 # --- Geo (для concentration_points.py) ---
 shapely==2.0.6
 
+# --- Database (PostgreSQL через async-pool; опционально — если DATABASE_URL задан,
+# задачи и аудит-лог персистятся в БД; иначе работает in-memory fallback).
+# Ставим в основном requirements.txt, потому что Dockerfile собирает образ
+# отсюда (а не из miniapp/backend/requirements.txt).
+psycopg[binary,pool]>=3.2,<4
+
 # --- НП БДД module ---
 # jsonschema — для валидации freeze/history/plans/vehicles JSON.
 # openpyxl — уже выше (для converter.py, читает Excel).
