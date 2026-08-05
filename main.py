@@ -289,6 +289,20 @@ async def lifespan(app: FastAPI):
                         )
                 except Exception as ce:
                     logger.warning(f"Cleanup cards_cache error: {ce}")
+
+                # Этап 4: чистим протухшие очаги в clusters_cache.
+                try:
+                    from miniapp.backend.db.clusters_cache import (
+                        cleanup_old_clusters,
+                    )
+                    clusters_removed = await cleanup_old_clusters()
+                    if clusters_removed > 0:
+                        logger.info(
+                            f"Cleanup: удалено {clusters_removed} протухших "
+                            f"записей кэша очагов"
+                        )
+                except Exception as ce:
+                    logger.warning(f"Cleanup clusters_cache error: {ce}")
             except asyncio.CancelledError:
                 logger.info("Cleanup loop cancelled")
                 break
@@ -464,6 +478,26 @@ async def health_db_cards():
     - top_regions — топ-5 регионов по размеру кэша
     """
     from miniapp.backend.db.cards_cache import get_cache_stats
+    return await get_cache_stats()
+
+
+@app.get("/health/db/clusters")
+async def health_db_clusters():
+    """
+    Статистика кэша очагов концентрации ДТП в PostgreSQL (Этап 4).
+
+    Возвращает:
+    - configured / ready — состояние БД
+    - total_entries — всего записей в clusters_cache (включая протухшие)
+    - valid_entries — валидных записей (expires_at > NOW())
+    - total_clusters_cached — суммарное количество очагов в валидных записях
+    - total_preclusters_cached — суммарное количество предочагов
+    - entries_with_prev — сколько записей используют АППГ-сравнение
+    - regions_cached — сколько регионов имеют валидные записи
+    - oldest_expiry / newest_expiry — диапазон TTL
+    - top_regions — топ-5 регионов по размеру кэша
+    """
+    from miniapp.backend.db.clusters_cache import get_cache_stats
     return await get_cache_stats()
 
 
