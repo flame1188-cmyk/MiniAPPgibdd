@@ -107,6 +107,16 @@ CARDS_CACHE_TTL_SECONDS: int = int(os.getenv("CARDS_CACHE_TTL_SECONDS", "3600"))
 # Очаги стабильнее карточек — TTL по умолчанию 6 часов.
 CLUSTERS_CACHE_TTL_SECONDS: int = int(os.getenv("CLUSTERS_CACHE_TTL_SECONDS", "21600"))
 
+# Этап 5: TTL кэша готовых Excel-файлов (Файл 1 ДТП + Файл 2 участники)
+# в PostgreSQL. Excel — производное от cards (через gibdd_parser +
+# excel_generator), поэтому TTL должен быть ≤ CARDS_CACHE_TTL_SECONDS
+# (если cards протухли — Excel всё ещё валиден, но при cache miss cards
+# перечитаются и excel_cache обновится).
+# По умолчанию 24 часа (86400 сек) — совпадает с рекомендуемым TTL cards
+# для закрытых периодов. Экономия ~5-8 сек на каждого пользователя,
+# который запрашивает тот же регион+период.
+EXCEL_CACHE_TTL_SECONDS: int = int(os.getenv("EXCEL_CACHE_TTL_SECONDS", "86400"))
+
 
 # ========================
 # Валидация
