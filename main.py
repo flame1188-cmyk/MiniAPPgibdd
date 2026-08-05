@@ -397,6 +397,19 @@ app.add_middleware(
     expose_headers=["X-Task-Id"],
 )
 
+# === Фаза 1.5: Rate limiting middleware ===
+# Применяем лимит 60 req/min к /api/* (кроме exempt-эндпоинтов).
+# Webhook /bot/webhook и /health* — не лимитируются.
+from miniapp.backend.middleware.rate_limit import rate_limit_middleware
+app.middleware("http")(rate_limit_middleware)
+
+# === Фаза 1.6: Prometheus metrics ===
+# /metrics endpoint для скрапирования Prometheus.
+# Метрики: http_requests_total, http_request_duration_seconds,
+# gibdd_tasks_total, gibdd_tasks_in_progress, gibdd_cache_hits_total и др.
+from miniapp.backend.middleware.metrics import setup_metrics
+setup_metrics(app)
+
 # Монтируем все роутеры Mini App под /api
 app.mount("/api", miniapp_app)
 
