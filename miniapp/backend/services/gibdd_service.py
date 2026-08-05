@@ -21,7 +21,9 @@ import asyncio
 import importlib
 import logging
 import sys
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -138,11 +140,85 @@ class Task:
 
 
 # In-memory хранилище задач (для production заменить на Redis/PostgreSQL)
-_tasks: Dict[str, Task] = {}
+#
+# === Фаза 1.4: LRU-политика на _tasks ===
+# Раньше это был обычный Dict[str, Task], который рос без ограничений.
+# Каждая задача держит в памяти 3-12 MB (cards + prev_cards + raw_clusters +
+# analytics). При 30 пользователях × 5 задач = 150 × 8 MB = ~1.2 GB —
+# риск OOM на bothost с 2 GB RAM.
+#
+# OrderedDict + ручной LRU eviction: при добавлении новой задачи, если
+# размер превышает MAX_INMEMORY_TASKS, вытесняем самую старую (FIFO по
+# created_at). Тяжёлые поля вытесненной задачи сохраняются в БД (через
+# repository.save_task), лёгкие метаданные остаются доступны через
+# get_task_async() (lazy load из БД).
+#
+# MAX_INMEMORY_TASKS=50 выбрано как баланс: ~400 MB максимум в RAM,
+# достаточно для одновременной работы 10-15 пользователей.
+MAX_INMEMORY_TASKS = 50
+_tasks: OrderedDict[str, Task] = OrderedDict()
+_tasks_lock = threading.Lock()
+
+
+def _register_task(task: Task) -> None:
+    """Добавляет задачу в _tasks с LRU-eviction.
+
+    Если превышен лимит MAX_INMEMORY_TASKS — вытесняет самую старую задачу
+    (по created_at). Вытесняемая задача предварительно сохраняется в БД
+    (fire-and-forget через asyncio.create_task), чтобы метаданные не
+    потерялись и были доступны через get_task_async().
+    """
+    with _tasks_lock:
+        # Если задача уже есть — обновляем позицию (move_to_end)
+        if task.id in _tasks:
+            _tasks.move_to_end(task.id)
+            _tasks[task.id] = task
+            return
+
+        # Вытесняем самые старые, если превышен лимит
+        while len(_tasks) >= MAX_INMEMORY_TASKS:
+            evicted_id, evicted_task = _tasks.popitem(last=False)
+            logger.info(
+                f"_tasks LRU: вытеснена задача {evicted_id} "
+                f"(регион={evicted_task.region_code}, "
+                f"возраст={evicted_task.created_at.isoformat()}) — "
+                f"данные сохранены в БД, доступны через get_task_async()"
+            )
+            # Fire-and-forget persist в БД (если БД недоступна — теряем,
+            # но это acceptable: задача старая, пользователь вряд ли
+            # вернётся к ней в течение 24 часов)
+            try:
+                from ..db.repository import save_task
+                asyncio.create_task(save_task(evicted_task))
+            except Exception as exc:
+                logger.debug(
+                    f"_register_task: persist evicted {evicted_id} failed: {exc}"
+                )
+
+        _tasks[task.id] = task
+
+    # === Фаза 1.6: обновляем Prometheus gauge размера _tasks ===
+    try:
+        from ..middleware.metrics import update_tasks_in_memory
+        update_tasks_in_memory(len(_tasks))
+    except Exception:
+        pass
+
 
 # Корень проекта gibdd-bot (находится на 2 уровня выше этого файла):
 # miniapp/backend/services/gibdd_service.py → gibdd-bot/
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+# === Фаза 1.1: Semaphore на одновременные выгрузки ===
+# Ограничивает количество параллельно выполняемых execute_task().
+# Почему 3: API ГИБДД при 5+ одновременных запросах с одного IP
+# начинает возвращать 429/502; web-fallback (сайт stat.gibdd.ru) ещё
+# хуже — там POST-генерация отчётов. 3 параллельные выгрузки —
+# безопасный максимум. Остальные задачи ждут в очереди Semaphore.
+# При росте до 30 пользователей можно увеличить до 5.
+MAX_CONCURRENT_TASKS = 3
+_EXECUTE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
 def _ensure_project_path() -> None:
@@ -249,7 +325,7 @@ def create_task(
     """Создаёт новую задачу и возвращает её объект.
 
     Задача сохраняется:
-    - В in-memory _tasks (для совместимости со старым кодом)
+    - В in-memory _tasks (с LRU-eviction, см. _register_task)
     - В БД через repository.save_task (если DATABASE_URL задан)
     """
     task_id = uuid.uuid4().hex[:12]
@@ -262,7 +338,7 @@ def create_task(
         dat_list=dat_list,
         raw_query=raw_query,
     )
-    _tasks[task_id] = task
+    _register_task(task)
 
     # Асинхронно сохраняем в БД (если доступна).
     # Fire-and-forget — задача уже в in-memory и доступна сразу.
@@ -279,6 +355,10 @@ async def get_task_async(task_id: str) -> Optional[Task]:
     """Асинхронная версия get_task — проверяет и БД, и in-memory."""
     # Сначала in-memory (быстро + есть тяжёлые поля)
     if task_id in _tasks:
+        # LRU: обновляем позицию как "недавно использованную"
+        with _tasks_lock:
+            if task_id in _tasks:
+                _tasks.move_to_end(task_id)
         return _tasks[task_id]
 
     # Потом БД (если есть)
@@ -290,7 +370,7 @@ async def get_task_async(task_id: str) -> Optional[Task]:
         task = await load_task(task_id, _task_factory)
         if task is not None:
             attach_heavy_state(task)
-            _tasks[task_id] = task  # кэшируем
+            _register_task(task)  # добавляем в LRU-кэш
         return task
     except Exception as exc:
         logger.debug(f"get_task_async: DB load failed: {exc}")
@@ -377,6 +457,18 @@ def _task_dir(task_id: str) -> Path:
     return d
 
 
+def _parse_files_sync(gibdd_parser, cards):
+    """Синхронный хелпер для запуска в thread pool (Фаза 1.2).
+
+    gibdd_parser.build_file1_data + build_file2_data — CPU-bound парсинг
+    карточек. Объединены в одну функцию, чтобы вызвать через
+    asyncio.to_thread() один раз (а не два).
+    """
+    file1_data = gibdd_parser.build_file1_data(cards)
+    file2_data = gibdd_parser.build_file2_data(cards)
+    return file1_data, file2_data
+
+
 async def execute_task(task_id: str) -> None:
     """
     Асинхронное выполнение задачи выгрузки.
@@ -390,7 +482,39 @@ async def execute_task(task_id: str) -> None:
 
     На каждом переходе статуса — сохранение в БД через repository.save_task
     (если DATABASE_URL задан; иначе работает только in-memory).
+
+    === Фаза 1.1: Semaphore на одновременные выгрузки ===
+    Без ограничения 10 одновременных пользователей запустят 10 параллельных
+    пайплайнов, каждый делает 12 HTTP-запросов к API ГИБДД → 120 запросов
+    с одного IP → 429/502 блокировки. С Semaphore(3) — максимум 3
+    одновременных выгрузки, остальные ждут в очереди (пользователь видит
+    прогресс через polling статуса = FETCHING).
     """
+    # Таймаут 600 сек (10 мин) — если задача зависла, отпускаем semaphore.
+    # Обычно выгрузка занимает 30-60 сек, 10 мин — щедрый запас.
+    try:
+        async with _EXECUTE_SEMAPHORE:
+            # === Фаза 1.6: Prometheus metrics ===
+            from ..middleware.metrics import task_started, task_finished
+            task_started()
+            try:
+                await _execute_task_impl(task_id)
+            finally:
+                task_finished()
+    except Exception as exc:
+        logger.exception(f"Task {task_id} failed (semaphore-wrapped)")
+        task = _tasks.get(task_id)
+        if task:
+            task.status = TaskStatus.FAILED
+            task.error = str(exc)
+            task.updated_at = datetime.now(timezone.utc)
+            # Метрика: задача упала
+            from ..middleware.metrics import record_task_status
+            record_task_status("failed")
+
+
+async def _execute_task_impl(task_id: str) -> None:
+    """Реализация execute_task (вызывается под Semaphore)."""
     task = _tasks.get(task_id)
     if not task:
         # Возможно, задача создана в другом воркере и есть в БД.
@@ -456,8 +580,12 @@ async def execute_task(task_id: str) -> None:
         await _persist()
 
         gibdd_parser = _import_module("gibdd_parser")
-        file1_data = gibdd_parser.build_file1_data(cards)
-        file2_data = gibdd_parser.build_file2_data(cards)
+        # gibdd_parser.build_file1/2_data — синхронный CPU-bound парсинг
+        # 1500-3000 карточек. Выносим в thread pool, чтобы не блокировать
+        # event loop (Фаза 1.2).
+        file1_data, file2_data = await asyncio.to_thread(
+            _parse_files_sync, gibdd_parser, cards
+        )
 
         # === 3. ANALYTICS ===
         task.status = TaskStatus.ANALYTICS
@@ -549,10 +677,20 @@ async def execute_task(task_id: str) -> None:
             logger.debug(f"Task {task_id}: excel cache lookup failed: {exc}")
 
         # Если кэш промахнулся — генерируем Excel штатно (5-8 сек).
+        #
+        # === Фаза 1.2: генерация Excel в ThreadPool ===
+        # openpyxl — синхронная библиотека, при генерации Файла 2
+        # (3999 строк участников) занимает 5-6 сек и БЛОКИРУЕТ event loop.
+        # При 5 одновременных пользователях каждый следующий ждёт суммы
+        # времён всех предыдущих: 5 × 6 сек = 30 сек задержки.
+        # asyncio.to_thread() выносит генерацию в thread pool — event loop
+        # остаётся свободным для других запросов.
         if file1_bytes is None or file2_bytes is None:
             excel_gen = _import_module("excel_generator")
-            file1_bytes, file2_bytes = excel_gen.generate_both_files(
-                file1_data, file2_data
+            file1_bytes, file2_bytes = await asyncio.to_thread(
+                excel_gen.generate_both_files,
+                file1_data,
+                file2_data,
             )
 
             # === Этап 5: сохраняем в кэш для следующих пользователей ===
@@ -660,6 +798,13 @@ async def execute_task(task_id: str) -> None:
         task.updated_at = datetime.now(timezone.utc)
         await _persist()
 
+        # === Фаза 1.6: Prometheus metric — задача завершена успешно ===
+        try:
+            from ..middleware.metrics import record_task_status
+            record_task_status("done")
+        except Exception:
+            pass
+
         logger.info(
             f"Task {task_id} done: {task.total_dtp} ДТП, "
             f"{task.total_dead} погибших, {task.total_injured} раненых, "
@@ -672,6 +817,13 @@ async def execute_task(task_id: str) -> None:
         task.error = str(exc)
         task.updated_at = datetime.now(timezone.utc)
         await _persist()
+
+        # === Фаза 1.6: Prometheus metric — задача упала ===
+        try:
+            from ..middleware.metrics import record_task_status
+            record_task_status("failed")
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -2115,4 +2267,10 @@ async def cleanup_old_tasks(max_age_hours: int = 24) -> int:
         logger.info(
             f"Cleaned up: in-memory={len(to_delete)}, total(inc. DB)={deleted}"
         )
+        # === Фаза 1.6: обновляем gauge размера _tasks после cleanup ===
+        try:
+            from ..middleware.metrics import update_tasks_in_memory
+            update_tasks_in_memory(len(_tasks))
+        except Exception:
+            pass
     return max(deleted, len(to_delete))
