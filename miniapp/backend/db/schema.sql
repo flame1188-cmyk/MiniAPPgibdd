@@ -87,3 +87,56 @@ CREATE TRIGGER trg_tasks_updated_at
     BEFORE UPDATE ON tasks
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+
+-- ============================================================
+-- dtp_cards_cache: кэш карточек ДТП в PostgreSQL (Этап 3).
+-- Заменяет in-memory LRU из data_cache.py на персистентное хранилище,
+-- разделяемое между всеми воркерами и переживающее рестарт.
+--
+-- Ключ кэша: (reg_code, dat_hash) где
+--   dat_hash = MD5 от отсортированного списка "m.YYYY" дат,
+--   склеенных через ','. Пример:
+--     dat_list = ["1.2026", "2.2026"] → dat_hash = MD5("1.2026,2.2026")
+--
+-- Это даёт стабильный ключ, не зависящий от порядка месяцев в массиве
+-- (сортируем перед хэшированием), и позволяет использовать в кэше
+-- составные запросы за несколько периодов сразу.
+--
+-- TTL: expires_at = created_at + TTL_SECONDS (по умолчанию 1 час).
+-- Записи с expires_at < NOW() считаются протухшими и игнорируются
+-- при SELECT. Физическая очистка — через cleanup_old_cards() или
+-- background job (см. db/cards_cache.py).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dtp_cards_cache (
+    id              BIGSERIAL    PRIMARY KEY,
+    reg_code        VARCHAR(16)  NOT NULL,
+    dat_hash        CHAR(32)     NOT NULL,            -- MD5 hash
+    dat_list        JSONB        NOT NULL,            -- ["1.2026","2.2026",...] для диагностики
+    payload         JSONB        NOT NULL,            -- список карточек ДТП
+    errors          JSONB        NOT NULL DEFAULT '[]'::jsonb,  -- ошибки выгрузки
+    total_cards     INT          NOT NULL DEFAULT 0,
+    source          VARCHAR(16)  NOT NULL DEFAULT 'api',  -- 'api' | 'web_fallback'
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ  NOT NULL
+);
+
+-- Уникальный индекс: одна запись на (reg_code, dat_hash).
+-- На INSERT конфликтов (DO UPDATE) обновляем payload/expires_at.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dtp_cards_cache_reg_dat
+    ON dtp_cards_cache(reg_code, dat_hash);
+
+-- Для выборки «валидных» записей (partial index — только не протухшие).
+-- Ускоряет самый частый запрос:
+--   SELECT ... WHERE reg_code=%s AND dat_hash=%s AND expires_at > NOW()
+CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_valid
+    ON dtp_cards_cache(reg_code, dat_hash, expires_at)
+    WHERE expires_at > NOW();
+
+-- Для cleanup_old_cards() — быстрый поиск протухших записей.
+CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_expires
+    ON dtp_cards_cache(expires_at);
+
+-- Для invalidate_by_region — быстрое удаление всех записей региона.
+CREATE INDEX IF NOT EXISTS idx_dtp_cards_cache_reg
+    ON dtp_cards_cache(reg_code);
