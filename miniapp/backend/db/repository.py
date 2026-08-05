@@ -1,0 +1,575 @@
+"""
+TaskRepository — CRUD задач выгрузки + аудит-лог обращений к ПДн.
+
+Дизайн:
+- Если PostgreSQL готов (is_db_ready() == True) — операции идут в БД,
+  in-memory словарь используется как кэш для тяжёлых полей (cards,
+  raw_clusters и т.д.), которые не сериализуются в БД на Этапе 2.
+- Если PostgreSQL НЕ готов — операции идут только in-memory,
+  поведение идентично тому, что было до подключения БД.
+
+Это гарантирует, что:
+1. При недоступности БД приложение не падает.
+2. При рестарте с БД — задачи восстанавливаются (метаданные + files +
+   analytics), но тяжёлые поля (cards, raw_clusters) нужно
+   перезагрузить (через data_cache или повторный расчёт).
+3. При множественных воркерах — метаданные консистентны (тяжёлые
+   поля могут расходиться, но это решается на Этапе 3 кэшем карточек).
+"""
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from psycopg.types.json import Json
+from psycopg.rows import dict_row
+
+from .connection import get_pool, is_db_ready
+
+logger = logging.getLogger(__name__)
+
+# ====================================================================
+# In-memory кэш для тяжёлых полей Task
+# ====================================================================
+# Ключ: task_id, значение: dict с полями {cards, prev_cards, prev_label,
+# prev_cards_loaded, comparison, clusters_state, llm_summary_state,
+# llm_qa_history, last_point_stats, raw_clusters, raw_preclusters,
+# last_point_cards_current, last_point_cards_prev, last_point_params}
+#
+# Зачем: эти поля не персистятся в БД на Этапе 2 (слишком большие),
+# но нужны для работы analytics/clusters/point_stats/LLM. При рестарте
+# они теряются — пользователь может либо пере-открыть вкладку (тогда
+# данные перезагружаются лениво через ensure_prev_cards и т.д.),
+# либо пересоздать задачу.
+_TASKS_HEAVY_STATE: Dict[str, Dict[str, Any]] = {}
+
+# In-memory хранилище метаданных задач — fallback при отсутствии БД.
+# При наличии БД — используется только как кэш поверх SQL (чтобы не
+# дёргать БД на каждый get_task).
+_TASKS_MEMORY: Dict[str, "Task"] = {}  # type: ignore[name-defined]
+
+
+def set_heavy_state(task_id: str, key: str, value: Any) -> None:
+    """Сохраняет тяжёлое поле Task в in-memory кэше."""
+    if task_id not in _TASKS_HEAVY_STATE:
+        _TASKS_HEAVY_STATE[task_id] = {}
+    _TASKS_HEAVY_STATE[task_id][key] = value
+
+
+def get_heavy_state(task_id: str, key: str, default: Any = None) -> Any:
+    """Достаёт тяжёлое поле Task из in-memory кэша."""
+    return _TASKS_HEAVY_STATE.get(task_id, {}).get(key, default)
+
+
+def drop_heavy_state(task_id: str) -> None:
+    """Удаляет весь тяжёлый state задачи (при cleanup)."""
+    _TASKS_HEAVY_STATE.pop(task_id, None)
+
+
+# ====================================================================
+# Сохранение задачи в БД
+# ====================================================================
+async def save_task(task: Any) -> None:
+    """
+    Сохраняет метаданные задачи в БД (INSERT или UPDATE по id).
+
+    Тяжёлые поля (cards, raw_clusters и т.д.) НЕ сохраняются —
+    они остаются in-memory через set_heavy_state().
+    """
+    # Сохраняем тяжёлые поля в memory-кэш (всегда, даже если БД есть)
+    _cache_heavy_fields(task)
+
+    if not is_db_ready():
+        # БД нет — fallback: обновляем in-memory
+        _TASKS_MEMORY[task.id] = task
+        return
+
+    pool = get_pool()
+    if pool is None:
+        _TASKS_MEMORY[task.id] = task
+        return
+
+    try:
+        async with pool.connection() as conn:
+            # upsert: INSERT ... ON CONFLICT (id) DO UPDATE
+            await conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, user_id, region_code, region_name, period_label,
+                    dat_list, raw_query, status, progress, error,
+                    total_dtp, total_dead, total_injured, files,
+                    analytics, clusters_result, created_at, updated_at
+                ) VALUES (
+                    %(id)s, %(user_id)s, %(region_code)s, %(region_name)s,
+                    %(period_label)s, %(dat_list)s, %(raw_query)s,
+                    %(status)s, %(progress)s, %(error)s,
+                    %(total_dtp)s, %(total_dead)s, %(total_injured)s,
+                    %(files)s, %(analytics)s, %(clusters_result)s,
+                    %(created_at)s, %(updated_at)s
+                )
+                ON CONFLICT (id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    progress = EXCLUDED.progress,
+                    error = EXCLUDED.error,
+                    total_dtp = EXCLUDED.total_dtp,
+                    total_dead = EXCLUDED.total_dead,
+                    total_injured = EXCLUDED.total_injured,
+                    files = EXCLUDED.files,
+                    analytics = COALESCE(EXCLUDED.analytics, tasks.analytics),
+                    clusters_result = COALESCE(
+                        EXCLUDED.clusters_result, tasks.clusters_result
+                    ),
+                    updated_at = NOW()
+                """,
+                params={
+                    "id": task.id,
+                    "user_id": task.user_id,
+                    "region_code": task.region_code,
+                    "region_name": task.region_name,
+                    "period_label": task.period_label,
+                    "dat_list": Json(task.dat_list),
+                    "raw_query": task.raw_query,
+                    "status": task.status.value
+                    if hasattr(task.status, "value")
+                    else str(task.status),
+                    "progress": task.progress,
+                    "error": task.error,
+                    "total_dtp": task.total_dtp,
+                    "total_dead": task.total_dead,
+                    "total_injured": task.total_injured,
+                    "files": Json(task.files),
+                    "analytics": Json(task.analytics)
+                    if task.analytics is not None
+                    else None,
+                    "clusters_result": Json(task.clusters_state.result)
+                    if task.clusters_state
+                    and task.clusters_state.result is not None
+                    else None,
+                    "created_at": task.created_at,
+                    "updated_at": task.updated_at,
+                },
+            )
+            await conn.commit()
+
+        # Также обновляем in-memory кэш
+        _TASKS_MEMORY[task.id] = task
+
+    except Exception as exc:
+        logger.warning(
+            f"save_task({task.id}) failed: {exc} — used in-memory fallback"
+        )
+        _TASKS_MEMORY[task.id] = task
+
+
+# ====================================================================
+# Загрузка задачи из БД
+# ====================================================================
+async def load_task(task_id: str, task_factory: Any) -> Optional[Any]:
+    """
+    Загружает задачу по id.
+
+    Сначала проверяет in-memory кэш (быстро + содержит тяжёлые поля).
+    Если нет — идёт в БД (если готова) и конструирует Task из строки.
+    Если нет нигде — None.
+
+    task_factory: callable(id, user_id, region_code, region_name,
+                           period_label, dat_list, raw_query) -> Task
+    Используется для создания объекта Task без циклического импорта.
+    """
+    # 1. Memory cache hit
+    if task_id in _TASKS_MEMORY:
+        return _TASKS_MEMORY[task_id]
+
+    if not is_db_ready():
+        return None
+
+    pool = get_pool()
+    if pool is None:
+        return None
+
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id, user_id, region_code, region_name, period_label,
+                       dat_list, raw_query, status, progress, error,
+                       total_dtp, total_dead, total_injured, files,
+                       analytics, clusters_result,
+                       created_at, updated_at
+                FROM tasks WHERE id = %(id)s
+                """,
+                params={"id": task_id},
+                prepare=False,
+            )
+            row = await cur.fetchone()
+
+        if row is None:
+            return None
+
+        # Создаём Task через factory (избегаем циклического импорта)
+        task = task_factory(
+            id=row["id"],
+            user_id=row["user_id"],
+            region_code=row["region_code"],
+            region_name=row["region_name"],
+            period_label=row["period_label"],
+            dat_list=list(row["dat_list"]) if row["dat_list"] else [],
+            raw_query=row["raw_query"] or "",
+        )
+
+        # Восстанавливаем сохранённые поля
+        _restore_status(task, row["status"], row["progress"], row["error"])
+        task.total_dtp = row["total_dtp"] or 0
+        task.total_dead = row["total_dead"] or 0
+        task.total_injured = row["total_injured"] or 0
+        task.files = list(row["files"]) if row["files"] else []
+        task.analytics = row["analytics"]
+        if (
+            row["clusters_result"]
+            and task.clusters_state
+        ):
+            task.clusters_state.result = row["clusters_result"]
+            task.clusters_state.status = _make_analysis_status("done")
+            task.clusters_state.progress = 100
+            task.clusters_state.stage = "Готово (восстановлено из БД)"
+
+        # created_at/updated_at из БД
+        if row["created_at"]:
+            task.created_at = row["created_at"]
+        if row["updated_at"]:
+            task.updated_at = row["updated_at"]
+
+        # Кэшируем
+        _TASKS_MEMORY[task_id] = task
+        return task
+
+    except Exception as exc:
+        logger.warning(f"load_task({task_id}) failed: {exc}")
+        return None
+
+
+def _restore_status(task: Any, status: str, progress: int, error: Optional[str]) -> None:
+    """Восстанавливает статус задачи из строкового представления."""
+    # TaskStatus — Enum, ищем по value
+    try:
+        from ..services.gibdd_service import TaskStatus
+
+        for s in TaskStatus:
+            if s.value == status:
+                task.status = s
+                break
+    except Exception:
+        pass
+    task.progress = progress or 0
+    task.error = error
+
+
+def _make_analysis_status(value: str):
+    """Создаёт AnalysisStatus из строкового значения."""
+    try:
+        from ..services.gibdd_service import AnalysisStatus
+
+        for s in AnalysisStatus:
+            if s.value == value:
+                return s
+    except Exception:
+        pass
+    return None
+
+
+# ====================================================================
+# Список задач пользователя
+# ====================================================================
+async def list_user_tasks_from_db(
+    user_id: int, limit: int, task_factory: Any
+) -> List[Any]:
+    """
+    Возвращает последние N задач пользователя (из БД).
+    Если БД недоступна — fallback на in-memory.
+    """
+    if not is_db_ready():
+        # In-memory fallback
+        user_tasks = [
+            t for t in _TASKS_MEMORY.values() if t.user_id == user_id
+        ]
+        user_tasks.sort(key=lambda t: t.created_at, reverse=True)
+        return user_tasks[:limit]
+
+    pool = get_pool()
+    if pool is None:
+        return []
+
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT id, user_id, region_code, region_name, period_label,
+                       dat_list, raw_query, status, progress, error,
+                       total_dtp, total_dead, total_injured, files,
+                       analytics, clusters_result,
+                       created_at, updated_at
+                FROM tasks
+                WHERE user_id = %(uid)s
+                ORDER BY created_at DESC
+                LIMIT %(limit)s
+                """,
+                params={"uid": user_id, "limit": limit},
+                prepare=False,
+            )
+            rows = await cur.fetchall()
+
+        tasks: List[Any] = []
+        for row in rows:
+            # Проверяем in-memory кэш (чтобы вернуть тяжёлые поля, если они есть)
+            if row["id"] in _TASKS_MEMORY:
+                tasks.append(_TASKS_MEMORY[row["id"]])
+                continue
+
+            task = task_factory(
+                id=row["id"],
+                user_id=row["user_id"],
+                region_code=row["region_code"],
+                region_name=row["region_name"],
+                period_label=row["period_label"],
+                dat_list=list(row["dat_list"]) if row["dat_list"] else [],
+                raw_query=row["raw_query"] or "",
+            )
+            _restore_status(task, row["status"], row["progress"], row["error"])
+            task.total_dtp = row["total_dtp"] or 0
+            task.total_dead = row["total_dead"] or 0
+            task.total_injured = row["total_injured"] or 0
+            task.files = list(row["files"]) if row["files"] else []
+            task.analytics = row["analytics"]
+            if row["clusters_result"] and task.clusters_state:
+                task.clusters_state.result = row["clusters_result"]
+                task.clusters_state.status = _make_analysis_status("done")
+                task.clusters_state.progress = 100
+                task.clusters_state.stage = "Готово (восстановлено из БД)"
+
+            if row["created_at"]:
+                task.created_at = row["created_at"]
+            if row["updated_at"]:
+                task.updated_at = row["updated_at"]
+
+            _TASKS_MEMORY[task.id] = task
+            tasks.append(task)
+
+        return tasks
+
+    except Exception as exc:
+        logger.warning(f"list_user_tasks_from_db failed: {exc}")
+        # In-memory fallback
+        user_tasks = [t for t in _TASKS_MEMORY.values() if t.user_id == user_id]
+        user_tasks.sort(key=lambda t: t.created_at, reverse=True)
+        return user_tasks[:limit]
+
+
+# ====================================================================
+# Удаление старых задач
+# ====================================================================
+async def delete_old_tasks(
+    max_age_hours: int, project_root: Path
+) -> int:
+    """
+    Удаляет задачи старше max_age_hours.
+
+    Удаляет из:
+    - in-memory кэша (_TASKS_MEMORY и _TASKS_HEAVY_STATE)
+    - БД (если доступна)
+    - диска (data/tasks/{task_id}/)
+
+    Возвращает количество удалённых задач.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff_ts = now.timestamp() - max_age_hours * 3600
+
+    # 1. Собираем кандидатов на удаление из in-memory
+    to_delete_memory = [
+        tid
+        for tid, task in _TASKS_MEMORY.items()
+        if task.created_at.timestamp() < cutoff_ts
+    ]
+
+    # 2. Если БД есть — собираем кандидатов и оттуда
+    db_deleted = 0
+    if is_db_ready():
+        pool = get_pool()
+        if pool is not None:
+            try:
+                async with pool.connection() as conn:
+                    # Сначала выбираем id задач для удаления файлов
+                    cur = await conn.execute(
+                        """
+                        SELECT id, files FROM tasks
+                        WHERE created_at < NOW() - (%(hours)s || ' hours')::INTERVAL
+                        """,
+                        params={"hours": str(max_age_hours)},
+                        prepare=False,
+                    )
+                    rows = await cur.fetchall()
+
+                    # Удаляем файлы с диска для найденных задач
+                    for row in rows:
+                        tid = row["id"]
+                        files = row["files"] or []
+                        for f in files:
+                            try:
+                                Path(f.get("path", "")).unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                        # Удаляем директорию задачи
+                        try:
+                            task_dir = project_root / "data" / "tasks" / tid
+                            if task_dir.exists():
+                                task_dir.rmdir()
+                        except Exception:
+                            pass
+
+                    # Удаляем сами строки из БД
+                    if rows:
+                        ids_to_delete = [r["id"] for r in rows]
+                        await conn.execute(
+                            "DELETE FROM tasks WHERE id = ANY(%s)",
+                            params=(ids_to_delete,),
+                        )
+                        await conn.commit()
+                        db_deleted = len(ids_to_delete)
+
+            except Exception as exc:
+                logger.warning(f"delete_old_tasks (DB) failed: {exc}")
+
+    # 3. In-memory cleanup
+    memory_deleted = 0
+    for tid in to_delete_memory:
+        _TASKS_MEMORY.pop(tid, None)
+        drop_heavy_state(tid)
+        # Удаляем файлы с диска
+        task = _TASKS_MEMORY.get(tid)
+        if task:
+            for f in task.files:
+                try:
+                    Path(f.get("path", "")).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                task_dir = project_root / "data" / "tasks" / tid
+                if task_dir.exists():
+                    task_dir.rmdir()
+            except Exception:
+                pass
+        memory_deleted += 1
+
+    total = max(db_deleted, memory_deleted)
+    if total > 0:
+        logger.info(
+            f"Cleanup: удалено {total} старых задач "
+            f"(db={db_deleted}, memory={memory_deleted})"
+        )
+    return total
+
+
+# ====================================================================
+# Аудит-лог обращений к ПДн (152-ФЗ)
+# ====================================================================
+async def log_access(
+    user_id: int,
+    action: str,
+    region_code: Optional[str] = None,
+    period_label: Optional[str] = None,
+    task_id: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Логирует обращение пользователя к данным ДТП.
+
+    См. миниapp/README.md → «Требования 152-ФЗ»:
+    «Журнал аудита доступа к ПДн (логировать все запросы
+    user_id → region_code, period)».
+
+    Если БД недоступна — запись логируется только в обычный логгер
+    (теряется при рестарте, но не роняет приложение).
+    """
+    if not is_db_ready():
+        logger.info(
+            f"ACCESS_LOG (in-memory): user={user_id} action={action} "
+            f"region={region_code} period={period_label} task={task_id}"
+        )
+        return
+
+    pool = get_pool()
+    if pool is None:
+        return
+
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO access_log (
+                    user_id, region_code, period_label, action, task_id, details
+                ) VALUES (
+                    %(uid)s, %(reg)s, %(period)s, %(action)s, %(tid)s, %(details)s
+                )
+                """,
+                params={
+                    "uid": user_id,
+                    "reg": region_code,
+                    "period": period_label,
+                    "action": action,
+                    "tid": task_id,
+                    "details": Json(details) if details else None,
+                },
+            )
+            await conn.commit()
+    except Exception as exc:
+        logger.warning(f"log_access failed: {exc}")
+
+
+# ====================================================================
+# Вспомогательные: сохранение/восстановление тяжёлых полей
+# ====================================================================
+# Список полей Task, которые НЕ персистятся в БД на Этапе 2.
+# Они остаются in-memory, чтобы не раздувать JSONB-колонки.
+# Этап 3 (cards cache) и Этап 4 (clusters history) закроют их отдельно.
+_HEAVY_FIELDS = (
+    "cards",
+    "prev_cards",
+    "prev_label",
+    "prev_cards_loaded",
+    "comparison",
+    "llm_summary_state",
+    "llm_qa_history",
+    "last_point_stats",
+    "raw_clusters",
+    "raw_preclusters",
+    "last_point_cards_current",
+    "last_point_cards_prev",
+    "last_point_params",
+)
+
+
+def _cache_heavy_fields(task: Any) -> None:
+    """Копирует тяжёлые поля Task в in-memory кэш."""
+    cache = _TASKS_HEAVY_STATE.setdefault(task.id, {})
+    for field_name in _HEAVY_FIELDS:
+        if hasattr(task, field_name):
+            cache[field_name] = getattr(task, field_name)
+
+
+def attach_heavy_state(task: Any) -> None:
+    """
+    Присоединяет к Task тяжёлые поля из кэша (если они есть).
+    Вызывается после load_task, чтобы восстановить состояние.
+    """
+    cache = _TASKS_HEAVY_STATE.get(task.id)
+    if not cache:
+        return
+    for field_name in _HEAVY_FIELDS:
+        if field_name in cache and hasattr(task, field_name):
+            # Не затираем поле, если оно уже заполнено
+            # (например, после ensure_prev_cards)
+            current = getattr(task, field_name)
+            if not current and cache[field_name]:
+                setattr(task, field_name, cache[field_name])
