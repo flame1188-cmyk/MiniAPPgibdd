@@ -215,6 +215,12 @@ def find_region(text: str, regions: list[dict[str, str]]) -> tuple[str, str] | N
       5. Поиск по сокращённому названию
     """
     text_lower = text.lower().strip()
+    # Early return для пустого текста — иначе '' in any_normalized == True
+    # даёт score=60 > порога 30, и find_region возвращает первый регион.
+    # Фикс Wave 1: parse_user_message фильтрует пустой текст раньше, но
+    # find_region может вызываться и напрямую — защищаемся здесь.
+    if not text_lower:
+        return None
     search_index = _build_search_index(regions)
 
     # 1. Поиск по коду региона (цифры в запросе)
@@ -248,13 +254,20 @@ def find_region(text: str, regions: list[dict[str, str]]) -> tuple[str, str] | N
         # Текст запроса содержится в названии региона
         elif text_lower in normalized:
             score = 60 + len(text_lower)
-        # Проверяем каждое слово из запроса
+        # Проверяем каждое слово из запроса как ОТДЕЛЬНОЕ слово в названии
+        # региона (через word boundary), а не как подстроку.
+        # Раньше было `if word in normalized` — это пропускало подстроки:
+        #   слово 'год' (len=3) находилось как подстрока 'воло[год]ская',
+        #   score = 30+3 = 33 > порога 30 → любой запрос со словом 'год'
+        #   ложно матчился с Вологодской областью.
+        # Фикс Wave 1: regex с \b...\b — 'год' в 'вологодская' НЕ матчится,
+        # потому что 'год' там не отдельное слово.
         else:
             words = text_lower.split()
             for word in words:
                 if len(word) < 3:
                     continue  # Пропускаем слишком короткие слова
-                if word in normalized:
+                if re.search(r'\b' + re.escape(word) + r'\b', normalized):
                     score += 30 + len(word)
 
         if score > best_score:
@@ -302,9 +315,14 @@ def parse_period(text: str) -> ParsedPeriod | None:
         )
 
     # --- Квартал ---
+    # i{1,3}v? — матчит I/II/III/IV как римские цифры.
+    # Раньше было i{1,2}v? — матчило максимум 2 'i', поэтому 'III' → 'II' (Q2).
+    # Фикс Wave 1: i{1,3}v? корректно покрывает все 4 квартала.
+    # 'vi{0,3}|v|ix|x{1,3}' оставлены для совместимости (не используются для кварталов,
+    # но могут встречаться в римских месяцах — хотя сейчас кварталы только I-IV).
     m = re.search(
         r"(?:за\s*)?"
-        r"(?:(i{1,2}v?|vi{0,3}|iv|v|ix|x{1,3})\s*(?:кв|квартал))\s*"
+        r"(?:(i{1,3}v?|vi{0,3}|iv|v|ix|x{1,3})\s*(?:кв|квартал))\s*"
         r"(\d{4})",
         text_lower,
     )
