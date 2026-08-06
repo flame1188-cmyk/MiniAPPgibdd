@@ -101,6 +101,95 @@ FRONTEND_DIST = _PROJECT_ROOT / "miniapp" / "frontend" / "dist"
 
 
 # ============================================================
+# === Phase 2 fix: Фоновое обновление runtime-метрик ===
+# ============================================================
+# Проблема, которую решает этот блок:
+#   - gibdd_process_rss_bytes всегда 0, т.к. update_process_rss()
+#     вызывался только из /health/detailed.
+#   - gibdd_db_pool_size не имел значений по той же причине + формула
+#     active/idle была неверной (использовалась requests_waiting,
+#     что значит "запросы в очереди", а не "активные соединения").
+#
+# Решение: выделили логику в _update_runtime_metrics(), вызываем:
+#   1. Один раз при старте приложения (после db_init_pool).
+#   2. Каждые 30 секунд из фоновой задачи _metrics_updater_loop.
+#   3. По запросу /health/detailed (для согласованности JSON и metrics).
+# ============================================================
+import resource as _resource_module
+
+
+def _update_runtime_metrics() -> dict:
+    """Обновляет Prometheus gauges: gibdd_process_rss_bytes и gibdd_db_pool_size.
+
+    Возвращает dict с актуальными значениями (используется в /health/detailed).
+    Формула active/idle исправлена:
+      - pool_size       = всего открытых соединений (active+idle).
+      - pool_available  = свободных (idle) соединений.
+      - active = pool_size - pool_available.
+      - idle   = pool_available.
+    Раньше использовалось stats.get("requests_waiting") — это очередь
+    ожидающих запросов, а не активные соединения (всегда 0 при отсутствии нагрузки).
+    """
+    # RSS памяти процесса (Linux: ru_maxrss в KB)
+    try:
+        rss_kb = _resource_module.getrusage(_resource_module.RUSAGE_SELF).ru_maxrss
+        rss_mb = round(rss_kb / 1024, 1)
+        if rss_mb > 0:
+            update_process_rss(int(rss_mb * 1024 * 1024))
+    except Exception as exc:
+        logger.debug(f"_update_runtime_metrics: RSS error: {exc}")
+        rss_mb = -1
+
+    # Пул PostgreSQL
+    pool_info: dict = {"status": "fallback (in-memory)"}
+    pool = db_get_pool() if db_is_ready() else None
+    if pool is not None:
+        try:
+            stats = pool.get_stats() if hasattr(pool, "get_stats") else {}
+            pool_size = int(stats.get("pool_size", 0))
+            pool_available = int(stats.get("pool_available", 0))
+            max_size = int(getattr(pool, "_max_size", 0))
+            min_size = int(getattr(pool, "_min_size", 0))
+            active = max(0, pool_size - pool_available)
+            idle = pool_available
+
+            update_db_pool_metrics(active=active, idle=idle, max_size=max_size)
+
+            pool_info = {
+                "max_size": max_size,
+                "min_size": min_size,
+                "stats": stats,
+                "active": active,
+                "idle": idle,
+            }
+        except Exception as exc:
+            pool_info = {"error": str(exc)}
+            logger.debug(f"_update_runtime_metrics: pool error: {exc}")
+
+    return {"rss_mb": rss_mb, "pool": pool_info}
+
+
+async def _metrics_updater_loop():
+    """Фоновая задача: каждые 30 секунд обновляет runtime-метрики.
+
+    Это гарантирует, что gibdd_process_rss_bytes и gibdd_db_pool_size
+    всегда имеют актуальные значения в /metrics, независимо от того,
+    вызывался ли /health/detailed.
+    """
+    logger.info("Запущен фоновый апдейтер runtime-метрик (каждые 30 сек)")
+    while True:
+        try:
+            await asyncio.sleep(30)
+            _update_runtime_metrics()
+        except asyncio.CancelledError:
+            logger.info("Metrics updater loop cancelled")
+            break
+        except Exception as exc:
+            logger.warning(f"Metrics updater loop error: {exc}")
+            await asyncio.sleep(60)
+
+
+# ============================================================
 # Создание Telegram Application (через существующий bot._build_app)
 # ============================================================
 def _create_telegram_app() -> Application:
@@ -271,6 +360,21 @@ async def lifespan(app: FastAPI):
             f"PostgreSQL init failed: {exc} — продолжаем с in-memory fallback"
         )
 
+    # === Phase 2 fix: стартовое обновление runtime-метрик ===
+    # Сразу после инициализации пула — чтобы метрики были видны в /metrics
+    # уже при первом скрапе Prometheus'ом (без ожидания 30 сек).
+    try:
+        _update_runtime_metrics()
+        logger.info("Runtime-метрики (RSS, db_pool) обновлены при старте")
+    except Exception as exc:
+        logger.warning(f"Стартовое обновление метрик не удалось: {exc}")
+
+    # === Фоновая задача: периодическое обновление runtime-метрик ===
+    # gibdd_process_rss_bytes и gibdd_db_pool_size нужно обновлять
+    # независимо от вызовов /health/detailed, иначе в /metrics будут
+    # нули (Prometheus их не покажет).
+    metrics_updater_task = asyncio.create_task(_metrics_updater_loop())
+
     # === Фоновая задача: периодическая очистка старых задач ===
     # In-memory хранилище _tasks растёт без ограничений — каждая задача
     # держит мегабайты карточек ДТП, prev_cards, raw_clusters и т.д.
@@ -353,6 +457,13 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
+    # === Phase 2 fix: останавливаем апдейтер метрик ===
+    metrics_updater_task.cancel()
+    try:
+        await metrics_updater_task
     except asyncio.CancelledError:
         pass
 
@@ -591,7 +702,6 @@ async def health_detailed():
     - Alert rules: RSS > 1.5 GB, semaphore_occupied == max, db_pool active == max
     - Post-mortem анализа (request_id последнего запроса виден в логах)
     """
-    import resource
     from miniapp.backend.services.gibdd_service import (
         _tasks,
         MAX_CONCURRENT_TASKS,
@@ -599,47 +709,13 @@ async def health_detailed():
         _EXECUTE_SEMAPHORE,
     )
 
-    # RSS памяти процесса (Linux: ru_maxrss в KB)
-    try:
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        rss_mb = round(rss_kb / 1024, 1)
-    except Exception:
-        rss_mb = -1
-
-    # Размер пула PostgreSQL (если доступен)
-    db_pool_info: dict
-    pool = db_get_pool() if db_is_ready() else None
-    if pool is not None:
-        try:
-            # psycopg_pool AsyncConnectionPool имеет stats()
-            stats = pool.get_stats() if hasattr(pool, "get_stats") else {}
-            db_pool_info = {
-                "max_size": getattr(pool, "_max_size", "unknown"),
-                "min_size": getattr(pool, "_min_size", "unknown"),
-                "stats": stats,
-            }
-            # Обновляем Prometheus метрики
-            try:
-                active = stats.get("requests_waiting", 0)
-                idle = stats.get("pool_size", 0) - active
-                update_db_pool_metrics(
-                    active=active,
-                    idle=max(0, idle),
-                    max_size=int(getattr(pool, "_max_size", 0)),
-                )
-            except Exception:
-                pass
-        except Exception as exc:
-            db_pool_info = {"error": str(exc)}
-    else:
-        db_pool_info = {"status": "fallback (in-memory)"}
-
-    # Обновляем Prometheus gauge RSS
-    try:
-        if rss_mb > 0:
-            update_process_rss(int(rss_mb * 1024 * 1024))
-    except Exception:
-        pass
+    # === Phase 2 fix: используем общий хелпер ===
+    # Это гарантирует, что JSON-ответ и Prometheus-метрики согласованы
+    # (раньше в JSON было rss_mb=447, а в /metrics gibdd_process_rss_bytes=0,
+    # потому что метрики обновлялись только здесь, а не в фоне).
+    rt = _update_runtime_metrics()
+    rss_mb = rt["rss_mb"]
+    db_pool_info = rt["pool"]
 
     # Текущее количество задач и semaphore
     semaphore_occupied = MAX_CONCURRENT_TASKS - _EXECUTE_SEMAPHORE._value if hasattr(_EXECUTE_SEMAPHORE, "_value") else None
