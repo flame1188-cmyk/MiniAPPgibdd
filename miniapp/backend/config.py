@@ -64,6 +64,29 @@ class Settings(BaseSettings):
         description="Домен вида bot1234.bothost.tech, который выдал bothost",
     )
 
+    # === Phase 2: Scalability settings ===
+    max_concurrent_tasks: int = Field(
+        default=5,
+        description=(
+            "Максимум одновременных execute_task() (Semaphore). "
+            "3 для 2-10 пользователей, 5 для 10-30, 8 для 30+."
+        ),
+    )
+    max_inmemory_tasks: int = Field(
+        default=50,
+        description=(
+            "Размер in-memory LRU _tasks (50 = ~400 MB максимум RAM)."
+        ),
+    )
+    rate_limit_per_minute: int = Field(
+        default=60,
+        description="Лимит запросов в минуту на пользователя (slowapi).",
+    )
+    log_format: str = Field(
+        default="text",
+        description="Формат логов: text или json (для Loki/ELK).",
+    )
+
     # === Database (опционально) ===
     database_url: str = Field(
         default="",
@@ -74,12 +97,13 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = Field(default=2, description="Минимальный размер пула")
     db_pool_max: int = Field(
-        default=15,
+        default=30,
         description=(
             "Максимальный размер пула соединений PostgreSQL. "
-            "Раньше было 5 — критично мало при 10+ одновременных "
-            "пользователях: long-poll эндпоинты держат соединение "
-            "по 25-60 сек. Для 10 пользователей — 15, для 30 — 30-40."
+            "Раньше было 5 (Phase 1: 15) — критично мало при 10+ "
+            "одновременных пользователях: long-poll эндпоинты держат "
+            "соединение по 25-60 сек. Для 10 пользователей — 15, "
+            "для 30 — 30 (Phase 2 default), для 50+ — 40-50."
         ),
     )
     db_connect_timeout: int = Field(
