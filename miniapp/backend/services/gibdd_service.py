@@ -975,6 +975,89 @@ async def ensure_prev_cards(task: Task) -> Dict[str, Any]:
 
 
 # ============================================================
+# === Phase 2 fix: Восстановление task.cards из cards_cache ===
+# ============================================================
+# Проблема, которую решает этот блок:
+#   После рестарта контейнера (или LRU-eviction) task.cards пустой,
+#   т.к. это "тяжёлое" поле и НЕ персистится в БД (см. repository.py
+#   _HEAVY_FIELDS). Если пользователь открывает старую задачу и
+#   пытается посчитать очаги / LLM-резюме / точечную статистику —
+#   получает RuntimeError("Карточки текущего периода не загружены").
+#
+# Решение: перед каждой проверкой `if not task.cards` пробуем
+# восстановить карточки из cards_cache (PostgreSQL, TTL 24 часа).
+# Ключ кэша (reg_code, dat_hash) совпадает с ключом, который
+# используется при первичной выгрузке — поэтому кэш почти всегда
+# свежий для задач младше 24 часов.
+# ============================================================
+async def _ensure_cards_loaded(task: Task) -> bool:
+    """
+    Восстанавливает task.cards из cards_cache, если они пусты.
+
+    Вызывается перед каждой операцией, требующей task.cards:
+      - start_clusters_calculation
+      - ensure_comparison (косвенно: LLM, point stats)
+      - compute_point_stats
+      - generate_point_stats_map_html
+
+    Возвращает True, если после вызова task.cards непустые
+    (либо уже были, либо успешно восстановлены из кэша).
+    Возвращает False, если cards пустые и кэш не помог —
+    caller должен вернуть понятную ошибку пользователю.
+    """
+    if task.cards:
+        return True  # уже есть — ничего делать не нужно
+
+    # Нет dat_list — нет ключа кэша (анонимная задача?)
+    if not task.dat_list or not task.region_code:
+        return False
+
+    try:
+        from ..db.cards_cache import get_cached_cards
+        from ..db.connection import is_db_ready
+        if not is_db_ready():
+            return False
+
+        cached = await get_cached_cards(
+            reg_code=task.region_code,
+            dat_list=task.dat_list,
+        )
+        if cached is None:
+            logger.info(
+                f"Task {task.id}: cards_restore — кэш пуст или протух "
+                f"(reg={task.region_code}, dat={task.dat_list[:3]}...)"
+            )
+            return False
+
+        cards, _errors = cached
+        if not cards:
+            logger.info(
+                f"Task {task.id}: cards_restore — кэш вернул пустой список"
+            )
+            return False
+
+        # Восстанавливаем карточки и пересчитываем сводные метрики
+        task.cards = cards
+        task.total_dtp = len(cards)
+        task.total_dead = sum(int(c.get("pog", 0) or 0) for c in cards)
+        task.total_injured = sum(int(c.get("ran", 0) or 0) for c in cards)
+
+        logger.info(
+            f"Task {task.id}: cards restored from cache — "
+            f"{len(cards)} ДТП, {task.total_dead} погибших, "
+            f"{task.total_injured} раненых"
+        )
+        return True
+
+    except Exception as exc:
+        logger.warning(
+            f"Task {task.id}: cards_restore failed: {exc} — "
+            f"операция будет прервана"
+        )
+        return False
+
+
+# ============================================================
 # Сравнение метрик (для LLM)
 # ============================================================
 async def ensure_comparison(task: Task) -> Dict[str, Any]:
@@ -987,8 +1070,11 @@ async def ensure_comparison(task: Task) -> Dict[str, Any]:
     if task.comparison is not None:
         return {"ok": True, "comparison": task.comparison}
 
+    # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
     if not task.cards:
-        return {"ok": False, "error": "Карточки текущего периода не загружены"}
+        restored = await _ensure_cards_loaded(task)
+        if not restored:
+            return {"ok": False, "error": "Карточки текущего периода не загружены"}
 
     analytics_module = _import_module("analytics")
     current_metrics = analytics_module.calculate_metrics(task.cards)
@@ -1067,8 +1153,11 @@ async def compute_point_stats(
             "current_label": "...",
         }
     """
+    # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
     if not task.cards:
-        return {"ok": False, "error": "Карточки текущего периода не загружены"}
+        restored = await _ensure_cards_loaded(task)
+        if not restored:
+            return {"ok": False, "error": "Карточки текущего периода не загружены"}
 
     point_stats_module = _import_module("point_statistics")
 
@@ -1161,8 +1250,18 @@ async def start_clusters_calculation(task: Task) -> None:
     state.result = None
 
     try:
+        # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
+        # После рестарта контейнера task.cards пустые (тяжёлое поле, не персистится).
+        # Пробуем подтянуть из cards_cache (TTL 24 часа).
         if not task.cards:
-            raise RuntimeError("Карточки текущего периода не загружены")
+            restored = await _ensure_cards_loaded(task)
+            if not restored:
+                raise RuntimeError(
+                    "Карточки текущего периода не загружены. "
+                    "Возможно, задача создана до перезапуска сервиса, "
+                    "а кэш карточек (TTL 24ч) уже протух. "
+                    "Создайте новую выгрузку для этого региона и периода."
+                )
 
         # === Этап 4: проверяем кэш очагов в PostgreSQL ===
         # Если для данного (reg_code, current_dat, prev_dat) уже есть
@@ -1864,8 +1963,15 @@ async def generate_point_stats_map_html(
 
     Карта: точка + радиус + ДТП (текущий/прошлый) + камеры в радиусе.
     """
+    # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
     if not task.cards:
-        return None
+        restored = await _ensure_cards_loaded(task)
+        if not restored:
+            logger.warning(
+                f"Task {task.id}: generate_point_stats_map_html — "
+                f"cards пустые и кэш не помог"
+            )
+            return None
 
     try:
         report_gen_module = _import_module("report_generator")
