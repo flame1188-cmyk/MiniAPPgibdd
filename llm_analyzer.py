@@ -1807,7 +1807,7 @@ async def _ask_free_llm(
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
     }
 
     headers = {
@@ -1862,7 +1862,7 @@ async def _ask_paid_llm(
         "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
     }
 
     headers = {
