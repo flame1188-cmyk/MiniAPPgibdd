@@ -178,6 +178,27 @@ async def _request_with_retries(
     for attempt in range(1, retries + 1):
         await _throttle()
 
+        # === Фаза 2.2: observe_external_api для каждой попытки ===
+        # Импортируем лениво — модуль metrics живёт в miniapp.backend.middleware,
+        # а api_client.py находится в корне gibdd-bot и не должен зависеть
+        # от miniapp на верхнем уровне импортов.
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _root = str(_Path(__file__).resolve().parent)
+            if _root not in _sys.path:
+                _sys.path.insert(0, _root)
+            from miniapp.backend.middleware.metrics import observe_external_api
+        except ImportError:
+            observe_external_api = None  # type: ignore
+
+        _api_call_start = None
+        try:
+            from time import monotonic as _monotonic
+            _api_call_start = _monotonic()
+        except Exception:
+            pass
+
         try:
             logger.info(f"{description} | попытка {attempt}/{retries}")
             response = await client.get(url, params=params)
@@ -187,12 +208,32 @@ async def _request_with_retries(
                 f"статус={response.status_code} | "
                 f"размер={len(response.content)} байт"
             )
+            # === Фаза 2.2: успешный ответ API ГИБДД ===
+            if observe_external_api is not None and _api_call_start is not None:
+                try:
+                    observe_external_api(
+                        "gibdd_api",
+                        "success",
+                        _monotonic() - _api_call_start,
+                    )
+                except Exception:
+                    pass
             return response
 
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
             error_desc = _classify_error(e)
             last_error = e
             logger.warning(f"{description} | попытка {attempt}/{retries} | {error_desc}")
+            # === Фаза 2.2: сетевая ошибка (timeout / connect) ===
+            if observe_external_api is not None and _api_call_start is not None:
+                try:
+                    observe_external_api(
+                        "gibdd_api",
+                        "network_error",
+                        _monotonic() - _api_call_start,
+                    )
+                except Exception:
+                    pass
             # НЕ закрываем клиент! httpx сам помечает нерабочие соединения
             # в пуле и создаст новое при следующем запросе.
             # close_client() здесь убивал connection pooling — каждый ретрай
@@ -205,6 +246,16 @@ async def _request_with_retries(
                 error_desc = _classify_error(e)
                 last_error = e
                 logger.warning(f"{description} | попытка {attempt}/{retries} | {error_desc}")
+                # === Фаза 2.2: HTTP 5xx (серверная ошибка ГИБДД) ===
+                if observe_external_api is not None and _api_call_start is not None:
+                    try:
+                        observe_external_api(
+                            "gibdd_api",
+                            f"http_{status}",
+                            _monotonic() - _api_call_start,
+                        )
+                    except Exception:
+                        pass
             else:
                 # Клиентские ошибки (4xx) — не ретраим
                 error_desc = _classify_error(e)
@@ -212,6 +263,16 @@ async def _request_with_retries(
                 logger.error(
                     f"{description} | попытка {attempt} | {error_desc} | тело={body_preview}"
                 )
+                # === Фаза 2.2: HTTP 4xx (клиентская ошибка, обычно 429) ===
+                if observe_external_api is not None and _api_call_start is not None:
+                    try:
+                        observe_external_api(
+                            "gibdd_api",
+                            f"http_{status}",
+                            _monotonic() - _api_call_start,
+                        )
+                    except Exception:
+                        pass
                 raise
 
         except Exception as e:
@@ -220,6 +281,16 @@ async def _request_with_retries(
                 f"{description} | попытка {attempt}/{retries} | "
                 f"неожиданная ошибка: {type(e).__name__}: {e}"
             )
+            # === Фаза 2.2: прочие ошибки ===
+            if observe_external_api is not None and _api_call_start is not None:
+                try:
+                    observe_external_api(
+                        "gibdd_api",
+                        "error",
+                        _monotonic() - _api_call_start,
+                    )
+                except Exception:
+                    pass
 
         # Задержка перед следующим ретраем (экспоненциальная)
         if attempt < retries:

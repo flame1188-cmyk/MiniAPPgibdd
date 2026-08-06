@@ -90,6 +90,36 @@ ENABLE_NEWS_SEARCH: bool = os.getenv("ENABLE_NEWS_SEARCH", "true").lower() == "t
 # ========================
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+# Формат логов: "text" (по умолчанию, человекочитаемый) или "json"
+# (структурированные логи для Loki/ELK/Datadog).
+# В JSON-режиме используется python-json-logger, каждое сообщение —
+# объект с полями timestamp, level, logger, message, + контекстные поля
+# (request_id, user_id, task_id — если заданы в contextvars).
+# Рекомендуется "json" в production с централизованным сбором логов.
+LOG_FORMAT: str = os.getenv("LOG_FORMAT", "text")
+
+# ========================
+# Масштабирование (Фаза 2)
+# ========================
+# Максимум одновременных execute_task() (выгрузка + анализ + Excel).
+# Semaphore защищает API ГИБДД от 429/502 при массовых параллельных
+# запросах с одного IP.
+#   3 — для 2-10 пользователей (текущая нагрузка)
+#   5 — для 10-30 пользователей (Phase 2 default)
+#   8 — для 30+ пользователей с выделенным каналом
+# Остальные задачи ждут в очереди Semaphore; пользователь видит
+# статус FETCHING с progress=10%.
+MAX_CONCURRENT_TASKS: int = int(os.getenv("MAX_CONCURRENT_TASKS", "5"))
+
+# Размер in-memory LRU _tasks (для Phase 1.4).
+# ~8 MB на задачу → 50 = ~400 MB максимум RAM.
+# При росте до 30 пользователей можно увеличить до 100.
+MAX_INMEMORY_TASKS: int = int(os.getenv("MAX_INMEMORY_TASKS", "50"))
+
+# Лимит запросов в минуту на пользователя (Phase 1.5).
+# 60 = 1 req/sec — достаточно для интерактивной работы.
+RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
 
 # ========================
 # PostgreSQL-кэш (Этап 3+)
@@ -116,6 +146,27 @@ CLUSTERS_CACHE_TTL_SECONDS: int = int(os.getenv("CLUSTERS_CACHE_TTL_SECONDS", "2
 # для закрытых периодов. Экономия ~5-8 сек на каждого пользователя,
 # который запрашивает тот же регион+период.
 EXCEL_CACHE_TTL_SECONDS: int = int(os.getenv("EXCEL_CACHE_TTL_SECONDS", "86400"))
+
+# ========================
+# PostgreSQL пул соединений (Фаза 2)
+# ========================
+# Размер пула соединений к PostgreSQL. Каждое соединение ≈ 10 MB RAM
+# на сервере БД, плюс ~1 MB на клиенте.
+#
+# Расчёт под нагрузку:
+#   - 1 активный long-poll = 1 соединение на 25-60 сек
+#   - 1 _persist() в execute_task = 6 коротких запросов (1 соединение)
+#   - cache hits/misses = кратковременные соединения
+#
+# Рекомендации:
+#   10 пользователей → max=15 (Phase 1 значение)
+#   30 пользователей → max=30 (Phase 2 default)
+#   50+ пользователей → max=40-50 (нужен выделенный PostgreSQL)
+#
+# ВАЖНО: env-переменные DB_POOL_MIN/MAX в bothost перебивают default.
+# Если в bothost они не заданы — используется это значение.
+DB_POOL_MIN: int = int(os.getenv("DB_POOL_MIN", "2"))
+DB_POOL_MAX: int = int(os.getenv("DB_POOL_MAX", "30"))
 
 
 # ========================

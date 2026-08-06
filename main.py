@@ -31,6 +31,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# === Фаза 2.7: Структурированное логирование ===
+# Настраиваем логи ДО любых других импортов, чтобы все логи (включая
+# логи импорта) шли через наш форматтер.
+# LOG_FORMAT=text (по умолчанию) — человекочитаемый, для dev/bothost.
+# LOG_FORMAT=json — структурированные логи для Loki/ELK/Datadog.
+from miniapp.backend.middleware.logging_config import setup_logging as _setup_logging
+_setup_logging(level=os.environ.get("LOG_LEVEL", "INFO"),
+               fmt=os.environ.get("LOG_FORMAT", "text"))
+
 # Импортируем существующий конфиг gibdd-bot
 from config import (
     TELEGRAM_BOT_TOKEN,
@@ -40,11 +49,8 @@ from config import (
     validate_config,
 )
 
-# Настраиваем логирование ДО остальных импортов
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# Логгер создаётся ПОСЛЕ setup_logging, иначе basicConfig в других
+# модулях может перебить нашу конфигурацию.
 logger = logging.getLogger(__name__)
 
 # FastAPI
@@ -64,6 +70,14 @@ from miniapp.backend.db.connection import (
     init_pool as db_init_pool,
     close_pool as db_close_pool,
     is_db_ready as db_is_ready,
+    get_pool as db_get_pool,  # === Фаза 2.3: для /health/detailed ===
+)
+# === Фаза 2.8: Request ID middleware ===
+from miniapp.backend.middleware.request_id import RequestIdMiddleware
+# === Фаза 2.1/2.2: дополнительные metrics helpers ===
+from miniapp.backend.middleware.metrics import (
+    update_db_pool_metrics,
+    update_process_rss,
 )
 
 
@@ -403,6 +417,13 @@ app.add_middleware(
 from miniapp.backend.middleware.rate_limit import rate_limit_middleware
 app.middleware("http")(rate_limit_middleware)
 
+# === Фаза 2.8: Request ID middleware ===
+# Добавляет уникальный request_id в каждый HTTP-запрос:
+#   - в contextvars (доступен через logging_config.get_request_id())
+#   - в response header X-Request-ID (клиент видит и может сообщить в support)
+#   - в логи (каждый лог содержит request_id, можно фильтровать по нему)
+app.add_middleware(RequestIdMiddleware)
+
 # === Фаза 1.6: Prometheus metrics ===
 # /metrics endpoint для скрапирования Prometheus.
 # Метрики: http_requests_total, http_request_duration_seconds,
@@ -547,6 +568,120 @@ async def health_db_excel():
     """
     from miniapp.backend.db.excel_cache import get_cache_stats
     return await get_cache_stats()
+
+
+# ============================================================
+# === Фаза 2.3: /health/detailed — сводка для алертов Grafana ===
+# ============================================================
+@app.get("/health/detailed")
+async def health_detailed():
+    """
+    Детальный health-check для алертов и Grafana дашбордов.
+
+    Возвращает полную сводку состояния приложения:
+    - telegram_bot: running/stopped
+    - database: ready/fallback + размеры пула (active/idle/max)
+    - tasks: in_memory_count, in_progress, semaphore_occupied, max_concurrent
+    - caches: hit_rate для cards/clusters/excel (через Prometheus registry)
+    - memory: RSS в МБ (через resource.getrusage)
+    - rate_limit: счётчик 429 за весь период работы
+
+    Использовать для:
+    - Grafana дашборда (один запрос = полная картина)
+    - Alert rules: RSS > 1.5 GB, semaphore_occupied == max, db_pool active == max
+    - Post-mortem анализа (request_id последнего запроса виден в логах)
+    """
+    import resource
+    from miniapp.backend.services.gibdd_service import (
+        _tasks,
+        MAX_CONCURRENT_TASKS,
+        MAX_INMEMORY_TASKS,
+        _EXECUTE_SEMAPHORE,
+    )
+
+    # RSS памяти процесса (Linux: ru_maxrss в KB)
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = round(rss_kb / 1024, 1)
+    except Exception:
+        rss_mb = -1
+
+    # Размер пула PostgreSQL (если доступен)
+    db_pool_info: dict
+    pool = db_get_pool() if db_is_ready() else None
+    if pool is not None:
+        try:
+            # psycopg_pool AsyncConnectionPool имеет stats()
+            stats = pool.get_stats() if hasattr(pool, "get_stats") else {}
+            db_pool_info = {
+                "max_size": getattr(pool, "_max_size", "unknown"),
+                "min_size": getattr(pool, "_min_size", "unknown"),
+                "stats": stats,
+            }
+            # Обновляем Prometheus метрики
+            try:
+                active = stats.get("requests_waiting", 0)
+                idle = stats.get("pool_size", 0) - active
+                update_db_pool_metrics(
+                    active=active,
+                    idle=max(0, idle),
+                    max_size=int(getattr(pool, "_max_size", 0)),
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            db_pool_info = {"error": str(exc)}
+    else:
+        db_pool_info = {"status": "fallback (in-memory)"}
+
+    # Обновляем Prometheus gauge RSS
+    try:
+        if rss_mb > 0:
+            update_process_rss(int(rss_mb * 1024 * 1024))
+    except Exception:
+        pass
+
+    # Текущее количество задач и semaphore
+    semaphore_occupied = MAX_CONCURRENT_TASKS - _EXECUTE_SEMAPHORE._value if hasattr(_EXECUTE_SEMAPHORE, "_value") else None
+    # semaphore._value — количество свободных слотов (asyncio.Semaphore)
+    # Занятых = max - свободных
+
+    return {
+        "status": "ok",
+        "service": "gibdd-bot-miniapp",
+        "version": "2.0.0",  # === Фаза 2 ===
+        "telegram_bot": "running" if tg_app else "stopped",
+        "bothost_domain": BOTHOST_DOMAIN or "not_set",
+
+        # Database
+        "database": {
+            "status": "ready" if db_is_ready() else "fallback (in-memory)",
+            "pool": db_pool_info,
+        },
+
+        # Tasks / Semaphore
+        "tasks": {
+            "in_memory_count": len(_tasks),
+            "in_memory_max": MAX_INMEMORY_TASKS,
+            "semaphore_max": MAX_CONCURRENT_TASKS,
+            "semaphore_occupied": semaphore_occupied,
+        },
+
+        # Memory
+        "memory": {
+            "rss_mb": rss_mb,
+            "warning_threshold_mb": 1500,  # yellow
+            "critical_threshold_mb": 1900,  # red (bothost 2 GB limit)
+        },
+
+        # Caches — hit_rate вычисляется из Prometheus registry
+        # (см. /metrics для raw counters)
+        "caches": {
+            "cards": "see /metrics gibdd_cache_hits_total{cache_name=\"cards\"}",
+            "clusters": "see /metrics gibdd_cache_hits_total{cache_name=\"clusters\"}",
+            "excel": "see /metrics gibdd_cache_hits_total{cache_name=\"excel\"}",
+        },
+    }
 
 
 @app.get("/")

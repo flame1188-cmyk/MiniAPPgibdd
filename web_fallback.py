@@ -564,6 +564,21 @@ async def fetch_dtp_via_web_period(
         extracted = None
         last_err: Exception | None = None
 
+        # === Фаза 2.2: observe_external_api для каждого месяца web fallback ===
+        # Ленивый импорт — модуль metrics живёт в miniapp.backend.middleware.
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _root = str(_Path(__file__).resolve().parent)
+            if _root not in _sys.path:
+                _sys.path.insert(0, _root)
+            from miniapp.backend.middleware.metrics import observe_external_api
+        except ImportError:
+            observe_external_api = None  # type: ignore
+
+        from time import monotonic as _monotonic
+        _month_start = _monotonic()
+
         for attempt in range(1, _MONTH_RETRIES + 1):
             try:
                 extracted = await fetch_dtp_via_web(dat=dat, reg_api=reg_api)
@@ -584,6 +599,15 @@ async def fetch_dtp_via_web_period(
             cards.extend(extracted)
             logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
             consecutive_failures = 0
+            # === Фаза 2.2: успешная загрузка месяца ===
+            if observe_external_api is not None:
+                try:
+                    observe_external_api(
+                        "gibdd_web", "success",
+                        _monotonic() - _month_start,
+                    )
+                except Exception:
+                    pass
         else:
             # Все попытки провалились
             try:
@@ -596,6 +620,15 @@ async def fetch_dtp_via_web_period(
                 f"  {log_prefix}: {dat} -> ОШИБКА после "
                 f"{_MONTH_RETRIES} попыток: {err_msg}"
             )
+            # === Фаза 2.2: ошибка загрузки месяца (после всех ретраев) ===
+            if observe_external_api is not None:
+                try:
+                    observe_external_api(
+                        "gibdd_web", "error",
+                        _monotonic() - _month_start,
+                    )
+                except Exception:
+                    pass
 
             consecutive_failures += 1
             if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
