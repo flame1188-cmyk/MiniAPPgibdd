@@ -2751,3 +2751,77 @@ Stage Summary:
   при сбое — откат `cp bot.py.bak bot.py && rm -rf bot/`
 - Что осталось: Phase 3-3 (dispatch-таблица для on_callback_query) и
   Phase 3-4 (разбить analysis.py)
+
+---
+Task ID: phase3-2-bot-refactor-fixup
+Agent: main (super-z)
+Task: Хотфикс Phase 3-2 — prod-деплой упал с
+`AttributeError: module 'bot' has no attribute '_build_app'` в main.py:108.
+
+Контекст: После распаковки gibdd-bot-refactored.zip и перезапуска контейнера
+bot-1785601473 на bothost.tech в логах появилось:
+  File "/app/main.py", line 211, in _create_telegram_app
+    app = bot_module._build_app(TELEGRAM_BOT_TOKEN)
+  AttributeError: module 'bot' has no attribute '_build_app'
+
+Анализ:
+- В gibdd-bot/ есть и bot.py (thin shim), и bot/ (пакет).
+- При `import bot` Python выбирает ПАКЕТ (директорию), а не файл.
+- bot/__init__.py был чисто документационный — без реэкспортов.
+- main.py:108 зовёт `bot_module._build_app(...)` → AttributeError.
+- miniapp/backend/services/gibdd_service.py:560,891 зовёт
+  `bot_module._fetch_cards_for_period(...)` → та же проблема (проявилась бы
+  только при первом запросе, потому что в логах до этого не дошло).
+
+Work Log:
+- Прочитал main.py:85-110 — использует `import bot as bot_module;
+  bot_module._build_app(TELEGRAM_BOT_TOKEN)`.
+- Прочитал gibdd_service.py:556,890 — использует `bot_module =
+  _import_module("bot"); bot_module._fetch_cards_for_period(...)`.
+- Нашёл где живут функции после рефакторинга:
+  * `_build_app` → bot/app.py:112
+  * `_fetch_cards_for_period` → bot/access.py:33
+  * `cmd_*` → bot/handlers/commands.py
+  * `on_callback_query` → bot/handlers/callbacks.py:23
+  * `handle_message`, `_handle_document` → bot/handlers/messages.py
+  * `_handle_location_message` → bot/point_stats.py:400
+- Отредактировал bot/__init__.py — добавил явные реэкспорты:
+  ```python
+  from bot.app import _build_app, main, error_handler
+  from bot.access import _fetch_cards_for_period
+  from bot.handlers.commands import (cmd_start, cmd_help, cmd_dtp,
+      cmd_regions, cmd_miniapp, cmd_precache)
+  from bot.handlers.callbacks import on_callback_query
+  from bot.handlers.messages import handle_message, _handle_document
+  from bot.point_stats import _handle_location_message
+
+  __all__ = [...]  # 12 имён
+  ```
+- Проверил что нет циклических импортов: bot/__init__ → bot.app →
+  bot._state, bot.handlers.*, bot.access, bot.infra, bot.keyboards,
+  bot.output, bot.point_stats, bot.qa, bot.analysis. Граф ацикличный.
+- Проверил что нет конфликтов с thin shim bot.py (там только
+  `from bot.app import main; if __name__ == "__main__": main()` —
+  реэкспортов не делает, не мешает).
+- Запустил smoke-тесты: 19/19 passed, включая test_no_circular_imports.
+- Симулировал prod-сценарии:
+  * `import bot as bot_module; bot_module._build_app` → callable ✓
+  * `bot_module._fetch_cards_for_period` → callable ✓
+- Пересобрал архив: /home/z/my-project/download/gibdd-bot-refactored.zip
+  (107 KB, 24 файла, bot/__init__.py теперь 67 строк вместо 25)
+
+Stage Summary:
+- AttributeError устранён — bot/__init__.py теперь реэкспортирует 12 имён
+  из подмодулей (main, _build_app, error_handler, _fetch_cards_for_period,
+  cmd_start..cmd_precache, on_callback_query, handle_message,
+  _handle_document, _handle_location_message).
+- Smoke-тесты: 19/19 passed, без циклов.
+- Корневая причина: Python выбирает ПАКЕТ bot/ при `import bot`,
+  игнорируя thin shim bot.py. Реэкспорты в __init__.py — обязательны.
+- Архив обновлён: /home/z/my-project/download/gibdd-bot-refactored.zip
+- Деплой: распаковать архив заново (перезаписать bot/__init__.py),
+  перезапустить контейнер. main.py и gibdd_service.py менять НЕ нужно.
+- Урок на будущее: при split модуля в пакет всегда проверять всех
+  внешних потребителей `import X; X.func(...)` и реэкспортировать
+  нужные имена из __init__.py. Smoke-тест должен покрывать не только
+  структуру, но и реальные сценарии импорта из других модулей.
