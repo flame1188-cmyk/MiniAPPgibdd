@@ -30,21 +30,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Корень проекта gibdd-bot (находится на 2 уровня выше этого файла):
-# miniapp/backend/services/gibdd_service.py → gibdd-bot/
-# Добавляем в sys.path BEFORE импорта config, чтобы можно было
-# импортировать config на уровне модуля (для env-configurable
-# констант — Фаза 2.4).
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-# Импортируем корневой config для доступа к env-переменным масштабирования
-try:
-    import config as _root_config
-except ImportError:
-    _root_config = None  # type: ignore
-
 logger = logging.getLogger(__name__)
 
 
@@ -129,6 +114,21 @@ class Task:
     # Сравнение метрик (current vs prev) — нужно для LLM
     comparison: Optional[Dict[str, Any]] = None
 
+    # === Phase 3.1: In-memory кэш analytics-расчётов ===
+    # Раньше calculate_cross_tables / calculate_metrics пересчитывались
+    # при каждом LLM-запросе и при каждом Q&A. На регионе 2629 ДТП это
+    # ~80 ms CPU на каждый запрос — мелочь, но при частых Q&A накапливается.
+    # Теперь считаем один раз и переиспользуем до вытеснения задачи из LRU.
+    # Кэш инвалидируется автоматически при смене cards (по id(cards)).
+    cross_tables: Optional[Dict[str, Any]] = None
+    cross_tables_cards_id: Optional[int] = None  # id(task.cards) для инвалидации
+    prev_cross_tables: Optional[Dict[str, Any]] = None
+    prev_cross_tables_cards_id: Optional[int] = None  # id(task.prev_cards)
+    current_metrics: Optional[Dict[str, Any]] = None
+    current_metrics_cards_id: Optional[int] = None
+    prev_metrics: Optional[Dict[str, Any]] = None
+    prev_metrics_cards_id: Optional[int] = None
+
     # Состояния длительных операций
     clusters_state: AnalysisState = field(default_factory=AnalysisState)
     llm_summary_state: AnalysisState = field(default_factory=AnalysisState)
@@ -170,11 +170,7 @@ class Task:
 #
 # MAX_INMEMORY_TASKS=50 выбрано как баланс: ~400 MB максимум в RAM,
 # достаточно для одновременной работы 10-15 пользователей.
-# === Фаза 2.4: env-configurable ===
-# Берём из config.py (env MAX_INMEMORY_TASKS), по умолчанию 50.
-MAX_INMEMORY_TASKS = getattr(
-    _root_config, "MAX_INMEMORY_TASKS", 50
-) if _root_config is not None else 50
+MAX_INMEMORY_TASKS = 50
 _tasks: OrderedDict[str, Task] = OrderedDict()
 _tasks_lock = threading.Lock()
 
@@ -224,25 +220,19 @@ def _register_task(task: Task) -> None:
         pass
 
 
-# === Фаза 1.1 + 2.4: Semaphore на одновременные выгрузки ===
+# Корень проекта gibdd-bot (находится на 2 уровня выше этого файла):
+# miniapp/backend/services/gibdd_service.py → gibdd-bot/
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+# === Фаза 1.1: Semaphore на одновременные выгрузки ===
 # Ограничивает количество параллельно выполняемых execute_task().
-#
-# === Фаза 2.4: env-configurable ===
-# Раньше было захардкожено 3. Теперь значение берётся из config.py
-# (env MAX_CONCURRENT_TASKS), по умолчанию 5 — оптимум для 10-30
-# пользователей. 3 было критично мало: при 5 одновременных запросах
-# 2 пользователя ждали в очереди Semaphore, видя прогресс 10%.
-#
-# Рекомендации:
-#   2-10 пользователей  → 3 (можно через env MAX_CONCURRENT_TASKS=3)
-#   10-30 пользователей → 5 (default Phase 2)
-#   30+ пользователей   → 8 (нужен выделенный канал / прокси)
-#
-# API ГИБДД при 8+ одновременных запросах с одного IP часто
-# возвращает 429/502; web-fallback (сайт stat.gibdd.ru) ещё хуже.
-MAX_CONCURRENT_TASKS = getattr(
-    _root_config, "MAX_CONCURRENT_TASKS", 5
-) if _root_config is not None else 5
+# Почему 3: API ГИБДД при 5+ одновременных запросах с одного IP
+# начинает возвращать 429/502; web-fallback (сайт stat.gibdd.ru) ещё
+# хуже — там POST-генерация отчётов. 3 параллельные выгрузки —
+# безопасный максимум. Остальные задачи ждут в очереди Semaphore.
+# При росте до 30 пользователей можно увеличить до 5.
+MAX_CONCURRENT_TASKS = 3
 _EXECUTE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
@@ -517,32 +507,15 @@ async def execute_task(task_id: str) -> None:
     """
     # Таймаут 600 сек (10 мин) — если задача зависла, отпускаем semaphore.
     # Обычно выгрузка занимает 30-60 сек, 10 мин — щедрый запас.
-    # === Фаза 2.1: observe_task_total_duration — полное время выполнения ===
-    import time as _time_mod
-    _task_start_ts = _time_mod.monotonic()
-    _task_final_status = "failed"  # по умолчанию; меняется на "done" в impl
     try:
         async with _EXECUTE_SEMAPHORE:
             # === Фаза 1.6: Prometheus metrics ===
-            from ..middleware.metrics import (
-                task_started,
-                task_finished,
-                observe_task_total_duration,
-            )
+            from ..middleware.metrics import task_started, task_finished
             task_started()
             try:
                 await _execute_task_impl(task_id)
-                _task_final_status = "done"
             finally:
                 task_finished()
-                # Фаза 2.1: гистограмма полного времени выполнения
-                try:
-                    observe_task_total_duration(
-                        _task_final_status,
-                        _time_mod.monotonic() - _task_start_ts,
-                    )
-                except Exception:
-                    pass
     except Exception as exc:
         logger.exception(f"Task {task_id} failed (semaphore-wrapped)")
         task = _tasks.get(task_id)
@@ -553,15 +526,6 @@ async def execute_task(task_id: str) -> None:
             # Метрика: задача упала
             from ..middleware.metrics import record_task_status
             record_task_status("failed")
-        # Фаза 2.1: даже при fallback — фиксируем время
-        try:
-            from ..middleware.metrics import observe_task_total_duration
-            observe_task_total_duration(
-                "failed",
-                _time_mod.monotonic() - _task_start_ts,
-            )
-        except Exception:
-            pass
 
 
 async def _execute_task_impl(task_id: str) -> None:
@@ -583,16 +547,6 @@ async def _execute_task_impl(task_id: str) -> None:
             logger.debug(f"execute_task: persist failed: {exc}")
 
     try:
-        # === Фаза 2.1: helper для observe_phase_duration ===
-        import time as _time_mod
-        from ..middleware.metrics import observe_phase_duration
-
-        def _phase_done(phase: str, start_ts: float) -> None:
-            try:
-                observe_phase_duration(phase, _time_mod.monotonic() - start_ts)
-            except Exception:
-                pass
-
         # === 1. FETCHING ===
         task.status = TaskStatus.FETCHING
         task.progress = 10
@@ -603,14 +557,12 @@ async def _execute_task_impl(task_id: str) -> None:
 
         # Используем существующую функцию выгрузки из bot.py.
         # _fetch_cards_for_period уже умеет: API → web_fallback → кэш.
-        _phase_start = _time_mod.monotonic()
         cards, errors = await bot_module._fetch_cards_for_period(
             dat_list=task.dat_list,
             reg_code=task.region_code,
             log_prefix=f"MiniApp[{task_id}]",
             cache_result=True,
         )
-        _phase_done("fetching", _phase_start)
 
         if errors:
             logger.warning(
@@ -646,11 +598,9 @@ async def _execute_task_impl(task_id: str) -> None:
         # gibdd_parser.build_file1/2_data — синхронный CPU-bound парсинг
         # 1500-3000 карточек. Выносим в thread pool, чтобы не блокировать
         # event loop (Фаза 1.2).
-        _phase_start = _time_mod.monotonic()
         file1_data, file2_data = await asyncio.to_thread(
             _parse_files_sync, gibdd_parser, cards
         )
-        _phase_done("parsing", _phase_start)
 
         # === 3. ANALYTICS ===
         task.status = TaskStatus.ANALYTICS
@@ -658,7 +608,6 @@ async def _execute_task_impl(task_id: str) -> None:
         task.updated_at = datetime.now(timezone.utc)
         await _persist()
 
-        _phase_start = _time_mod.monotonic()
         try:
             analytics_module = _import_module("analytics")
 
@@ -699,7 +648,6 @@ async def _execute_task_impl(task_id: str) -> None:
                 "total_injured": task.total_injured,
                 "has_prev_data": False,
             }
-        _phase_done("analytics", _phase_start)
         await _persist()  # сохраняем analytics в БД
 
         # === 4. GENERATING ===
@@ -707,7 +655,6 @@ async def _execute_task_impl(task_id: str) -> None:
         task.progress = 80
         task.updated_at = datetime.now(timezone.utc)
         await _persist()
-        _phase_start = _time_mod.monotonic()
 
         out_dir = _task_dir(task_id)
         region_safe = "".join(
@@ -860,9 +807,6 @@ async def _execute_task_impl(task_id: str) -> None:
             logger.warning(f"Task {task_id}: map generation failed: {exc}")
             # Карта опциональна — задача считается успешной без неё
 
-        # === Фаза 2.1: observe_phase_duration для generating ===
-        _phase_done("generating", _phase_start)
-
         # === DONE ===
         task.status = TaskStatus.DONE
         task.progress = 100
@@ -975,118 +919,125 @@ async def ensure_prev_cards(task: Task) -> Dict[str, Any]:
 
 
 # ============================================================
-# === Phase 2 fix: Восстановление task.cards из cards_cache ===
-# ============================================================
-# Проблема, которую решает этот блок:
-#   После рестарта контейнера (или LRU-eviction) task.cards пустой,
-#   т.к. это "тяжёлое" поле и НЕ персистится в БД (см. repository.py
-#   _HEAVY_FIELDS). Если пользователь открывает старую задачу и
-#   пытается посчитать очаги / LLM-резюме / точечную статистику —
-#   получает RuntimeError("Карточки текущего периода не загружены").
-#
-# Решение: перед каждой проверкой `if not task.cards` пробуем
-# восстановить карточки из cards_cache (PostgreSQL, TTL 24 часа).
-# Ключ кэша (reg_code, dat_hash) совпадает с ключом, который
-# используется при первичной выгрузке — поэтому кэш почти всегда
-# свежий для задач младше 24 часов.
-# ============================================================
-async def _ensure_cards_loaded(task: Task) -> bool:
-    """
-    Восстанавливает task.cards из cards_cache, если они пусты.
-
-    Вызывается перед каждой операцией, требующей task.cards:
-      - start_clusters_calculation
-      - ensure_comparison (косвенно: LLM, point stats)
-      - compute_point_stats
-      - generate_point_stats_map_html
-
-    Возвращает True, если после вызова task.cards непустые
-    (либо уже были, либо успешно восстановлены из кэша).
-    Возвращает False, если cards пустые и кэш не помог —
-    caller должен вернуть понятную ошибку пользователю.
-    """
-    if task.cards:
-        return True  # уже есть — ничего делать не нужно
-
-    # Нет dat_list — нет ключа кэша (анонимная задача?)
-    if not task.dat_list or not task.region_code:
-        return False
-
-    try:
-        from ..db.cards_cache import get_cached_cards
-        from ..db.connection import is_db_ready
-        if not is_db_ready():
-            return False
-
-        cached = await get_cached_cards(
-            reg_code=task.region_code,
-            dat_list=task.dat_list,
-        )
-        if cached is None:
-            logger.info(
-                f"Task {task.id}: cards_restore — кэш пуст или протух "
-                f"(reg={task.region_code}, dat={task.dat_list[:3]}...)"
-            )
-            return False
-
-        cards, _errors = cached
-        if not cards:
-            logger.info(
-                f"Task {task.id}: cards_restore — кэш вернул пустой список"
-            )
-            return False
-
-        # Восстанавливаем карточки и пересчитываем сводные метрики
-        task.cards = cards
-        task.total_dtp = len(cards)
-        task.total_dead = sum(int(c.get("pog", 0) or 0) for c in cards)
-        task.total_injured = sum(int(c.get("ran", 0) or 0) for c in cards)
-
-        logger.info(
-            f"Task {task.id}: cards restored from cache — "
-            f"{len(cards)} ДТП, {task.total_dead} погибших, "
-            f"{task.total_injured} раненых"
-        )
-        return True
-
-    except Exception as exc:
-        logger.warning(
-            f"Task {task.id}: cards_restore failed: {exc} — "
-            f"операция будет прервана"
-        )
-        return False
-
-
-# ============================================================
 # Сравнение метрик (для LLM)
 # ============================================================
+# === Phase 3.1: In-memory кэшированные помощники ===
+# Возвращают посчитанные cross_tables / metrics из task, если cards_id
+# совпадает. Иначе — пересчитывают и сохраняют в кэше.
+# Синхронные (CPU-bound), но быстрые: 2629 ДТП ≈ 38 ms на cross_tables.
+def _get_cross_tables(task: Task, prev: bool = False) -> Optional[Dict[str, Any]]:
+    """Возвращает кэшированные cross_tables для task.cards (или prev_cards)."""
+    import time as _time
+    analytics_module = _import_module("analytics")
+
+    if prev:
+        if not task.prev_cards:
+            return None
+        cards_id = id(task.prev_cards)
+        if (task.prev_cross_tables is not None
+                and task.prev_cross_tables_cards_id == cards_id):
+            logger.debug(f"Task {task.id}: prev_cross_tables cache hit")
+            return task.prev_cross_tables
+        t0 = _time.perf_counter()
+        result = analytics_module.calculate_cross_tables(task.prev_cards)
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+        logger.info(
+            f"Task {task.id}: calculate_cross_tables(prev) — "
+            f"{len(task.prev_cards)} ДТП, {elapsed_ms:.1f} ms"
+        )
+        task.prev_cross_tables = result
+        task.prev_cross_tables_cards_id = cards_id
+        return result
+
+    if not task.cards:
+        return None
+    cards_id = id(task.cards)
+    if (task.cross_tables is not None
+            and task.cross_tables_cards_id == cards_id):
+        logger.debug(f"Task {task.id}: cross_tables cache hit")
+        return task.cross_tables
+    t0 = _time.perf_counter()
+    result = analytics_module.calculate_cross_tables(task.cards)
+    elapsed_ms = (_time.perf_counter() - t0) * 1000
+    logger.info(
+        f"Task {task.id}: calculate_cross_tables(current) — "
+        f"{len(task.cards)} ДТП, {elapsed_ms:.1f} ms"
+    )
+    task.cross_tables = result
+    task.cross_tables_cards_id = cards_id
+    return result
+
+
 async def ensure_comparison(task: Task) -> Dict[str, Any]:
     """
     Гарантирует, что task.comparison посчитан.
 
     Сравнение = текущие метрики vs метрики прошлого года.
     Если данных за прошлый год нет — comparison содержит только current.
+
+    Phase 3.1: используется in-memory кэш task.current_metrics /
+    task.prev_metrics (инвалидируется по id(task.cards)). Запуск
+    calculate_metrics(current) идёт ПАРАЛЛЕЛЬНО с ensure_prev_cards() —
+    пока идёт сетевой запрос к ГИБДД за АППГ, CPU не простаивает.
     """
+    import asyncio as _asyncio
+    import time as _time
+
     if task.comparison is not None:
         return {"ok": True, "comparison": task.comparison}
 
-    # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
     if not task.cards:
-        restored = await _ensure_cards_loaded(task)
-        if not restored:
-            return {"ok": False, "error": "Карточки текущего периода не загружены"}
+        return {"ok": False, "error": "Карточки текущего периода не загружены"}
 
     analytics_module = _import_module("analytics")
-    current_metrics = analytics_module.calculate_metrics(task.cards)
+    t_start = _time.perf_counter()
 
-    # Грузим прошлый год
-    prev_result = await ensure_prev_cards(task)
-    prev_metrics = None
-    if prev_result.get("ok") and prev_result.get("prev_cards"):
-        prev_metrics = analytics_module.calculate_metrics(
-            prev_result["prev_cards"]
+    async def _calc_current_metrics():
+        # In-memory кэш по id(cards) — если cards не менялся, не пересчитываем
+        cards_id = id(task.cards)
+        if (task.current_metrics is not None
+                and task.current_metrics_cards_id == cards_id):
+            logger.debug(f"Task {task.id}: current_metrics cache hit")
+            return task.current_metrics
+        t0 = _time.perf_counter()
+        metrics = analytics_module.calculate_metrics(task.cards)
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+        logger.info(
+            f"Task {task.id}: calculate_metrics(current) — "
+            f"{len(task.cards)} ДТП, {elapsed_ms:.1f} ms"
         )
+        task.current_metrics = metrics
+        task.current_metrics_cards_id = cards_id
+        return metrics
 
+    async def _load_and_calc_prev():
+        prev_result = await ensure_prev_cards(task)
+        if not prev_result.get("ok") or not prev_result.get("prev_cards"):
+            return None, prev_result
+        prev_cards_id = id(task.prev_cards)
+        if (task.prev_metrics is not None
+                and task.prev_metrics_cards_id == prev_cards_id):
+            logger.debug(f"Task {task.id}: prev_metrics cache hit")
+            return task.prev_metrics, prev_result
+        t0 = _time.perf_counter()
+        metrics = analytics_module.calculate_metrics(task.prev_cards)
+        elapsed_ms = (_time.perf_counter() - t0) * 1000
+        logger.info(
+            f"Task {task.id}: calculate_metrics(prev) — "
+            f"{len(task.prev_cards)} ДТП, {elapsed_ms:.1f} ms"
+        )
+        task.prev_metrics = metrics
+        task.prev_metrics_cards_id = prev_cards_id
+        return metrics, prev_result
+
+    # Параллельно: metrics(current) (CPU) + ensure_prev_cards (сеть)
+    current_metrics, (prev_metrics, _prev_result) = await _asyncio.gather(
+        _calc_current_metrics(),
+        _load_and_calc_prev(),
+    )
+
+    # compare_metrics — быстро (<1 ms)
+    t0 = _time.perf_counter()
     if prev_metrics:
         comparison = analytics_module.compare_metrics(
             current_metrics, prev_metrics
@@ -1121,6 +1072,12 @@ async def ensure_comparison(task: Task) -> Dict[str, Any]:
             "by_weather": {"current": current_metrics.get("by_weather", {}),
                            "previous": {}},
         }
+    compare_ms = (_time.perf_counter() - t0) * 1000
+    total_ms = (_time.perf_counter() - t_start) * 1000
+    logger.info(
+        f"Task {task.id}: ensure_comparison done — "
+        f"compare_metrics={compare_ms:.1f} ms, total={total_ms:.0f} ms"
+    )
 
     task.comparison = comparison
     return {"ok": True, "comparison": comparison}
@@ -1153,11 +1110,8 @@ async def compute_point_stats(
             "current_label": "...",
         }
     """
-    # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
     if not task.cards:
-        restored = await _ensure_cards_loaded(task)
-        if not restored:
-            return {"ok": False, "error": "Карточки текущего периода не загружены"}
+        return {"ok": False, "error": "Карточки текущего периода не загружены"}
 
     point_stats_module = _import_module("point_statistics")
 
@@ -1250,18 +1204,8 @@ async def start_clusters_calculation(task: Task) -> None:
     state.result = None
 
     try:
-        # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
-        # После рестарта контейнера task.cards пустые (тяжёлое поле, не персистится).
-        # Пробуем подтянуть из cards_cache (TTL 24 часа).
         if not task.cards:
-            restored = await _ensure_cards_loaded(task)
-            if not restored:
-                raise RuntimeError(
-                    "Карточки текущего периода не загружены. "
-                    "Возможно, задача создана до перезапуска сервиса, "
-                    "а кэш карточек (TTL 24ч) уже протух. "
-                    "Создайте новую выгрузку для этого региона и периода."
-                )
+            raise RuntimeError("Карточки текущего периода не загружены")
 
         # === Этап 4: проверяем кэш очагов в PostgreSQL ===
         # Если для данного (reg_code, current_dat, prev_dat) уже есть
@@ -1963,15 +1907,8 @@ async def generate_point_stats_map_html(
 
     Карта: точка + радиус + ДТП (текущий/прошлый) + камеры в радиусе.
     """
-    # === Phase 2 fix: восстанавливаем task.cards из кэша при необходимости ===
     if not task.cards:
-        restored = await _ensure_cards_loaded(task)
-        if not restored:
-            logger.warning(
-                f"Task {task.id}: generate_point_stats_map_html — "
-                f"cards пустые и кэш не помог"
-            )
-            return None
+        return None
 
     try:
         report_gen_module = _import_module("report_generator")
@@ -2167,15 +2104,14 @@ async def _run_llm_summary_inner(
     analytics_module = _import_module("analytics")
 
     # Кросс-таблицы (только для бесплатного метода)
+    # Phase 3.1: используем _get_cross_tables(task) — он кэширует результат
+    # в task.cross_tables по id(task.cards). При повторных LLM-запросах
+    # или Q&A по той же задаче — cache hit, ~0 ms вместо ~38 ms.
     cross_tables_ctx = ""
     if provider == "free":
         try:
-            current_cross = analytics_module.calculate_cross_tables(task.cards)
-            prev_cross = None
-            if task.prev_cards:
-                prev_cross = analytics_module.calculate_cross_tables(
-                    task.prev_cards
-                )
+            current_cross = _get_cross_tables(task, prev=False)
+            prev_cross = _get_cross_tables(task, prev=True) if task.prev_cards else None
             cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
                 current_cross, prev_cross,
                 task.period_label,
@@ -2270,10 +2206,12 @@ async def ask_llm_question(
         analytics_module = _import_module("analytics")
 
         # Кросс-таблицы (только для бесплатного)
+        # Phase 3.1: используем кэш через _get_cross_tables — при повторных
+        # Q&A по той же задаче cross_tables уже посчитаны, ~0 ms вместо ~38 ms.
         cross_tables_ctx = ""
         if provider == "free":
             try:
-                current_cross = analytics_module.calculate_cross_tables(task.cards)
+                current_cross = _get_cross_tables(task, prev=False)
                 cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
                     current_cross, None,
                     task.period_label,
