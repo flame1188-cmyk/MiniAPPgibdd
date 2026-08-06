@@ -25,7 +25,6 @@ import httpx
 from config import (
     LLM_API_KEY, LLM_MODEL,
     LLM_PAID_API_KEY, LLM_PAID_API_URL, LLM_PAID_MODEL,
-    LLM_MAX_TOKENS,
 )
 
 logger = logging.getLogger(__name__)
@@ -1810,7 +1809,7 @@ async def _ask_free_llm(
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": LLM_MAX_TOKENS,
+        "max_tokens": 8192,
     }
 
     headers = {
@@ -1865,7 +1864,7 @@ async def _ask_paid_llm(
         "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": LLM_MAX_TOKENS,
+        "max_tokens": 8192,
     }
 
     headers = {
@@ -2126,24 +2125,7 @@ async def _do_llm_request(
         raise ValueError("LLM вернул пустой ответ (content='')")
 
     tokens_used = data.get("usage", {}).get("total_tokens", "?")
-    completion_tokens = data.get("usage", {}).get("completion_tokens", "?")
-    finish_reason = data.get("choices", [{}])[0].get("finish_reason", "?")
-    logger.info(
-        f"LLM ответ: {len(content)} символов, "
-        f"prompt_tokens={data.get('usage', {}).get('prompt_tokens', '?')}, "
-        f"completion_tokens={completion_tokens}, "
-        f"total_tokens={tokens_used}, finish_reason={finish_reason}"
-    )
-
-    # Предупреждение о транкации ответа по лимиту max_tokens.
-    # Сигнал администратору: нужно увеличить LLM_MAX_TOKENS в .env.
-    if finish_reason == "length":
-        logger.warning(
-            f"LLM ответ обрезан по лимиту max_tokens={LLM_MAX_TOKENS} "
-            f"(completion_tokens={completion_tokens}). "
-            f"Резюме может быть неполным. "
-            f"Для увеличения лимита поднимите LLM_MAX_TOKENS в .env."
-        )
+    logger.info(f"LLM ответ: {len(content)} символов, токенов: {tokens_used}")
 
     return content
 
