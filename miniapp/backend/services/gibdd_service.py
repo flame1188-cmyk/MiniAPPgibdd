@@ -30,6 +30,21 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Корень проекта gibdd-bot (находится на 2 уровня выше этого файла):
+# miniapp/backend/services/gibdd_service.py → gibdd-bot/
+# Добавляем в sys.path BEFORE импорта config, чтобы можно было
+# импортировать config на уровне модуля (для env-configurable
+# констант — Фаза 2.4).
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Импортируем корневой config для доступа к env-переменным масштабирования
+try:
+    import config as _root_config
+except ImportError:
+    _root_config = None  # type: ignore
+
 logger = logging.getLogger(__name__)
 
 
@@ -155,7 +170,11 @@ class Task:
 #
 # MAX_INMEMORY_TASKS=50 выбрано как баланс: ~400 MB максимум в RAM,
 # достаточно для одновременной работы 10-15 пользователей.
-MAX_INMEMORY_TASKS = 50
+# === Фаза 2.4: env-configurable ===
+# Берём из config.py (env MAX_INMEMORY_TASKS), по умолчанию 50.
+MAX_INMEMORY_TASKS = getattr(
+    _root_config, "MAX_INMEMORY_TASKS", 50
+) if _root_config is not None else 50
 _tasks: OrderedDict[str, Task] = OrderedDict()
 _tasks_lock = threading.Lock()
 
@@ -205,19 +224,25 @@ def _register_task(task: Task) -> None:
         pass
 
 
-# Корень проекта gibdd-bot (находится на 2 уровня выше этого файла):
-# miniapp/backend/services/gibdd_service.py → gibdd-bot/
-_PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
-
-# === Фаза 1.1: Semaphore на одновременные выгрузки ===
+# === Фаза 1.1 + 2.4: Semaphore на одновременные выгрузки ===
 # Ограничивает количество параллельно выполняемых execute_task().
-# Почему 3: API ГИБДД при 5+ одновременных запросах с одного IP
-# начинает возвращать 429/502; web-fallback (сайт stat.gibdd.ru) ещё
-# хуже — там POST-генерация отчётов. 3 параллельные выгрузки —
-# безопасный максимум. Остальные задачи ждут в очереди Semaphore.
-# При росте до 30 пользователей можно увеличить до 5.
-MAX_CONCURRENT_TASKS = 3
+#
+# === Фаза 2.4: env-configurable ===
+# Раньше было захардкожено 3. Теперь значение берётся из config.py
+# (env MAX_CONCURRENT_TASKS), по умолчанию 5 — оптимум для 10-30
+# пользователей. 3 было критично мало: при 5 одновременных запросах
+# 2 пользователя ждали в очереди Semaphore, видя прогресс 10%.
+#
+# Рекомендации:
+#   2-10 пользователей  → 3 (можно через env MAX_CONCURRENT_TASKS=3)
+#   10-30 пользователей → 5 (default Phase 2)
+#   30+ пользователей   → 8 (нужен выделенный канал / прокси)
+#
+# API ГИБДД при 8+ одновременных запросах с одного IP часто
+# возвращает 429/502; web-fallback (сайт stat.gibdd.ru) ещё хуже.
+MAX_CONCURRENT_TASKS = getattr(
+    _root_config, "MAX_CONCURRENT_TASKS", 5
+) if _root_config is not None else 5
 _EXECUTE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
@@ -492,15 +517,32 @@ async def execute_task(task_id: str) -> None:
     """
     # Таймаут 600 сек (10 мин) — если задача зависла, отпускаем semaphore.
     # Обычно выгрузка занимает 30-60 сек, 10 мин — щедрый запас.
+    # === Фаза 2.1: observe_task_total_duration — полное время выполнения ===
+    import time as _time_mod
+    _task_start_ts = _time_mod.monotonic()
+    _task_final_status = "failed"  # по умолчанию; меняется на "done" в impl
     try:
         async with _EXECUTE_SEMAPHORE:
             # === Фаза 1.6: Prometheus metrics ===
-            from ..middleware.metrics import task_started, task_finished
+            from ..middleware.metrics import (
+                task_started,
+                task_finished,
+                observe_task_total_duration,
+            )
             task_started()
             try:
                 await _execute_task_impl(task_id)
+                _task_final_status = "done"
             finally:
                 task_finished()
+                # Фаза 2.1: гистограмма полного времени выполнения
+                try:
+                    observe_task_total_duration(
+                        _task_final_status,
+                        _time_mod.monotonic() - _task_start_ts,
+                    )
+                except Exception:
+                    pass
     except Exception as exc:
         logger.exception(f"Task {task_id} failed (semaphore-wrapped)")
         task = _tasks.get(task_id)
@@ -511,6 +553,15 @@ async def execute_task(task_id: str) -> None:
             # Метрика: задача упала
             from ..middleware.metrics import record_task_status
             record_task_status("failed")
+        # Фаза 2.1: даже при fallback — фиксируем время
+        try:
+            from ..middleware.metrics import observe_task_total_duration
+            observe_task_total_duration(
+                "failed",
+                _time_mod.monotonic() - _task_start_ts,
+            )
+        except Exception:
+            pass
 
 
 async def _execute_task_impl(task_id: str) -> None:
@@ -532,6 +583,16 @@ async def _execute_task_impl(task_id: str) -> None:
             logger.debug(f"execute_task: persist failed: {exc}")
 
     try:
+        # === Фаза 2.1: helper для observe_phase_duration ===
+        import time as _time_mod
+        from ..middleware.metrics import observe_phase_duration
+
+        def _phase_done(phase: str, start_ts: float) -> None:
+            try:
+                observe_phase_duration(phase, _time_mod.monotonic() - start_ts)
+            except Exception:
+                pass
+
         # === 1. FETCHING ===
         task.status = TaskStatus.FETCHING
         task.progress = 10
@@ -542,12 +603,14 @@ async def _execute_task_impl(task_id: str) -> None:
 
         # Используем существующую функцию выгрузки из bot.py.
         # _fetch_cards_for_period уже умеет: API → web_fallback → кэш.
+        _phase_start = _time_mod.monotonic()
         cards, errors = await bot_module._fetch_cards_for_period(
             dat_list=task.dat_list,
             reg_code=task.region_code,
             log_prefix=f"MiniApp[{task_id}]",
             cache_result=True,
         )
+        _phase_done("fetching", _phase_start)
 
         if errors:
             logger.warning(
@@ -583,9 +646,11 @@ async def _execute_task_impl(task_id: str) -> None:
         # gibdd_parser.build_file1/2_data — синхронный CPU-bound парсинг
         # 1500-3000 карточек. Выносим в thread pool, чтобы не блокировать
         # event loop (Фаза 1.2).
+        _phase_start = _time_mod.monotonic()
         file1_data, file2_data = await asyncio.to_thread(
             _parse_files_sync, gibdd_parser, cards
         )
+        _phase_done("parsing", _phase_start)
 
         # === 3. ANALYTICS ===
         task.status = TaskStatus.ANALYTICS
@@ -593,6 +658,7 @@ async def _execute_task_impl(task_id: str) -> None:
         task.updated_at = datetime.now(timezone.utc)
         await _persist()
 
+        _phase_start = _time_mod.monotonic()
         try:
             analytics_module = _import_module("analytics")
 
@@ -633,6 +699,7 @@ async def _execute_task_impl(task_id: str) -> None:
                 "total_injured": task.total_injured,
                 "has_prev_data": False,
             }
+        _phase_done("analytics", _phase_start)
         await _persist()  # сохраняем analytics в БД
 
         # === 4. GENERATING ===
@@ -640,6 +707,7 @@ async def _execute_task_impl(task_id: str) -> None:
         task.progress = 80
         task.updated_at = datetime.now(timezone.utc)
         await _persist()
+        _phase_start = _time_mod.monotonic()
 
         out_dir = _task_dir(task_id)
         region_safe = "".join(
@@ -791,6 +859,9 @@ async def _execute_task_impl(task_id: str) -> None:
         except Exception as exc:
             logger.warning(f"Task {task_id}: map generation failed: {exc}")
             # Карта опциональна — задача считается успешной без неё
+
+        # === Фаза 2.1: observe_phase_duration для generating ===
+        _phase_done("generating", _phase_start)
 
         # === DONE ===
         task.status = TaskStatus.DONE
