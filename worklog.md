@@ -2825,3 +2825,90 @@ Stage Summary:
   внешних потребителей `import X; X.func(...)` и реэкспортировать
   нужные имена из __init__.py. Smoke-тест должен покрывать не только
   структуру, но и реальные сценарии импорта из других модулей.
+
+---
+Task ID: phase3-2-bot-refactor-fixup-2
+Agent: main (super-z)
+Task: Хотфикс #2 Phase 3-2 — prod-деплой упал с
+`NameError: name '_is_api_down' is not defined` в gibdd_service.py:560
+→ bot/access.py:78.
+
+Контекст: После первого хотфикса (bot/__init__.py re-exports) бот запустился,
+но первый же запрос ДТП упал:
+  File "/app/bot/access.py", line 78, in _fetch_cards_for_period
+    if _is_api_down():
+  NameError: name '_is_api_down' is not defined
+
+Анализ:
+- `_is_api_down` и `_mark_api_down` определены в `bot/infra.py` (строки 60, 54).
+- `bot/access.py` делал только `from bot._state import *`, где этих функций НЕТ
+  (в _state.py лежит только переменная `_api_down`, а функции-аксессоры
+  уехали в infra.py при рефакторинге).
+- В исходном bot.py всё было в одном модуле — имена разрешались локально.
+- После split в пакет каждая функция оказалась в своём модуле, и `from _state
+  import *` больше не покрывает их.
+
+Полный AST-аудит нашёл ещё несколько таких пропусков:
+- `bot/access.py` — пропущены `_is_api_down`, `_mark_api_down` (из infra.py)
+- `bot/app.py` — пропущены `_tg_retry`, `_sanitize_error` (из infra.py)
+- `bot/output.py` — пропущен `_sanitize_error` (из infra.py)
+- `bot/output.py` — нужны `_get_current_cards`, `_build_menu_keyboard` из
+  analysis.py, НО analysis.py импортирует из output.py → циклическая
+  зависимость. Решение: late imports внутри функций.
+- `bot/point_stats.py` — нужны `_get_current_cards`, `_build_menu_keyboard`
+  из analysis.py (без цикла — module-level импорт OK)
+- `bot/qa.py` — нужен `_get_current_cards` из analysis.py (без цикла)
+
+Work Log:
+- Прочитал bot/access.py, bot/app.py, bot/output.py, bot/point_stats.py,
+  bot/qa.py — проверил какие функции используются и где определены.
+- Написал AST-аудит: для каждого модуля bot/*.py собрал имена used (Load),
+  вычел local defs, explicit imports, _state.__all__, builtins, locals —
+  нашёл ~12 private имён, из них ~6 реальных пропусков, остальные false
+  positives (local `import httpx as _httpx` внутри функций, `_os = os`).
+- bot/access.py: добавил строку `from bot.infra import _is_api_down, _mark_api_down`
+- bot/app.py: расширил импорт с `from bot.infra import _IsDocument`
+  на `from bot.infra import _IsDocument, _tg_retry, _sanitize_error`
+- bot/output.py: расширил импорт infra (добавил `_sanitize_error`) и
+  заменил 3 использования `_get_current_cards` / `_build_menu_keyboard` на
+  late imports внутри функций (3 шт: в `_html_map_menu` строка 31,
+  в `_generate_and_send_dtp_map` строки 65 и 144).
+- bot/point_stats.py: добавил module-level
+  `from bot.analysis import _get_current_cards, _build_menu_keyboard`
+- bot/qa.py: добавил module-level `from bot.analysis import _get_current_cards`
+- Запустил runtime-проверку:
+  * `bot._build_app` callable ✓
+  * `bot._fetch_cards_for_period` callable, signature совпадает ✓
+  * `access._is_api_down()` → False (initial state) ✓
+  * `access._mark_api_down()` → меняет `_api_down` на True ✓
+  * `output._html_map_menu`, `_generate_and_send_dtp_map` импортируются ✓
+  * `point_stats._get_current_cards`, `_build_menu_keyboard` доступны ✓
+  * `qa._handle_analytics_question` доступна ✓
+- Запустил smoke-тесты: 19/19 passed в test_bot_package.py, 63/63 passed
+  во всех smoke-тестах, без циклических импортов.
+- Пересобрал архив: /home/z/my-project/download/gibdd-bot-refactored.zip
+  (108 KB, 24 файла)
+
+Stage Summary:
+- NameError устранён — все cross-module ссылки в пакете bot/ явно импортированы.
+- 5 файлов изменено:
+  * bot/access.py (+1 строка: from bot.infra import _is_api_down, _mark_api_down)
+  * bot/app.py (расширен импорт infra: +_tg_retry, +_sanitize_error)
+  * bot/output.py (+_sanitize_error в module-level, +3 late imports в
+    функциях для разрыва цикла с analysis.py)
+  * bot/point_stats.py (+1 строка: from bot.analysis import _get_current_cards,
+    _build_menu_keyboard)
+  * bot/qa.py (+1 строка: from bot.analysis import _get_current_cards)
+- Тесты: 63 passed, 7 skipped (slowapi/psycopg не установлены в dev),
+  0 failed.
+- Архив: /home/z/my-project/download/gibdd-bot-refactored.zip (108 KB)
+- Деплой: распаковать архив заново, перезапустить контейнер. Изменения
+  изолированы в bot/* — main.py, gibdd_service.py, config.py НЕ тронуты.
+- Корневая причина: при Phase 3-2 рефакторинге `extract_bot.py` честно
+  перенёс функции в модули по разделам, но НЕ добавил явные cross-module
+  импорты (рассчитывал на `from bot._state import *` как в едином bot.py).
+  В едином файле это работало, в пакете — нет.
+- Урок на будущее: при split модуля в пакет AST-аудит used-but-not-imported
+  private имён — обязательный шаг перед деплоем. Smoke-тест на импорты
+  не ловит runtime NameError, потому что Python резолвит имена лениво
+  (при вызове функции, а не при её определении).
