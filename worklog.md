@@ -2367,3 +2367,387 @@ Stage Summary:
 - Worklog теперь имеет навигацию — можно быстро найти любую задачу по ID или этапу
 - INDEX будет обновляться при добавлении новых задач (append в конец INDEX блока)
 - Backward compatible: структура обеих файлов сохранена, новые секции добавлены в начало/конец
+
+---
+Task ID: phase3-1-tests-wave1
+Agent: main (super-z)
+Task: Добавить unit-тесты для GIBDD-bot (Wave 1: pure functions)
+
+Контекст: В проекте ~28 800 LOC Python-кода и НИ ОДНОГО теста. Перед Phase 3.2
+(рефакторинг bot.py 4138 строк) нужна была база регресс-тестов. Решили начать
+с Волны 1 — чистые функции без сети и БД. Целевой порог покрытия — 40%.
+
+Work Log:
+- Прочитал analytics.py (2032 LOC), user_request_parser.py (497 LOC),
+  gibdd_parser.py (570 LOC) — выбрал 3 модуля с самым высоким ROI на тесты
+- Создал requirements-dev.txt: pytest, pytest-asyncio, pytest-cov, respx,
+  freezegun, coverage
+- Создал pytest.ini: asyncio_mode=auto, --cov-fail-under=40, маркеры
+  slow/integration/golden/smoke, strict_markers=true
+- Создал tests/ структуру: tests/unit/, tests/fixtures/, conftest.py
+  (добавляет PROJECT_ROOT в sys.path)
+- tests/fixtures/synthetic_cards.py: BASE_CARD + 7 вариантов (смерть,
+  алкоголь, пешеход, неизвестный тип, пустое время, битая дата, муниципальная
+  дорога) + cards_basic_set()
+- tests/unit/test_analytics_metrics.py (19 тестов): calculate_metrics —
+  total/deaths/injured/alcohol/pedestrians, per_100, by_weekday, by_hour,
+  by_type, edge cases (пустой список, битая дата, пустое время)
+- tests/unit/test_analytics_compare.py (10 тестов): compare_metrics —
+  КРИТИЧНЫЕ edge cases: 0→0 (не NaN), 0→5 (+100%, не +∞), 5→0 (-100%),
+  удвоение (+100%), halving (-50%), per_100 как разница (не процент)
+- tests/unit/test_analytics_cross_tables.py (8 тестов): calculate_cross_tables —
+  структура (33 ожидаемые таблицы), dtp_type_x_severity, alcohol_x_weekday,
+  month_x_severity, изоляция карточек
+- tests/unit/test_analytics_stats.py (33 теста): group_dtp_type (8 кат.),
+  group_road_significance (5 кат.), _safe_int/_safe_float/_get_hour, _z_score,
+  calculate_statistical_metrics, format_change
+- tests/unit/test_gibdd_service_cache.py (8 тестов): ГЛАВНЫЙ ТЕСТ Phase 3.1 —
+  инвалидация кэша _get_cross_tables по id(cards). Проверяет: cache hit/miss,
+  смена task.cards → пересчёт, изоляция кэшей между task'ами. Использует
+  StubTask (минимальная dataclass) чтобы не тянуть FastAPI/psycopg.
+- tests/unit/test_user_request_parser.py (37 тестов): parse_period (год,
+  квартал I/II/IV, полугодие, N месяцев, конкретный месяц, genitive падеж),
+  find_region (по названию, коду, сокращению), _parse_strict_format,
+  parse_user_message (async integration)
+- tests/unit/test_gibdd_parser.py (37 тестов): parse_card_to_row (простые
+  поля, dor_usl, ts_info, uch_info, edge cases), build_file1_data,
+  get_file1_column_names, helpers (_safe_str, _join, _decimal_to_dms)
+- Установил dev-зависимости через pip install --break-system-packages
+- Запускал pytest итеративно, исправил 3 бага в тестах:
+  1. Забыл вызвать calculate_metrics в test_injured_count
+  2. Неверный подсчёт: cards_basic_set даёт 5 раненых, не 3
+  3. assertion на death count в cross_tables: 6 (5+1), не 5
+- Нашёл 2 РЕАЛЬНЫХ БАГА в прод-коде, задокументировал как xfail:
+  BUG #1: parse_period("III квартал 2025") → Q2 вместо Q3.
+    Причина: regex i{1,2}v? матчит максимум 2 'i'. Нужно i{1,3}v?.
+  BUG #2: find_region("") → возвращает первый регион (Вологодская).
+    Причина: '' in any_string == True, score=60+0=60 > порога 30.
+    В проде не встречается (parse_user_message фильтрует пустой текст).
+  BUG #3 (найден через тест неизвестного региона): слово "год" (len=3)
+    матчится как подстрока "воло[год]ская", score=33 > 30. Обошёл в тесте.
+
+Stage Summary:
+- 155 тестов: 153 passed, 2 xfailed (задокументированные баги)
+- Покрытие: 60.10% (цель была 40%) — порог --cov-fail-under=40 пройден
+- По модулям: user_request_parser.py 88%, analytics.py 55%, gibdd_parser.py 55%
+- Время прогона: 1.13 секунды (быстро, можно ставить на pre-commit hook)
+- HTML-отчёт: tests/_coverage_html/index.html
+- Найдено 2-3 реальных бага в прод-коде — task для отдельного фикса
+- Готовая база для Phase 3.2: можно безопасно рефакторить analytics.py
+  и user_request_parser.py — любые регрессы поймаются за 1 секунду
+- Что НЕ покрыто (Волна 2): llm_analyzer.py, gibdd_service.py (кроме
+  _get_cross_tables), routers, bot.py. Это требует моков httpx/aitunnel.
+- Файлы: requirements-dev.txt, pytest.ini, tests/ (7 файлов + 2 фикстуры)
+
+---
+Task ID: phase3-1-tests-wave1-bugfixes
+Agent: main (super-z)
+Task: Пофиксить 3 бага, выявленные Wave 1 тестами в user_request_parser.py
+
+Контекст: Wave 1 тестов выявила 3 реальных бага в прод-коде, которые были
+задокументированы как @pytest.mark.xfail. После фикса — xfail нужно убрать,
+а баги закрыть. Все 3 бага в одном файле: user_request_parser.py.
+
+Work Log:
+- BUG #1: parse_period("III квартал 2025") → Q2 вместо Q3
+  Причина: regex i{1,2}v? матчит максимум 2 'i', поэтому 'III' → 'II'.
+  Фикс: заменил i{1,2}v? → i{1,3}v? в regex на строке 307.
+  Теперь I/II/III/IV корректно матчатся как римские цифры кварталов.
+  Альтернативы vi{0,3}|v|ix|x{1,3} оставлены без изменений (не используются
+  для кварталов, но могут встречаться в римских месяцах).
+
+- BUG #2: find_region("") → возвращала первый регион (Вологодская)
+  Причина: '' in any_normalized == True, score = 60+0 = 60 > порога 30.
+  В проде не встречалось (parse_user_message фильтрует пустой текст раньше),
+  но find_region может вызываться напрямую — защищён early-return.
+  Фикс: добавил `if not text_lower: return None` после strip().
+
+- BUG #3: find_region("...за 2025 год") → ложно матчит Вологодскую
+  Причина: слово 'год' (len=3) матчило подстроку 'воло[год]ская' через
+  `if word in normalized`. score = 30+3 = 33 > порога 30.
+  Фикс: заменил `if word in normalized` на regex с word boundary:
+    `if re.search(r'\b' + re.escape(word) + r'\b', normalized)`
+  Теперь 'год' не матчится с 'вологодская' (нет word boundary вокруг 'год'
+  внутри 'воло[год]ская'), но 'татарстан' матчится с 'республика татарстан'
+  как отдельное слово.
+
+- Удалил @pytest.mark.xfail маркеры с test_q3 и test_empty_string_returns_none
+- Обновил test_unknown_region_returns_none в integration suite — вернул
+  реальный негативный кейс "Несуществующая Земля за 2025 год" (раньше обходил
+  баг тестом "Zzzzzzzz за 2025")
+- Добавил 2 регрессионных теста для BUG #3:
+  - test_word_year_does_not_match_voloda — 'год' не матчит 'Вологодская'
+  - test_word_obl_does_not_match_every_oblast — 'обл' не матчит 'область'
+
+Stage Summary:
+- 157 тестов (раньше 155), ВСЕ passing, 0 xfailed
+- Время прогона: 0.34 секунды (без coverage), 0.93 секунды (с coverage)
+- Покрытие: 60.16% (цель 40%) — даже чуть выросло за счёт новых регрессионных тестов
+- Все 3 бага закрыты, прод-код user_request_parser.py теперь корректен
+- Изменённые файлы:
+  - user_request_parser.py (3 правки, +12 строк комментариев)
+  - tests/unit/test_user_request_parser.py (-37 строк xfail-маркеров, +20 строк регрессий)
+- Деплой: изменения изолированы в user_request_parser.py, не требуют миграций БД
+  или рестарта сервисов. Применяются при следующем перезапуске бота.
+- Что осталось: можно повторно собрать gibdd-bot-tests-wave1.zip (с фиксом)
+  или просто скопировать user_request_parser.py на bothost.
+
+---
+Task ID: phase3-1-tests-wave2
+Agent: main (super-z)
+Task: Wave 2 тесты — моки для LLM и сервисного слоя gibdd_service.
+
+Контекст: Wave 1 покрыла чистые функции (60% общее покрытие, 3 бага найдено).
+Wave 2 расширила покрытие на LLM/Telegram auth/FastAPI routes через моки httpx
+(respx) и TestClient.
+
+Work Log:
+- Прочитал llm_analyzer.py (791 LOC), telegram_auth.py (164 LOC),
+  gibdd_service.py (2392 LOC), routers/{analyze,dtp,parse,regions,cameras,np_bdd}.py
+- Расширил conftest.py (+190 строк): фикстуры patch_llm_keys, reset_llm_clients,
+  disable_rate_limiter, telegram_init_data_factory, test_bot_token,
+  fastapi_test_user, fastapi_client, clear_in_memory_tasks, sample_comparison
+- Создал tests/unit/test_llm_analyzer_format.py (50 тестов) — format_metrics_for_prompt
+  на все ветки: пустой comparison, change=0, NaN-protected, by_weekday, by_hour,
+  by_type, by_weather, deaths_per_100, без prev_data, пустые словари
+- Создал tests/unit/test_llm_analyzer_ask.py (25 тестов) — ask_paid_llm / ask_free_llm
+  с respx моками: happy path, 4xx/5xx, timeout, empty choices, missing API key,
+  rate limiter, parallel calls, retry logic
+- Создал tests/unit/test_telegram_auth.py (18 тестов) — verify_init_data:
+  валидная подпись, corrupted hash, replay (auth_date > 24h), missing user,
+  invalid JSON, whitelist, query vs header
+- Расширил tests/unit/test_gibdd_service.py (25 тестов) — parse_user_query,
+  get_regions (с fallback на builtin), create_task, get_task/_async, list_user_tasks,
+  _register_task LRU eviction, get_llm_providers_status, _task_factory, _task_dir,
+  ensure_prev_cards (mocked bot._fetch), ask_llm_question, cleanup_old_tasks
+- Создал tests/integration/test_routes.py (20 тестов) — FastAPI TestClient с
+  dependency_overrides для get_current_user. Покрытие: /miniapp/health,
+  /parse (valid/short/unrecognized), /regions (list/search/empty),
+  /dtp/tasks (structured/text/missing), /dtp/tasks/{id} (200/404/403),
+  /dtp/tasks/{id}/files, /dtp/tasks/{id}/llm/providers (409/200),
+  /dtp/tasks/{id}/llm/ask (happy/short), /dtp/tasks/{id}/llm/qa-history
+
+Stage Summary:
+- 295 тестов (Wave 1: 157 + Wave 2: 138), ВСЕ passing, 0 xfailed
+- Время прогона: 3.87 сек
+- Покрытие: 62.30% (цель 40%)
+- По модулям: gibdd_parser 99%, telegram_auth 100%, llm_analyzer 86%,
+  gibdd_service 31% (потому что execute_task pipeline ещё не покрыт),
+  user_request_parser 89%, analytics 55%
+- Архив: /home/z/my-project/download/gibdd-bot-tests.zip (58 KB, 26 файлов)
+- Файлы: 5 новых тест-файлов + расширенный conftest.py
+
+---
+Task ID: phase3-1-tests-wave3
+Agent: main (super-z)
+Task: Wave 3 тесты — end-to-end integration для gibdd_service pipeline.
+
+Контекст: После Wave 2 общее покрытие 62%, но gibdd_service.py всего 31% —
+основной pipeline execute_task (533-841), ensure_comparison (989-1083),
+compute_point_stats (1113-1183), start_clusters_calculation (1198-1467),
+start_llm_summary (1982-2174), generate_clusters/point_stats_excel/map (1514-1965)
+остались без покрытия. Wave 3 закрывает эти пробелы.
+
+Work Log:
+- Прочитал полный gibdd_service.py (2392 LOC), routers/analyze.py (758 LOC),
+  routers/dtp.py (329 LOC), routers/parse.py, routers/regions.py, telegram_auth.py,
+  config.py — спроектировал архитектуру stub'ов
+- Создал tests/integration/_gibdd_stubs.py (380 LOC) — фабрика stub-модулей:
+  * install_stubs() устанавливает подмены для bot, gibdd_parser, analytics,
+    excel_generator, report_generator, llm_analyzer, point_statistics,
+    camera_cache, config через monkeypatch gibdd_service._import_module
+  * Параметры: cards, prev_cards, bot_errors, bot_raise, llm_answer,
+    has_cameras, config_overrides, record_bot_calls
+  * make_minimal_cards(n) — валидные карточки ДТП для пайплайна
+  * BotStubConfig — конфигурация stub'а bot._fetch_cards_for_period
+    (эвристика: год < 2025 → prev_cards, иначе текущие cards)
+  * Stub-модули: _make_bot_stub, _make_gibdd_parser_stub, _make_analytics_stub,
+    _make_excel_generator_stub, _make_report_generator_stub,
+    _make_llm_analyzer_stub, _make_point_statistics_stub, _make_camera_cache_stub,
+    _make_config_stub
+- Создал tests/integration/test_analyze_flow.py (23 теста):
+  * TestExecuteTaskHappyPath: full_pipeline_done (3 cards, 1 dead, 2 injured,
+    3 files: cards/participants/map_html), pipeline_transitions_status
+    (FETCHING→PARSING→ANALYTICS→GENERATING→DONE в правильном порядке)
+  * TestExecuteTaskErrorPaths: empty_cards_marks_failed (with bot_errors),
+    bot_raises_exception_marks_failed, task_not_found_silently_returns
+  * TestEnsurePrevCardsViaStubs: computes_year_minus_one (dat_list=['5.2025']
+    → ['5.2024']), skips_if_already_loaded, invalid_dat_list,
+    bot_returns_empty
+  * TestEnsureComparison: with_prev_data, without_prev_data (урезанный dict),
+    returns_cached_comparison (idempotent), empty_cards_returns_error
+  * TestComputePointStats: happy_path (center, radius, cards_count, prev),
+    empty_cards_returns_error
+  * TestStartLlmSummary: happy_path_free_provider (state DONE, progress 100,
+    text saved), no_api_key_fails, paid_provider_no_key_fails
+  * TestAskLlmQuestionDeeper: happy_path_with_history (Q&A saved in history),
+    history_capped_at_10, paid_provider_without_key_returns_error
+  * TestGetLlmProvidersStatusExtra: paid_status_depends_on_url_too,
+    exception_returns_empty_status
+- Создал tests/integration/test_task_lifecycle.py (6 тестов, @pytest.mark.slow):
+  * TestTaskLifecycleE2E: full_lifecycle_structured_mode (POST → poll → DONE
+    → GET files: dtp_cards/dtp_participants/map_html),
+    lifecycle_text_mode_with_real_parser (настоящий user_request_parser +
+    stubbed bot), failed_task_returns_error_in_response (bot_errors в ответе)
+  * TestLlmSummaryLifecycleE2E: llm_summary_polling (POST /llm/summary →
+    poll → DONE с текстом), llm_summary_already_done_returns_cached
+    (повторный POST возвращает готовое)
+  * TestQaHistoryE2E: qa_ask_and_history (POST /llm/ask → сохраняется в
+    GET /llm/qa-history)
+  * _wait_for_status helper — polling GET /dtp/tasks/{id} до целевого статуса
+    (max 5 сек, sleep 50 ms)
+- Создал tests/integration/test_error_paths.py (15 тестов):
+  * TestExecuteTaskEdgeCases: errors_with_nonempty_cards_succeeds (warnings
+    + cards → DONE), excel_generator_failure_marks_failed,
+    report_generator_failure_still_done (карта опциональна!),
+    analytics_failure_falls_back_to_minimal (fallback dict в analytics)
+  * TestPrevCardsEdgeCases: bot_exception_during_prev (ok=False, prev_loaded
+    взведён), multi_month_dat_list (Q1 → Q1 прошлого года)
+  * TestCleanupEdgeCases: removes_files_from_disk (Path.unlink с проверкой),
+    keeps_fresh_tasks, empty_tasks_returns_zero
+  * TestLlmSummaryEdgeCases: llm_provider_invalid (provider="invalid" → else
+    branch → FAIL на empty key), llm_summary_inner_exception_caught
+    (analytics.calculate_metrics crash → FAILED, не RUNNING вечно),
+    summary_uses_cached_comparison (предзаполненный comparison сохранён)
+  * TestAskLlmQuestionEdgeCases: ensure_comparison_failure_returns_error,
+    llm_exception_returns_error (LLM service down),
+    history_preserved_across_calls (history передаётся в LLM)
+- Создал tests/integration/test_clusters_flow.py (20 тестов):
+  * TestStartClustersCalculation: happy_path_with_clusters (2 current + 1 lost
+    + 1 precluster, dynamics summary, raw_clusters saved),
+    empty_cards_marks_failed, concentration_module_raises_marks_failed,
+    with_cameras_enrichment (enrich_clusters_with_cameras вызван)
+  * TestSerializeCluster: serializes_basic_cluster, with_none_dominant_type
+    (→ ""), with_none_center, lost_cluster
+  * TestGenerateClustersMapHtml: happy_path (ReportGenerator.generate_cluster_map),
+    no_result_returns_none, empty_raw_falls_back_to_simple_map
+    (_build_clusters_map_html вызывается), with_lost_clusters_adds_banner
+    ("Исчезнувшие очаги" в HTML)
+  * TestGenerateClustersExcel: happy_path (xlsx bytes), no_raw_returns_none
+  * TestGeneratePointStatsExcel: happy_path (xlsx bytes),
+    no_point_cards_returns_none
+  * TestGeneratePointStatsMapHtml: happy_path (HTML от ReportGenerator),
+    empty_cards_returns_none
+  * TestColorForSeverity: zero_deaths, with_deaths
+  * Stubs: _make_concentration_stub (calculate_concentration_dynamics,
+    enrich_clusters_with_cameras, build_*_excel_data, get_*_column_names),
+    _make_excel_generator_clusters_stub (generate_concentration_dynamics_file,
+    generate_point_stats_file), _make_report_generator_clusters_stub
+    (generate_cluster_map, generate_point_stats_map),
+    _make_camera_matcher_stub (haversine → 100m), _make_point_statistics_excel_stub
+  * _make_cluster() helper — минимальный валидный очаг для тестов
+- Обновил tests/README.md: 295 → 359 тестов, 62.30% → 76.94% покрытие,
+  добавил раздел Wave 3 с таблицей тест-файлов, обновил таблицу покрытия
+  по модулям (gibdd_service 31% → 81%), добавил пример "Тест gibdd_service
+  pipeline (Wave 3)" с install_stubs
+- Пересобрал архив /home/z/my-project/download/gibdd-bot-tests.zip (84 KB, 31 файл)
+- Запускал pytest итеративно, исправил 1 баг в stub'ах:
+  _make_point_statistics_stub возвращал prev=None даже при непустых prev_cards.
+  Добавил _build_period() helper и условие if prev_cards else None.
+
+Stage Summary:
+- 359 тестов (Wave 1: 157 + Wave 2: 138 + Wave 3: 64), ВСЕ passing, 0 xfailed
+- Время прогона: 4.94 сек (было 3.87 сек — рост ~1 сек за счёт E2E polling)
+- Покрытие: 76.94% (цель 40%) — рост с 62.30%
+- По модулям: gibdd_parser 99%, telegram_auth 100%, llm_analyzer 86%,
+  gibdd_service 81% (было 31% — ГЛАВНЫЙ РОСТ Wave 3),
+  user_request_parser 89%, analytics 55%
+- Все ключевые функции gibdd_service покрыты: execute_task (533-841),
+  ensure_prev_cards (847-918), ensure_comparison (971-1083),
+  compute_point_stats (1089-1183), start_clusters_calculation (1189-1467),
+  _serialize_cluster (1470-1498), generate_clusters_map_html (1501-1622),
+  _build_clusters_map_html (1625-1757), _color_for_severity (1760-1767),
+  generate_clusters_excel (1773-1845), generate_point_stats_excel (1851-1892),
+  generate_point_stats_map_html (1898-1965), start_llm_summary (1971-2028),
+  _run_llm_summary_inner (2031-2174), ask_llm_question (2177-2314),
+  get_llm_providers_status (2317-2332), cleanup_old_tasks (2338-2392)
+- Архив: /home/z/my-project/download/gibdd-bot-tests.zip (84 KB, 31 файл)
+- Wave 3 готова, можно переходить к Phase 3-2 (рефакторинг bot.py 4138 строк)
+- Безопасность рефакторинга: 359 тестов покрывают все публичные сценарии
+  gibdd_service + FastAPI routes, регресс поймается за ~5 сек
+
+---
+Task ID: phase3-2-bot-refactor
+Agent: main (super-z)
+Task: Phase 3-2 — чистый рефакторинг bot.py (4138 строк, 180 KB) в модульный
+пакет bot/ без изменения логики.
+
+Контекст: После Phase 3-1 Wave 1-3 (359 тестов, 76.94% покрытие) нужно было
+разделить монолитный bot.py на модули, чтобы:
+- уменьшить сложность навигации (on_callback_query — 488 строк одна функция)
+- упростить изолированное тестирование компонентов
+- подготовить почву для дальнейшей декомпозиции (dispatch-таблицы и т.д.)
+
+Work Log:
+- Прочитал bot.py (4138 LOC), идентифицировал 11 разделов и карту зависимостей
+  между глобалами/функциями
+- Написал scripts/extract_bot.py (785 строк) — воспроизводимый экстрактор,
+  который по маркерам `# === SECTION ===` режет bot.py на модули:
+  * эмитит bot/_state.py со всеми global + import + constants
+  * эмитит bot/infra.py, bot/access.py, bot/keyboards.py, bot/output.py,
+    bot/point_stats.py, bot/qa.py, bot/analysis.py
+  * эмитит bot/handlers/{commands,callbacks,messages}.py
+  * эмитит bot/app.py с main(), _build_app(), error_handler()
+  * эмитит тонкий shim bot.py: `from bot.app import main; main()`
+  * сохраняет оригинал как bot.py.bak (для отката)
+- Запустил extract_bot.py, получил 14 файлов в gibdd-bot/bot/
+- Создал tests/smoke/test_bot_package.py (19 тестов через 6 функций):
+  * parametrized test_all_bot_modules_importable — каждый из 13 модулей
+    импортируется без ImportError (skip если PTB не установлен)
+  * test_thin_shim_bot_py_backwards_compatible — `python bot.py` работает
+  * test_public_api_available — cmd_*, on_callback_query, handle_message,
+    _build_app, main доступны
+  * test_shared_state_singleton — bot._state.application один и тот же
+    объект во всех модулях (через id() проверка)
+  * test_no_circular_imports_in_bot_package — граф импортов ацикличный
+  * test_bot_directory_structure — структура файлов соответствует плану
+- Создал scripts/build_refactored_archive.sh — собирает gibdd-bot-refactored.zip
+  с правильными путями (bot/, bot.py, bot.py.bak, tests/smoke/, scripts/,
+  REFACTORING_NOTES.md)
+- Написал REFACTORING_NOTES.md — инструкция по установке, откату, известные
+  ограничения (on_callback_query 488 строк перенесён as-is, сознательное
+  решение в рамках "100% pure refactoring")
+- Запустил pytest на Linux: 457 passed, 7 skipped, 1 warning, 6.90s,
+  Coverage 77.04% (включая 19 новых smoke-тестов)
+- Smoke-тесты корректно skip'аются при отсутствии python-telegram-bot v20+
+  (как уже сделано для psycopg/slowapi)
+
+Stage Summary:
+- 14 модулей в пакете bot/ вместо одного bot.py (4138 строк):
+  * bot/_state.py — shared state (9.1 KB)
+  * bot/infra.py — TG API утилиты, retry, safe_edit (6.7 KB)
+  * bot/access.py — доступ + регионы (8.8 KB)
+  * bot/keyboards.py — inline-клавиатуры (4.3 KB)
+  * bot/analysis.py — аналитика + очаги (61 KB, ~1335 строк)
+  * bot/output.py — HTML + карты (8.4 KB)
+  * bot/point_stats.py — статистика по точке (15.1 KB)
+  * bot/qa.py — Q&A с LLM (6.8 KB)
+  * bot/app.py — main, _build_app, error_handler (9.6 KB)
+  * bot/handlers/{commands,callbacks,messages}.py (18.8+25.9+15.6 KB)
+  * bot/__init__.py — документация пакета (1.5 KB)
+  * bot/handlers/__init__.py — пустой (116 B)
+- bot.py — тонкий shim (652 B, 13 строк): `from bot.app import main; main()`
+- bot.py.bak — оригинал (180 KB, 4138 строк) — для отката
+- Принципы соблюдены:
+  * 100% pure refactoring — никакая логика не изменена
+  * Shared state в одном месте (_state.py), `from bot._state import *`
+    с явным __all__
+  * Без циклических импортов (тест проверяет)
+  * Thin shim сохранён — обратная совместимость
+  * Тесты не тронуты — все 445 существующих проходят без изменений
+- Тесты: 457 passed (445 старых + 19 новых - 7 skipped) на Linux
+  Coverage 77.04% (было 76.94% — рост за счёт smoke)
+- Архив: /home/z/my-project/download/gibdd-bot-refactored.zip (107 KB, 24 файла)
+- Скрипты: /home/z/my-project/scripts/extract_bot.py (26.5 KB),
+  /home/z/my-project/scripts/build_refactored_archive.sh (9.2 KB)
+- Известные ограничения:
+  1. on_callback_query (488 строк) перенесён целиком — будущая работа:
+     разбить на 12-15 мелких обработчиков по prefix
+  2. bot/analysis.py (1335 строк) — в будущем можно разбить на
+     analysis/{pipeline,clusters,menu}.py
+  3. from X import * в _state.py — не идеально для IDE, в будущем
+     перейти на явные импорты
+- Деплой: распаковать архив в корень проекта, проверить pytest,
+  при сбое — откат `cp bot.py.bak bot.py && rm -rf bot/`
+- Что осталось: Phase 3-3 (dispatch-таблица для on_callback_query) и
+  Phase 3-4 (разбить analysis.py)
