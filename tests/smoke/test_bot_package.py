@@ -2,13 +2,21 @@
 Smoke-тесты на структуру пакета bot/ (после Phase 3-2 рефакторинга).
 
 Проверяют:
-  1. Все 13 модулей bot/* импортируются без ошибок
+  1. Все 13 модулей bot/* импортируются без ошибок (если PTB установлен)
   2. Thin shim bot.py продолжает работать (python bot.py → from bot.app import main)
   3. Публичный API бота (cmd_*, on_callback_query, handle_message, _build_app, main)
      доступен через bot.app или bot.handlers.*
   4. Нет циклических импортов между модулями
+  5. Структура директории соответствует плану
 
 Запуск: pytest tests/smoke/test_bot_package.py -m smoke
+
+ВАЖНО: Большинство тестов требуют python-telegram-bot v20+ (с классами
+Update/InlineKeyboardButton/etc. в корне `telegram`). Если PTB не установлен
+или установлена старая версия (≤13.x) — тесты корректно пропускаются (skip),
+как уже сделано для psycopg/slowapi.
+
+Тесты структуры директории и thin shim НЕ требуют PTB и проходят всегда.
 """
 from __future__ import annotations
 
@@ -38,10 +46,61 @@ EXPECTED_BOT_MODULES = [
 ]
 
 
+# ====================== PTB availability check ======================
+
+def _ptb_available() -> bool:
+    """Проверяет, установлен ли python-telegram-bot v20+ с нужными классами.
+
+    PTB v20+ экспортирует Update, InlineKeyboardButton, InlineKeyboardMarkup
+    в корне `telegram`. Старые версии (≤13.x) или конфликтующий пакет
+    `telegram` (заброшенный, не имеющий отношения к PTB) — не экспортируют.
+
+    Возвращает True только если нужные классы доступны.
+    """
+    try:
+        import telegram
+        return (
+            hasattr(telegram, "Update")
+            and hasattr(telegram, "InlineKeyboardButton")
+            and hasattr(telegram, "InlineKeyboardMarkup")
+        )
+    except ImportError:
+        return False
+
+
+# Параметризованный skip-маркер: тесты, требующие PTB, пропускаются если его нет.
+ptb_required = pytest.mark.skipif(
+    not _ptb_available(),
+    reason="python-telegram-bot v20+ не установлен — bot/* модули опциональны "
+           "в dev-окружении без PTB. Установите: pip install python-telegram-bot>=20.0",
+)
+
+
+# ====================== Tests ======================
+
 @pytest.mark.smoke
 @pytest.mark.parametrize("module_name", EXPECTED_BOT_MODULES)
 def test_bot_module_imports_without_errors(module_name: str) -> None:
-    """Каждый модуль пакета bot/ должен импортироваться без исключений."""
+    """Каждый модуль пакета bot/ должен импортироваться без исключений.
+
+    Требует python-telegram-bot v20+. Если PTB не установлен — тест skip'ается.
+    Пустые модули (bot, bot.handlers) импортируются без PTB и тестируются всегда.
+    """
+    # bot и bot.handlers — пустые __init__.py, не требуют PTB.
+    if module_name in ("bot", "bot.handlers"):
+        try:
+            importlib.import_module(module_name)
+        except ImportError as e:
+            pytest.fail(f"Не удалось импортировать {module_name}: {e}")
+        return
+
+    # Остальные модули требуют PTB.
+    if not _ptb_available():
+        pytest.skip(
+            "python-telegram-bot v20+ не установлен — bot/* модули опциональны "
+            "в dev-окружении без PTB"
+        )
+
     try:
         importlib.import_module(module_name)
     except ImportError as e:
@@ -60,9 +119,7 @@ def test_bot_module_imports_without_errors(module_name: str) -> None:
 def test_thin_shim_bot_py_still_works() -> None:
     """bot.py должен оставаться тонкой обёрткой, делегирующей в bot.app.
 
-    Это гарантирует обратную совместимость:
-      • `python bot.py` продолжает работать
-      • Тесты, импортирующие из bot, не ломаются
+    Не требует PTB — проверяет только структуру файла.
     """
     project_root = Path(__file__).resolve().parents[2]
     bot_py = project_root / "bot.py"
@@ -76,7 +133,6 @@ def test_thin_shim_bot_py_still_works() -> None:
     )
 
     # thin shim НЕ должен содержать большого количества строк кода
-    # (только импорт + __main__ guard)
     line_count = len([line for line in content.splitlines() if line.strip()])
     assert line_count < 30, (
         f"bot.py должен быть тонким (<30 строк кода), фактически {line_count} строк. "
@@ -85,11 +141,13 @@ def test_thin_shim_bot_py_still_works() -> None:
 
 
 @pytest.mark.smoke
+@ptb_required
 def test_public_api_handlers_accessible() -> None:
     """Все публичные обработчики бота должны быть доступны через bot.app или bot.handlers.*.
 
-    Эти имена используются в _build_app() для регистрации в Application.
-    Если они недоступны — Application не зарегистрирует обработчики → бот не отвечает.
+    Требует PTB v20+. Эти имена используются в _build_app() для регистрации
+    в Application. Если они недоступны — Application не зарегистрирует
+    обработчики → бот не отвечает.
     """
     from bot.handlers.commands import (
         cmd_start, cmd_help, cmd_dtp, cmd_regions, cmd_miniapp, cmd_precache,
@@ -117,6 +175,7 @@ def test_public_api_handlers_accessible() -> None:
 
 
 @pytest.mark.smoke
+@ptb_required
 def test_shared_state_is_single_instance() -> None:
     """Глобальное состояние (_api_down, _user_locks, logger, etc.) должно быть
     единым экземпляром во всех модулях — иначе поведение изменится.
@@ -146,6 +205,7 @@ def test_shared_state_is_single_instance() -> None:
 
 
 @pytest.mark.smoke
+@ptb_required
 def test_no_circular_imports_in_bot_package() -> None:
     """Проверка отсутствия циклических импортов в пакете bot/.
 
@@ -179,7 +239,10 @@ def test_no_circular_imports_in_bot_package() -> None:
 
 @pytest.mark.smoke
 def test_bot_package_directory_structure() -> None:
-    """Структура директории bot/ должна соответствовать плану Phase 3-2."""
+    """Структура директории bot/ должна соответствовать плану Phase 3-2.
+
+    Не требует PTB — проверяет только наличие файлов.
+    """
     project_root = Path(__file__).resolve().parents[2]
     bot_dir = project_root / "bot"
 
