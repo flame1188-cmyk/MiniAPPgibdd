@@ -16,15 +16,16 @@ from dataclasses import dataclass, field
 
 import pytest
 
-# gibdd_service живёт в miniapp/backend/services/ — добавим в path
-MINIAPP_BACKEND = Path(__file__).resolve().parent.parent.parent / "miniapp" / "backend"
-if str(MINIAPP_BACKEND) not in sys.path:
-    sys.path.insert(0, str(MINIAPP_BACKEND))
-
-# Проектный корень для импорта analytics
+# Корень проекта gibdd-bot (для импорта analytics и tests.fixtures)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# miniapp/ в path — чтобы работал `from backend.services import gibdd_service`
+# (routers используют relative imports, поэтому `backend` должен быть пакетом)
+MINIAPP_ROOT = PROJECT_ROOT / "miniapp"
+if str(MINIAPP_ROOT) not in sys.path:
+    sys.path.insert(0, str(MINIAPP_ROOT))
 
 import analytics
 from tests.fixtures.synthetic_cards import cards_basic_set
@@ -61,7 +62,7 @@ class StubTask:
 # с понятным сообщением, а не роняет весь suite.
 
 try:
-    from services.gibdd_service import _get_cross_tables, Task
+    from backend.services.gibdd_service import _get_cross_tables, Task
     GIBDD_SERVICE_AVAILABLE = True
 except Exception as e:  # pragma: no cover — environment without deps
     GIBDD_SERVICE_AVAILABLE = False
