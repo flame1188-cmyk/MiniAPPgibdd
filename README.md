@@ -297,6 +297,15 @@ cp .env.example .env
 | `LLM_API_KEY` | API-ключ [ZhipuAI](https://open.bigmodel.cn) для AI-анализа | Нет |
 | `LLM_MODEL` | Модель GLM (по умолчанию `glm-4.7-flash`) | Нет |
 | `ENABLE_NEWS_SEARCH` | Поиск новостей для контекста LLM (`true`/`false`, по умолчанию `true`) | Нет |
+| `LLM_PAID_API_KEY` | API-ключ платного провайдера (AItunnel, OpenRouter) для расширенного AI-анализа | Нет |
+| `LLM_PAID_API_URL` | URL платного провайдера без `/chat/completions` (по умолчанию `https://api.aitunnel.ru/v1`) | Нет |
+| `LLM_PAID_MODEL` | Модель платного LLM (по умолчанию `deepseek-v4-flash`) | Нет |
+| `LLM_MAX_TOKENS` | Лимит длины ответа LLM в токенах (по умолчанию `16384`). При `finish_reason=length` в логах WARNING — поднимите значение | Нет |
+| `ADMIN_TELEGRAM_IDS` | ID администраторов через запятую — для системных алертов (cache TTL, мониторинг) | Нет |
+| `MAX_CONCURRENT_TASKS` | Лимит одновременных задач выгрузки (по умолчанию `5`, `asyncio.Semaphore`) | Нет |
+| `RATE_LIMIT_PER_MINUTE` | Лимит запросов API на пользователя в минуту (slowapi, по умолчанию `60`) | Нет |
+| `MAX_INMEMORY_TASKS` | Размер LRU-кэша задач в памяти (по умолчанию `50`) | Нет |
+| `LOG_FORMAT` | Формат логов: `text` (по умолчанию) или `json` (структурированные логи для ELK/Loki) | Нет |
 | `REGIONS_API_ENABLED` | Запрос справочника регионов через API ГИБДД (`1`/`0`, по умолчанию `0` — сразу файловый кэш) | Нет |
 | `TARGET_API_TIMEOUT` | Таймаут запросов к API ГИБДД в секундах (по умолчанию `120`) | Нет |
 | `LOG_LEVEL` | Уровень логирования (по умолчанию `INFO`) | Нет |
@@ -665,6 +674,87 @@ Vite добавляет хэш к именам файлов (`index-AbCd1234.js`
 1. Проверьте `DB_POOL_MAX` (по умолчанию 5) — при высоком RPS увеличьте
 2. Проверьте `DB_CONNECT_TIMEOUT` (по умолчанию 10с)
 3. На bothost.ru PostgreSQL иногда уходит на обслуживание — приложение автоматически переключится на in-memory fallback, но кэш будет менее эффективным
+
+---
+
+## Журнал изменений
+
+### Phase 3 (в процессе)
+
+**3.1 — Оптимизация analytics-фазы** (`2026-08-06`)
+- Профилирование `analytics.py` через `scripts/profile_analytics.py` на синтетике 500/2000/5000 ДТП
+- Главная находка: CPU-расчёт быстрый (~100 ms на 2629 ДТП), основное время «analytics 36%» — это сеть + clusters
+- `calculate_cross_tables` пересчитывался при каждом LLM-запросе и Q&A — теперь in-memory кэш в `Task` (8 полей с инвалидацией по `id(cards)`)
+- `ensure_comparison`: `asyncio.gather(calculate_metrics(current), ensure_prev_cards())` — CPU работает пока идёт сеть
+- Timing-логирование: каждая операция пишет ms (`calculate_metrics — 2629 ДТП, 9.1 ms` и т.д.)
+- Cache hit при повторных Q&A: ~0 ms вместо ~38 ms
+- Файл: `miniapp/backend/services/gibdd_service.py` (+98 строк)
+
+**3.0 — LLM max_tokens + транкация-детект** (`2026-08-06`)
+- Лимит `max_tokens` поднят с `8192` → `16384`, вынесен в env `LLM_MAX_TOKENS`
+- Логирование `prompt_tokens`, `completion_tokens`, `total_tokens`, `finish_reason`
+- WARNING при `finish_reason=length` с подсказкой «поднимите LLM_MAX_TOKENS в .env»
+- Применяется одинаково к бесплатному (GLM-4.7-flash) и платному (deepseek-v4-flash) провайдерам
+- Файлы: `config.py` (+17 строк), `llm_analyzer.py` (+18/-1 строк)
+
+### Phase 2 — observability + устойчивость
+
+**2.8 — Fix: восстановление cards после рестарта** (`2026-08-06`)
+- После рестарта контейнера `task.cards` (heavy field, не персистится в БД) терялся
+- Добавлен `_ensure_cards_loaded(task)` — восстанавливает из `cards_cache` (PostgreSQL, TTL 24ч)
+- Интегрирован в 4 функции: `ensure_comparison`, `compute_point_stats`, `start_clusters_calculation`, `generate_point_stats_map_html`
+- При cache miss (старая задача): понятное сообщение «Создайте новую выгрузку для этого региона и периода»
+- Файл: `miniapp/backend/services/gibdd_service.py` (+105 строк)
+
+**2.7 — Fix: observability метрики** (`2026-08-05`)
+- Background `_metrics_updater_loop()` каждые 30 сек обновляет Prometheus gauges
+- До этого `gibdd_process_rss_bytes=0` и `gibdd_db_pool_size` были пустые — обновлялись только при запросе к `/health/detailed`
+- Корректная формула: `active = pool_size - pool_available`, `idle = pool_available`
+- Файл: `miniapp/backend/main.py` (+60 строк)
+
+**2.1–2.6 — Observability + тюнинг**
+- `2.1` Prometheus-метрики: `gibdd_tasks_total`, `gibdd_task_duration_seconds`, `gibdd_db_pool_size`, `gibdd_process_rss_bytes`, `gibdd_cards_cache_hits_total`
+- `2.2` `/health/detailed` эндпоинт с pool stats, cache stats, version
+- `2.3` slowapi rate limiting (60 req/min на пользователя)
+- `2.4` `MAX_CONCURRENT_TASKS=5` через `asyncio.Semaphore`
+- `2.5` LRU `_tasks` (maxlen=50) с eviction тяжёлых полей в БД
+- `2.6` request_id middleware — каждый лог содержит `request_id` для трассировки
+- `2.7` JSON-логи опционально через `LOG_FORMAT=json` (для ELK/Loki)
+
+### Phase 1 — Mini App + PostgreSQL кэши
+
+**1.5 — Excel-кэш в PostgreSQL** (`Stage 5`)
+- Готовые Excel-файлы (Файл 1 ДТП + Файл 2 участники) кэшируются в БД (TTL 24ч)
+- Экономия ~5-8 сек на повторных запросах того же региона+периода
+
+**1.4 — Clusters-кэш в PostgreSQL** (`Stage 4`)
+- Результат расчёта очагов (payload + raw_clusters + raw_preclusters) кэшируется в БД (TTL 6ч)
+- Второй пользователь с тем же регионом+периодом — мгновенный cache hit вместо 15-30 сек расчёта
+
+**1.3 — TTL-мониторинг кэшей** (`Stage 3`)
+- `cleanup_old_cards()`, `cleanup_old_clusters()`, `cleanup_old_excel()` — фоновые задачи
+- Метрика `gibdd_cards_cache_entries` для наблюдения за размером
+
+**1.2 — PostgreSQL миграция** (`Stage 1-2`)
+- `psycopg_pool.AsyncConnectionPool` (min=2, max=30)
+- Таблицы: `dtp_cards_cache`, `dtp_clusters_cache`, `dtp_excel_cache`, `tasks`, `audit_log`
+- Fallback: при недоступности БД — in-memory режим (функциональность сохраняется)
+
+**1.1 — Mini App интеграция** (`v0.2-v0.6`)
+- FastAPI backend + React/TypeScript frontend, единый процесс с Telegram-ботом
+- 6 вкладок: Запрос / Аналитика / Очаги / Точка / ИИ-анализ / НП БДД
+- Long polling (25 сек) для статуса длительных операций
+- Telegram theme (light/dark), haptic feedback, fullscreen mode
+
+### Phase 0 — Базовый функционал
+
+- Telegram-бот с командами `/start`, `/dtp`, `/regions`, `/help`
+- Выгрузка карточек ДТП и участников через GIBDD API + web fallback
+- Excel-генерация (2 файла: ДТП + участники)
+- HTML-карты (Leaflet, инлайн-библиотеки, работа офлайн)
+- AI-анализ через ZhipuAI GLM-4.7-Flash
+- 4-уровневый fallback справочника регионов
+- Web-fallback при ошибке API (5xx, ConnectionError)
 
 ---
 
