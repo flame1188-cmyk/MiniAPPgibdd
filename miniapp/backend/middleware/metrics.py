@@ -106,7 +106,37 @@ if PROMETHEUS_AVAILABLE:
     EXTERNAL_API_DURATION = Histogram(
         "gibdd_external_api_duration_seconds",
         "Время ответа внешних API",
-        ["api", "status"],  # api=gibdd/llm, status=success/error
+        ["api", "status"],  # api=gibdd_api/gibdd_web/llm, status=success/error
+        buckets=(0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
+    )
+
+    # === Phase 2: дополнительные метрики ===
+
+    # Размер пула PostgreSQL (active/idle)
+    DB_POOL_SIZE = Gauge(
+        "gibdd_db_pool_size",
+        "Размер пула соединений PostgreSQL",
+        ["state"],  # state=active/idle/max
+    )
+
+    # RSS памяти процесса (в байтах)
+    PROCESS_RSS_BYTES = Gauge(
+        "gibdd_process_rss_bytes",
+        "Resident memory процесса (RSS) в байтах",
+    )
+
+    # Время выполнения execute_task целиком (от старта до done/failed)
+    TASK_TOTAL_DURATION = Histogram(
+        "gibdd_task_total_duration_seconds",
+        "Полное время выполнения задачи (execute_task)",
+        ["status"],  # done/failed
+        buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0),
+    )
+
+    # Количество rate-limited запросов (HTTP 429)
+    RATE_LIMITED_TOTAL = Counter(
+        "gibdd_rate_limited_total",
+        "Запросов отклонено rate limiter'ом (HTTP 429)",
     )
 else:
     # Заглушки, чтобы не падать без prometheus_client
@@ -119,6 +149,8 @@ else:
     TASKS_TOTAL = TASKS_IN_PROGRESS = TASKS_IN_MEMORY = _Stub()
     SEMAPHORE_OCCUPIED = CACHE_HITS = CACHE_MISSES = _Stub()
     ACTIVE_LONG_POLLS = TASK_PHASE_DURATION = EXTERNAL_API_DURATION = _Stub()
+    DB_POOL_SIZE = PROCESS_RSS_BYTES = TASK_TOTAL_DURATION = _Stub()
+    RATE_LIMITED_TOTAL = _Stub()
 
 
 def setup_metrics(app) -> None:
@@ -196,3 +228,33 @@ def observe_phase_duration(phase: str, seconds: float) -> None:
 
 def observe_external_api(api: str, status: str, seconds: float) -> None:
     EXTERNAL_API_DURATION.labels(api=api, status=status).observe(seconds)
+
+
+# === Phase 2: новые хелперы ===
+
+def update_db_pool_metrics(active: int, idle: int, max_size: int) -> None:
+    """Обновляет gauges размера пула PostgreSQL.
+
+    Вызывать из /health/detailed endpoint или из periodic background task.
+    """
+    DB_POOL_SIZE.labels(state="active").set(active)
+    DB_POOL_SIZE.labels(state="idle").set(idle)
+    DB_POOL_SIZE.labels(state="max").set(max_size)
+
+
+def update_process_rss(bytes_: int) -> None:
+    """Обновляет gauge RSS памяти процесса.
+
+    Используется в /health/detailed для алертов по памяти.
+    """
+    PROCESS_RSS_BYTES.set(bytes_)
+
+
+def observe_task_total_duration(status: str, seconds: float) -> None:
+    """Вызвать при завершении execute_task (status=done/failed)."""
+    TASK_TOTAL_DURATION.labels(status=status).observe(seconds)
+
+
+def record_rate_limited() -> None:
+    """Вызвать когда slowapi отклонил запрос (429)."""
+    RATE_LIMITED_TOTAL.inc()
