@@ -1518,10 +1518,12 @@ def format_metrics_for_prompt(
     cur_type = comparison["by_type"]["current"]
     prev_type = comparison["by_type"]["previous"]
 
+    # Сортировка: по убыванию суммарной частоты, при равенстве — по имени (алфавит).
+    # Без вторичного ключа порядок не детерминирован (PYTHONHASHSEED влияет на
+    # итерацию set), что ломает golden-тесты и LLM-промпты между запусками.
     all_types = sorted(
         set(list(cur_type.keys()) + list(prev_type.keys())),
-        key=lambda x: cur_type.get(x, 0) + prev_type.get(x, 0),
-        reverse=True,
+        key=lambda x: (-(cur_type.get(x, 0) + prev_type.get(x, 0)), x),
     )
 
     for tp_name in all_types[:10]:
@@ -1541,10 +1543,10 @@ def format_metrics_for_prompt(
 
     if cur_weather or prev_weather:
         lines.append("РАСПРЕДЕЛЕНИЕ ПО ПОГОДНЫМ УСЛОВИЯМ:")
+        # Та же детерминированная сортировка: по частоте, при равенстве — по имени.
         all_w = sorted(
             set(list(cur_weather.keys()) + list(prev_weather.keys())),
-            key=lambda x: cur_weather.get(x, 0) + prev_weather.get(x, 0),
-            reverse=True,
+            key=lambda x: (-(cur_weather.get(x, 0) + prev_weather.get(x, 0)), x),
         )
         for w_name in all_w[:8]:
             cur = cur_weather.get(w_name, 0)
