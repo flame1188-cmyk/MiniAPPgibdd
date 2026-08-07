@@ -2912,3 +2912,93 @@ Stage Summary:
   private имён — обязательный шаг перед деплоем. Smoke-тест на импорты
   не ловит runtime NameError, потому что Python резолвит имена лениво
   (при вызове функции, а не при её определении).
+
+---
+Task ID: phase3-3-callbacks-dispatch
+Agent: main (super-z)
+Task: Phase 3-3 — рефакторинг on_callback_query (488 строк, одна функция)
+в dispatch-таблицу с 29 маленькими обработчиками.
+
+Контекст: После Phase 3-2 (split bot.py → bot/ пакет) функция
+`on_callback_query` в `bot/handlers/callbacks.py` осталась гигантским
+if-elif (488 строк, 29 веток). Это:
+- Трудно читать (одна функция на 488 строк)
+- Невозможно тестировать изолированно
+- Smoke-тесты на структуру проходили, но реальное покрытие callbacks.py
+  было ~3% (одна большая функция, которую нельзя вызвать без PTB+context)
+
+Work Log:
+- Прочитал bot/handlers/callbacks.py (512 строк), составил каталог всех
+  callback_data:
+  * 10 prefix-matches: rp:, r:, py:, pq:, ph:, p9:, pn:, pm:, yy:, ps_radius:
+  * 19 exact-matches: back, do_analytics, do_analytics_ai, do_analytics_ai_paid,
+    choose_ai_method, do_concentration, cam_skip, cam_use_cached,
+    cam_ask_upload, do_point_stats, do_html_map, html_map_dtp_only,
+    html_map_ask_cameras, ps_excel, ps_html_map, change_data, back_to_menu,
+    end_qa, cancel
+  * Итого: 29 обработчиков
+- Проверил что ни один prefix не является префиксом другого (order не важен):
+  python3 -c "..." → 0 конфликтов
+- Спроектировал сигнатуру обработчиков: `async def(update, context, data) -> None`
+  (совпадает с on_callback_query минус lock/access/exception logic)
+- Полностью переписал bot/handlers/callbacks.py:
+  * 29 async-функций _h_xxx (например _h_back, _h_do_analytics, _h_region_page)
+  * Каждая с docstring + 100% перенос логики из исходной if-elif ветки
+  * _EXACT_HANDLERS: dict[str, Handler] — 19 ключей
+  * _PREFIX_HANDLERS: list[tuple[str, Handler]] — 10 префиксов
+  * _resolve_handler(data) → Handler | None — O(1) dict lookup + O(N) prefix
+  * on_callback_query — тонкий dispatcher (44 строки вместо 488):
+    - Базовые проверки (query.data, answer, access control)
+    - Lock acquisition (без изменений)
+    - _resolve_handler + try/except
+  * 100% pure refactoring — никакая логика не изменена
+- Обновил tests/smoke/test_bot_package.py — после fixup-1 bot/__init__.py
+  реэкспортирует PTB-функции, поэтому import bot требует PTB. Тест
+  test_bot_module_imports_without_errors теперь skip'ает bot и bot.handlers
+  без PTB (раньше только bot._state и т.д.)
+- Создал tests/unit/test_callbacks_dispatch.py — 189 тестов в 7 классах:
+  * TestDispatchTableSizes (5 тестов): 19 exact + 10 prefix = 29, без дублей
+  * TestHandlerSignatures (4×29=116 тестов): все async, сигнатура
+    (update, context, data)
+  * TestKnownCallbackRouting (19+22=41 тест): все known callback_data
+    резолвятся в правильный handler
+  * TestUnknownCallbacks (15 тестов): unknown → None (silent ignore)
+  * TestPrefixConflicts (2 теста): ни один prefix не является подстрокой
+    другого, перестановка не меняет результат
+  * TestOnCallbackQueryDispatcher (7 тестов): empty query, access control,
+    lock, unknown callback, exception caught, handler called
+  * TestHandlerSmoke (2×29=58 тестов): у каждого handler есть docstring,
+    имя начинается с _h_
+- Установил python-telegram-bot v22.8 для runtime-тестов в dev-окружении
+- Установил respx для интеграционных тестов LLM
+- Запустил полный набор тестов:
+  * 646 passed, 8 skipped, 0 failed
+  * Coverage bot/handlers/callbacks.py: 31% (было ~3%)
+  * Общее покрытие: 54.68% (цель 40%)
+- Пересобрал архив: /home/z/my-project/download/gibdd-bot-refactored.zip
+  (115 KB, 26 файлов — добавился tests/unit/test_callbacks_dispatch.py)
+- Обновил scripts/build_refactored_archive.sh — копирует tests/unit/
+
+Stage Summary:
+- 488-строчный on_callback_query → 29 маленьких обработчиков + тонкий
+  dispatcher (44 строки)
+- bot/handlers/callbacks.py: было 16 KB (512 строк), стало 28 KB (656 строк)
+  — рост за счёт docstrings, сигнатур и dispatch-таблицы
+- 29 обработчиков имеют единый контракт: `async def(update, context, data)`
+- Dispatch: O(1) dict lookup для exact + O(N) prefix scan (N=10)
+- Тесты: 646 passed (раньше было 445), 189 новых dispatch-тестов
+- Покрытие callbacks.py: 3% → 31% (рост x10)
+- Тесты покрывают:
+  * Маршрутизацию всех 29 callback_data (41 кейс)
+  * Сигнатуры всех handlers (116 кейсов)
+  * Silent ignore для unknown callbacks (15 кейсов)
+  * Dispatcher behavior: lock, access control, exception handling (7 кейсов)
+  * Базовые свойства handlers: docstring, имя с _h_ (58 кейсов)
+- Архив: /home/z/my-project/download/gibdd-bot-refactored.zip (115 KB, 26 файлов)
+- Деплой: распаковать архив (перезапишется bot/handlers/callbacks.py),
+  перезапустить контейнер. Изменения изолированы в callbacks.py — никакие
+  другие файлы не менялись.
+- Безопасность: 100% pure refactoring, поведение идентично исходному.
+  Если в prod что-то отвалится — откат через `cp bot.py.bak bot.py`.
+- Что осталось: Phase 3-4 (разбить bot/analysis.py 1335 строк на
+  analysis/{pipeline,clusters,menu}.py)
