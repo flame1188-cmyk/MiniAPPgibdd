@@ -86,8 +86,15 @@ def test_bot_module_imports_without_errors(module_name: str) -> None:
     Требует python-telegram-bot v20+. Если PTB не установлен — тест skip'ается.
     Пустые модули (bot, bot.handlers) импортируются без PTB и тестируются всегда.
     """
-    # bot и bot.handlers — пустые __init__.py, не требуют PTB.
-    if module_name in ("bot", "bot.handlers"):
+    # bot.handlers и bot — оба зависят от PTB, потому что:
+    #   • bot/__init__.py (после fixup-1) реэкспортирует PTB-функции
+    #     (_build_app, _fetch_cards_for_period, ...) для обратной
+    #     совместимости с main.py и gibdd_service.py
+    #   • Python всегда импортирует родительский пакет `bot` перед
+    #     `bot.handlers`, поэтому bot.handlers также требует PTB
+    # В prod PTB всегда установлен. В dev без PTB переходим к общей
+    # ветке skip'а ниже.
+    if module_name in ("bot", "bot.handlers") and _ptb_available():
         try:
             importlib.import_module(module_name)
         except ImportError as e:
