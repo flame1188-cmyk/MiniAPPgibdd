@@ -84,22 +84,6 @@ LLM_PAID_MODEL: str = os.getenv("LLM_PAID_MODEL", "deepseek-v4-flash")
 # Если "false" — нейросеть будет анализировать только данные stat.gibdd.ru
 ENABLE_NEWS_SEARCH: bool = os.getenv("ENABLE_NEWS_SEARCH", "true").lower() == "true"
 
-# Верхний лимит на длину ответа LLM в токенах (max_tokens в payload).
-# Применяется ОДИНАКОВО к бесплатному (GLM-4.7-flash) и платному (deepseek-v4-flash)
-# провайдерам. Лимит — это потолок, а не фикс: платим только за реально
-# сгенерированные токены, поэтому короткие ответы не дорожают.
-#
-# Рекомендации:
-#   8192   (дефолт старый) — транкация на крупных регионах (2–5K ДТП, 40+ очагов)
-#   16384  (текущий дефолт) — покрывает 95%+ случаев, поддерживается обоими
-#                            провайдерами, время генерации 60–90 сек
-#   32768  — доп. запас, но на aitunnel.ru flash-модели могут молча подменяться
-#   65536+ — только для reasoner-моделей (deepseek-reasoner), не наш случай
-#
-# При finish_reason=length в логах появится WARNING — это сигнал, что лимит
-# исчерпан и ответ обрезан. В этом случае увеличьте LLM_MAX_TOKENS.
-LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "16384"))
-
 
 # ========================
 # Логирование
@@ -132,6 +116,32 @@ CLUSTERS_CACHE_TTL_SECONDS: int = int(os.getenv("CLUSTERS_CACHE_TTL_SECONDS", "2
 # для закрытых периодов. Экономия ~5-8 сек на каждого пользователя,
 # который запрашивает тот же регион+период.
 EXCEL_CACHE_TTL_SECONDS: int = int(os.getenv("EXCEL_CACHE_TTL_SECONDS", "86400"))
+
+
+# ========================
+# Sprint 2: LLM_SEMAPHORE + LLM cache
+# ========================
+
+# LLM_SEMAPHORE — лимит одновременных LLM-вызовов в одном процессе.
+# Защищает от 429 Too Many Requests на free-тарифе (GLM-4.7-Flash RPM~30).
+# При превышении лимита coroutine ждёт в очереди (FIFO).
+#   - free-тариф: рекомендуется 2 (безопасно для RPM=30)
+#   - paid-тариф (DeepSeek): можно 5+ (RPM=200)
+# При переходе на paid — выставьте LLM_MAX_CONCURRENT=5.
+LLM_MAX_CONCURRENT: int = int(os.getenv("LLM_MAX_CONCURRENT", "2"))
+
+# LLM cache — TTL кэшированных summary в PostgreSQL.
+# По умолчанию 24 часа (86400 сек). Summary — производное от
+# (cards + clusters + cross_tables + SYSTEM_PROMPT), все детерминированы.
+# Если меняется prompt_hash — кэш инвалидируется автоматически, поэтому
+# TTL можно держать длинным.
+LLM_CACHE_TTL_SECONDS: int = int(os.getenv("LLM_CACHE_TTL_SECONDS", "86400"))
+
+# LLM cache version — позволяет принудительно инвалидировать ВЕСЬ кэш
+# (например, при глобальном изменении SYSTEM_PROMPT, которое не отразилось
+# в prompt_hash, или при смене модели). Увеличьте на 1 — все старые записи
+# перестанут матчится по cache_key.
+LLM_CACHE_VERSION: str = os.getenv("LLM_CACHE_VERSION", "1")
 
 
 # ========================
