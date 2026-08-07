@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from backend.services import _imports  # для патчей _PROJECT_ROOT/_import_module
 
 
 # ============================================================
@@ -54,6 +55,7 @@ class TestParseUserQuery:
 
         fake_parser.parse_user_message = fake_parse
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         result = await gibdd_service.parse_user_query("Вологодская область май 2025")
         assert result["ok"] is True
@@ -74,6 +76,7 @@ class TestParseUserQuery:
 
         fake_parser.parse_user_message = fake_parse
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         result = await gibdd_service.parse_user_query("абракадабра")
         assert result["ok"] is False
@@ -90,6 +93,7 @@ class TestParseUserQuery:
 
         fake_parser.parse_user_message = fake_parse
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         result = await gibdd_service.parse_user_query("тест")
         assert result["ok"] is False
@@ -111,6 +115,7 @@ class TestGetRegions:
 
         fake_parser.ensure_regions_loaded = fake_ensure
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         result = await gibdd_service.get_regions()
         assert len(result) == 2
@@ -133,6 +138,8 @@ class TestGetRegions:
             return __import__("regions_builtin")
 
         monkeypatch.setattr(gibdd_service, "_import_module", smart_import)
+
+        monkeypatch.setattr(_imports, "_import_module", smart_import)
 
         result = await gibdd_service.get_regions()
         # BUILTIN_REGIONS — непустой список
@@ -346,6 +353,7 @@ class TestGetLlmProvidersStatus:
         fake_config.LLM_PAID_API_URL = "https://paid.example.com"
         fake_config.LLM_PAID_MODEL = "deepseek-chat"
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_config)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_config)
 
         status = gibdd_service.get_llm_providers_status()
         assert status["free"] is True
@@ -363,6 +371,7 @@ class TestGetLlmProvidersStatus:
         fake_config.LLM_PAID_API_URL = ""
         fake_config.LLM_PAID_MODEL = "deepseek-chat"
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_config)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_config)
 
         status = gibdd_service.get_llm_providers_status()
         assert status["free"] is False
@@ -394,6 +403,7 @@ class TestTaskFactoryAndDir:
 
         # Подменяем _PROJECT_ROOT на временный
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         d = gibdd_service._task_dir("test-task-id")
         assert d.exists()
@@ -433,6 +443,8 @@ class TestEnsurePrevCards:
             return __import__(name)
 
         monkeypatch.setattr(gibdd_service, "_import_module", smart_import)
+
+        monkeypatch.setattr(_imports, "_import_module", smart_import)
 
         result = await gibdd_service.ensure_prev_cards(task)
 
@@ -494,6 +506,8 @@ class TestAskLlmQuestion:
         fake_config.LLM_PAID_MODEL = "x"
 
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_config)
+
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_config)
         result = await gibdd_service.ask_llm_question(task, "Нормальный вопрос?", provider="free")
         assert result["ok"] is False
         assert "не настроен" in result["error"].lower() or "LLM_API_KEY" in result["error"]

@@ -429,6 +429,13 @@ def install_stubs(
         # Реальный импорт для прочих модулей (например, regions_builtin)
         return __import__(name)
 
+    # Патчим _import_module в _imports (источник) — все service-модули
+    # (pipeline, clusters_ops, llm_ops, ...) используют _imports._import_module()
+    # через атрибут модуля, поэтому патч в _imports виден всем.
+    from backend.services import _imports as _imp_mod
+    monkeypatch.setattr(_imp_mod, "_import_module", smart_import)
+    # Дублируем патч в facade для обратной совместимости
+    # (на случай если какой-то код вызывает gibdd_service._import_module напрямую)
     monkeypatch.setattr(gibdd_service, "_import_module", smart_import)
     return stubs
 

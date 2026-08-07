@@ -33,6 +33,7 @@ from tests.integration._gibdd_stubs import (
     install_stubs,
     make_minimal_cards,
 )
+from backend.services import _imports  # для патчей _PROJECT_ROOT/_import_module
 
 
 # ============================================================
@@ -83,6 +84,8 @@ class TestExecuteTaskEdgeCases:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         cards = make_minimal_cards(2)
         install_stubs(
             monkeypatch, cards=cards, bot_errors=["Partial: month 4 failed"],
@@ -109,6 +112,8 @@ class TestExecuteTaskEdgeCases:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(2)
         stubs = install_stubs(monkeypatch, cards=cards)
@@ -138,6 +143,8 @@ class TestExecuteTaskEdgeCases:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(2)
         stubs = install_stubs(monkeypatch, cards=cards)
@@ -175,6 +182,8 @@ class TestExecuteTaskEdgeCases:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(3)
         stubs = install_stubs(monkeypatch, cards=cards)
@@ -267,6 +276,8 @@ class TestCleanupEdgeCases:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         # Создаём задачу с файлом
         cards = make_minimal_cards(1)
         install_stubs(monkeypatch, cards=cards)
@@ -302,6 +313,8 @@ class TestCleanupEdgeCases:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         install_stubs(monkeypatch, cards=make_minimal_cards(1))
 

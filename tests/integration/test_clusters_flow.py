@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from tests.integration._gibdd_stubs import install_stubs, make_minimal_cards
+from backend.services import _imports  # для патчей _PROJECT_ROOT/_import_module
 
 
 # ============================================================
@@ -274,6 +275,8 @@ class TestStartClustersCalculation:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         clusters = [
             _make_cluster(road="ул. А", total_accidents=5, dynamics_status="new"),
             _make_cluster(road="ул. Б", total_accidents=3, dynamics_status="repeated_growing"),
@@ -331,6 +334,8 @@ class TestStartClustersCalculation:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         _install_clusters_stubs(monkeypatch, cards=[], clusters=[])
 
         task = gibdd_service.create_task(
@@ -355,6 +360,8 @@ class TestStartClustersCalculation:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         stubs = _install_clusters_stubs(monkeypatch, clusters=[])
 
@@ -384,6 +391,8 @@ class TestStartClustersCalculation:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         clusters = [_make_cluster(road="ул. А", total_accidents=3)]
         _install_clusters_stubs(monkeypatch, clusters=clusters, has_cameras=True)
@@ -462,6 +471,8 @@ class TestGenerateClustersMapHtml:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         clusters = [_make_cluster(road="ул. А"), _make_cluster(road="ул. Б")]
         _install_clusters_stubs(monkeypatch, clusters=clusters)
 
@@ -506,6 +517,8 @@ class TestGenerateClustersMapHtml:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         _install_clusters_stubs(monkeypatch, clusters=[], preclusters=[])
 
         task = gibdd_service.create_task(
@@ -529,6 +542,8 @@ class TestGenerateClustersMapHtml:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         clusters = [
             _make_cluster(road="ул. А"),
@@ -561,6 +576,8 @@ class TestGenerateClustersExcel:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         clusters = [_make_cluster(road="ул. А"), _make_cluster(road="ул. Б")]
         preclusters = [{"road": "precluster", "center": (59.0, 39.0)}]

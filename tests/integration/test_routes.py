@@ -20,6 +20,7 @@
 import types
 
 import pytest
+from backend.services import _imports  # для патчей _PROJECT_ROOT/_import_module
 
 
 # ============================================================
@@ -78,6 +79,7 @@ class TestParseEndpoint:
 
         fake_parser.parse_user_message = fake_parse
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         response = fastapi_client.post(
             "/parse",
@@ -108,6 +110,7 @@ class TestParseEndpoint:
 
         fake_parser.parse_user_message = fake_parse
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         response = fastapi_client.post(
             "/parse",
@@ -137,6 +140,7 @@ class TestRegionsEndpoint:
 
         fake_parser.ensure_regions_loaded = fake_ensure
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         response = fastapi_client.get("/regions")
         assert response.status_code == 200
@@ -159,6 +163,7 @@ class TestRegionsEndpoint:
 
         fake_parser.ensure_regions_loaded = fake_ensure
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         response = fastapi_client.get("/regions/search?q=край")
         assert response.status_code == 200
@@ -180,6 +185,7 @@ class TestRegionsEndpoint:
 
         fake_parser.ensure_regions_loaded = fake_ensure
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         response = fastapi_client.get("/regions/search?q=")
         assert response.status_code == 200
@@ -242,6 +248,7 @@ class TestDtpTasksEndpoint:
 
         fake_parser.parse_user_message = fake_parse
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_parser)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_parser)
 
         # Также подменяем repository.log_access
         fake_repo = types.ModuleType("repository")
@@ -422,6 +429,7 @@ class TestLlmEndpoints:
         fake_config.LLM_PAID_API_URL = ""
         fake_config.LLM_PAID_MODEL = ""
         monkeypatch.setattr(gibdd_service, "_import_module", lambda name: fake_config)
+        monkeypatch.setattr(_imports, "_import_module", lambda name: fake_config)
 
         response = fastapi_client.get(f"/dtp/tasks/{task.id}/llm/providers")
         assert response.status_code == 200
@@ -493,6 +501,8 @@ class TestLlmEndpoints:
             raise ImportError(f"unexpected module: {name}")
 
         monkeypatch.setattr(gibdd_service, "_import_module", smart_import)
+
+        monkeypatch.setattr(_imports, "_import_module", smart_import)
 
         response = fastapi_client.post(
             f"/dtp/tasks/{task.id}/llm/ask",

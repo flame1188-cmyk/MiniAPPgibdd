@@ -29,6 +29,7 @@ from tests.integration._gibdd_stubs import (
     install_stubs,
     make_minimal_cards,
 )
+from backend.services import _imports  # для патчей _PROJECT_ROOT/_import_module
 
 
 # ============================================================
@@ -99,6 +100,7 @@ class TestTaskLifecycleE2E:
 
         # Файлы должны писаться в tmp_path
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(3)
         install_stubs(monkeypatch, cards=cards, prev_cards=[])
@@ -160,6 +162,8 @@ class TestTaskLifecycleE2E:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         # НЕ патчим _import_module полностью — только bot, gibdd_parser, etc.
         # user_request_parser и regions_builtin остаются настоящими
         cards = make_minimal_cards(2)
@@ -199,6 +203,8 @@ class TestTaskLifecycleE2E:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         install_stubs(
             monkeypatch,
@@ -244,6 +250,8 @@ class TestLlmSummaryLifecycleE2E:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(2)
         prev_cards = make_minimal_cards(3)
@@ -314,6 +322,8 @@ class TestLlmSummaryLifecycleE2E:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         cards = make_minimal_cards(2)
         install_stubs(
             monkeypatch, cards=cards, prev_cards=[],
@@ -380,6 +390,8 @@ class TestQaHistoryE2E:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(2)
         prev_cards = make_minimal_cards(3)

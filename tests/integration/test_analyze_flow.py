@@ -33,6 +33,7 @@ from tests.integration._gibdd_stubs import (
     install_stubs,
     make_minimal_cards,
 )
+from backend.services import _imports  # для патчей _PROJECT_ROOT/_import_module
 
 
 # ============================================================
@@ -80,6 +81,7 @@ class TestExecuteTaskHappyPath:
 
         # Подменяем _PROJECT_ROOT на временный, чтобы файлы писались в tmp
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(3)
         install_stubs(monkeypatch, cards=cards, prev_cards=[])
@@ -131,6 +133,8 @@ class TestExecuteTaskHappyPath:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         cards = make_minimal_cards(2)
         install_stubs(monkeypatch, cards=cards)
@@ -188,6 +192,8 @@ class TestExecuteTaskErrorPaths:
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
         install_stubs(monkeypatch, cards=[], bot_errors=["API timeout"])
 
         task = gibdd_service.create_task(
@@ -210,6 +216,8 @@ class TestExecuteTaskErrorPaths:
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
         install_stubs(
             monkeypatch,
@@ -724,7 +732,11 @@ class TestGetLlmProvidersStatusExtra:
         def raising_import(name):
             raise RuntimeError("import failed")
 
+        # Патчим в _imports (источник) — service-модули используют
+        # _imports._import_module() через атрибут модуля.
+        monkeypatch.setattr(_imports, "_import_module", raising_import)
         monkeypatch.setattr(gibdd_service, "_import_module", raising_import)
+        monkeypatch.setattr(_imports, "_import_module", raising_import)
 
         status = gibdd_service.get_llm_providers_status()
         assert status == {"free": False, "paid": False, "free_model": "", "paid_model": ""}
