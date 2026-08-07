@@ -545,3 +545,200 @@ class TestCleanupOldTasks:
         assert old_task.id not in gibdd_service._tasks
         assert new_task.id in gibdd_service._tasks
         assert deleted >= 1
+
+
+# ============================================================
+# Sprint 2: LLM_SEMAPHORE + LLM cache
+# ============================================================
+class TestLLMSemaphore:
+    """Тесты LLM_SEMAPHORE — лимит одновременных LLM-вызовов."""
+
+    @pytest.mark.asyncio
+    async def test_semaphore_exists_and_is_asyncio(self):
+        from backend.services import gibdd_service
+        assert hasattr(gibdd_service, "_LLM_SEMAPHORE")
+        assert isinstance(gibdd_service._LLM_SEMAPHORE, asyncio.Semaphore)
+
+    @pytest.mark.asyncio
+    async def test_semaphore_default_value_is_positive(self):
+        from backend.services import gibdd_service
+        # _value — текущее доступное количество слотов
+        assert gibdd_service._LLM_SEMAPHORE._value > 0
+
+    @pytest.mark.asyncio
+    async def test_semaphore_acquires_and_releases(self):
+        from backend.services import gibdd_service
+        sem = gibdd_service._LLM_SEMAPHORE
+        initial = sem._value
+        await sem.acquire()
+        assert sem._value == initial - 1
+        sem.release()
+        assert sem._value == initial
+
+    @pytest.mark.asyncio
+    async def test_semaphore_limits_concurrent_access(self):
+        """5 одновременных workers с limit=2 — max concurrent = 2."""
+        from backend.services import gibdd_service
+        # Создаём свежий semaphore для изоляции теста
+        sem = asyncio.Semaphore(2)
+        concurrent = 0
+        max_concurrent = 0
+
+        async def worker():
+            nonlocal concurrent, max_concurrent
+            async with sem:
+                concurrent += 1
+                max_concurrent = max(max_concurrent, concurrent)
+                await asyncio.sleep(0.05)
+                concurrent -= 1
+
+        await asyncio.gather(*[worker() for _ in range(5)])
+        assert max_concurrent == 2
+
+
+class TestLLMCache:
+    """Тесты llm_cache — кэш summary в PostgreSQL."""
+
+    def test_make_cache_key_deterministic(self):
+        """Одинаковый вход → одинаковый ключ."""
+        from backend.db.llm_cache import make_cache_key
+        k1, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026", "2.2026"], provider="free",
+            clusters_ctx="ctx1", cross_tables_ctx="ctx2", system_prompt="sys",
+        )
+        k2, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026", "2.2026"], provider="free",
+            clusters_ctx="ctx1", cross_tables_ctx="ctx2", system_prompt="sys",
+        )
+        assert k1 == k2
+
+    def test_make_cache_key_ignores_dat_list_order(self):
+        """Порядок дат не важен — ключ одинаковый."""
+        from backend.db.llm_cache import make_cache_key
+        k1, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026", "2.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        k2, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["2.2026", "1.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        assert k1 == k2
+
+    def test_make_cache_key_different_provider(self):
+        """Разный provider → разный ключ."""
+        from backend.db.llm_cache import make_cache_key
+        k1, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        k2, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="paid",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        assert k1 != k2
+
+    def test_make_cache_key_different_clusters_ctx(self):
+        """Разный clusters_ctx → разный ключ (инвалидация при изменении очагов)."""
+        from backend.db.llm_cache import make_cache_key
+        k1, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="ctx-A", cross_tables_ctx="y", system_prompt="z",
+        )
+        k2, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="ctx-B", cross_tables_ctx="y", system_prompt="z",
+        )
+        assert k1 != k2
+
+    def test_make_cache_key_different_system_prompt(self):
+        """Разный SYSTEM_PROMPT → разный ключ (инвалидация при смене промпта)."""
+        from backend.db.llm_cache import make_cache_key
+        k1, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="prompt-v1",
+        )
+        k2, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="prompt-v2",
+        )
+        assert k1 != k2
+
+    def test_make_cache_key_is_sha256_hex(self):
+        """Ключ — 64-символьный SHA-256 hex."""
+        from backend.db.llm_cache import make_cache_key
+        k, _, _ = make_cache_key(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        assert len(k) == 64
+        assert all(c in "0123456789abcdef" for c in k)
+
+    def test_make_dat_hash_empty(self):
+        """Пустой список дат → пустой хэш."""
+        from backend.db.llm_cache import _make_dat_hash
+        assert _make_dat_hash([]) == ""
+
+    def test_make_dat_hash_single(self):
+        """Одна дата → MD5 от неё."""
+        from backend.db.llm_cache import _make_dat_hash
+        import hashlib
+        expected = hashlib.md5(b"1.2026").hexdigest()
+        assert _make_dat_hash(["1.2026"]) == expected
+
+    @pytest.mark.asyncio
+    async def test_get_cached_summary_returns_none_when_db_not_ready(self, monkeypatch):
+        """Если БД недоступна — кэш возвращает None (no-op)."""
+        from backend.db import llm_cache
+
+        # Патчим is_db_ready → False
+        fake_conn = types.ModuleType("backend.db.connection")
+        fake_conn.is_db_ready = lambda: False
+        fake_conn.get_pool = lambda: None
+        monkeypatch.setitem(__import__("sys").modules, "backend.db.connection", fake_conn)
+
+        result = await llm_cache.get_cached_summary(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_put_cached_summary_no_op_when_db_not_ready(self, monkeypatch):
+        """put_cached_summary не падает, если БД недоступна."""
+        from backend.db import llm_cache
+
+        fake_conn = types.ModuleType("backend.db.connection")
+        fake_conn.is_db_ready = lambda: False
+        fake_conn.get_pool = lambda: None
+        monkeypatch.setitem(__import__("sys").modules, "backend.db.connection", fake_conn)
+
+        # Не должно выбросить исключение
+        await llm_cache.put_cached_summary(
+            reg_code="1146", dat_list=["1.2026"], provider="free",
+            summary_text="test summary",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_cached_summary_returns_none_for_empty_dat_list(self):
+        """Пустой dat_list → сразу None (без обращения к БД)."""
+        from backend.db import llm_cache
+        result = await llm_cache.get_cached_summary(
+            reg_code="1146", dat_list=[], provider="free",
+            clusters_ctx="x", cross_tables_ctx="y", system_prompt="z",
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_expired_returns_zero_when_db_not_ready(self, monkeypatch):
+        """cleanup_expired_llm_cache возвращает 0, если БД недоступна."""
+        from backend.db import llm_cache
+
+        fake_conn = types.ModuleType("backend.db.connection")
+        fake_conn.is_db_ready = lambda: False
+        fake_conn.get_pool = lambda: None
+        monkeypatch.setitem(__import__("sys").modules, "backend.db.connection", fake_conn)
+
+        deleted = await llm_cache.cleanup_expired_llm_cache()
+        assert deleted == 0
