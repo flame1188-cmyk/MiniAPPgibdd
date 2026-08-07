@@ -281,3 +281,59 @@ CREATE INDEX IF NOT EXISTS idx_excel_cache_expires
 -- Для invalidate_by_region — быстрое удаление всех записей региона.
 CREATE INDEX IF NOT EXISTS idx_excel_cache_reg
     ON excel_cache(reg_code);
+
+
+-- ============================================================
+-- llm_cache — кэш LLM-резюме (Sprint 2)
+-- ============================================================
+-- Зачем: LLM-summary — самое дорогое место пайплайна (~53 сек,
+-- 429 Too Many Requests при 3+ одновременных на free-тарифе).
+-- Повторный запрос того же региона+периода+провайдера+промпта
+-- даёт байтово идентичный summary — кэшируем, чтобы:
+--   - 2-й пользователь получал ответ мгновенно (<100 мс)
+--   - не тратилась quota LLM
+--   - снижался риск 429
+--
+-- Ключ cache_key = SHA-256 от:
+--   reg_code | dat_hash | provider | prompt_hash | llm_version
+--
+-- prompt_hash = MD5 от (system_prompt + clusters_ctx + cross_tables_ctx)
+-- Если меняется SYSTEM_PROMPT или формат таблиц — кэш инвалидируется
+-- автоматически.
+--
+-- llm_version (env LLM_CACHE_VERSION) — позволяет принудительно
+-- инвалидировать весь кэш при релизе новой версии промпта.
+--
+-- TTL: 24 часа (env LLM_CACHE_TTL_SECONDS).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS llm_cache (
+    id              BIGSERIAL    PRIMARY KEY,
+    cache_key       CHAR(64)     NOT NULL,            -- SHA-256
+    reg_code        VARCHAR(16)  NOT NULL,
+    dat_hash        CHAR(32)     NOT NULL,            -- MD5 hash (как в dtp_cards_cache)
+    provider        VARCHAR(16)  NOT NULL,            -- 'free' / 'paid'
+    summary_text    TEXT         NOT NULL,
+    prompt_hash     CHAR(32)     NOT NULL,            -- MD5 от промпта
+    clusters_count  INT,                              -- для диагностики
+    total_dtp       INT,                              -- для диагностики
+    region_name     TEXT,
+    period_label    TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ  NOT NULL
+);
+
+-- Уникальный индекс: одна запись на cache_key.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_cache_key
+    ON llm_cache(cache_key);
+
+-- Для частого запроса GET по cache_key с проверкой expires_at.
+CREATE INDEX IF NOT EXISTS idx_llm_cache_key_expires
+    ON llm_cache(cache_key, expires_at);
+
+-- Для cleanup_expired_llm_cache — быстрый поиск протухших.
+CREATE INDEX IF NOT EXISTS idx_llm_cache_expires
+    ON llm_cache(expires_at);
+
+-- Для invalidate_by_region — быстрое удаление всех записей региона.
+CREATE INDEX IF NOT EXISTS idx_llm_cache_reg
+    ON llm_cache(reg_code);
