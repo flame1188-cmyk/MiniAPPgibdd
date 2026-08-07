@@ -60,8 +60,18 @@ def _register_task(task: Task) -> None:
             _tasks[task.id] = task
             return
 
-        # Вытесняем самые старые, если превышен лимит
-        while len(_tasks) >= MAX_INMEMORY_TASKS:
+        # Вытесняем самые старые, если превышен лимит.
+        # ВНИМАНИЕ: читаем лимит через lazy-import фасада gibdd_service, а не
+        # через локальный binding MAX_INMEMORY_TASKS — иначе monkeypatch на
+        # gibdd_service.MAX_INMEMORY_TASKS в тестах не сработает (патч на
+        # фасаде не доходит до локальной копии в task_registry). Аналогично
+        # паттерну с _imports._import_module.
+        try:
+            from . import gibdd_service as _facade
+            _limit = getattr(_facade, "MAX_INMEMORY_TASKS", MAX_INMEMORY_TASKS)
+        except Exception:
+            _limit = MAX_INMEMORY_TASKS
+        while len(_tasks) >= _limit:
             evicted_id, evicted_task = _tasks.popitem(last=False)
             logger.info(
                 f"_tasks LRU: вытеснена задача {evicted_id} "
