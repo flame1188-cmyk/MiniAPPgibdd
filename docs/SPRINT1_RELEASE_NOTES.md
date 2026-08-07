@@ -64,11 +64,37 @@ result = _imports._import_module(...)
   - Типы объектов (OrderedDict, threading.Lock, asyncio.Semaphore)
   - Identity _tasks (один и тот же объект во всех модулях)
 - **FastAPI app init**: OK (38 routes)
-- **Unit + integration tests**: **414 passed, 1 failed, 30 skipped**
+- **Unit + integration tests**: **440 passed, 30 skipped, 0 failed ✓**
   - ДО рефакторинга (stashed): 43 failed, 372 passed
-  - ПОСЛЕ: 1 failed, 414 passed → рефакторинг + фикс тест-стабов **ИСПРАВИЛИ 42 ранее падавших теста**
-  - Единственный remaining failure (`TestLruEviction::test_eviction_when_limit_exceeded`) —
-    pre-existing, не связан с рефакторингом
+  - ПОСЛЕ initial split: 1 failed, 414 passed (TestLruEviction fall-through)
+  - ПОСЛЕ LRU-fix v2: **0 failed, 440 passed** → рефакторинг + фикс тест-стабов + LRU-fix
+    **ИСПРАВИЛИ 43 ранее падавших теста**
+  - Все 30 skipped — опциональные зависимости (psycopg, PTB v20+, slowapi, respx) в dev-окружении
+
+## Post-deploy fix: LRU eviction (v2)
+
+После деплоя Sprint 1 на Windows-машине пользователя выявлен regression:
+`TestLruEviction::test_eviction_when_limit_exceeded` падал с `assert 5 == 3`.
+
+**Причина:** тот же класс проблем, что и с `_import_module`. Тест патчит
+`gibdd_service.MAX_INMEMORY_TASKS` (facade), но `_register_task` в
+`task_registry.py` читал `MAX_INMEMORY_TASKS` через **локальный binding**
+модуля — патч на фасаде не доходил.
+
+**Фикс:** `task_registry.py:_register_task` теперь читает лимит через
+lazy-import фасада:
+```python
+try:
+    from . import gibdd_service as _facade
+    _limit = getattr(_facade, "MAX_INMEMORY_TASKS", MAX_INMEMORY_TASKS)
+except Exception:
+    _limit = MAX_INMEMORY_TASKS
+while len(_tasks) >= _limit:
+    ...
+```
+
+Verify-скрипт: `scripts/verify_lru_patch.py` воспроизводит сценарий теста
+вне pytest — подтверждает, что патч на фасаде теперь доходит до eviction logic.
 
 ## Что НЕ изменилось
 
