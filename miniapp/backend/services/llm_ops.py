@@ -9,11 +9,34 @@ LLM-аналитика: summary + Q&A.
 Провайдеры:
 - "free" — ZhipuAI/GLM (LLM_API_KEY, дефолт)
 - "paid" — DeepSeek (LLM_PAID_API_KEY/LLM_PAID_API_URL)
+
+=== Sprint 2: LLM_SEMAPHORE + LLM cache ===
+
+LLM_SEMAPHORE:
+    Ограничивает количество одновременных LLM-вызовов в одном процессе.
+    Защищает от 429 Too Many Requests на free-тарифе (GLM-4.7-Flash RPM~30).
+    Настраивается через env LLM_MAX_CONCURRENT (по умолчанию 2).
+    При превышении лимита coroutine ждёт в очереди (FIFO).
+
+    ВНИМАНИЕ: существующий rate-limiter в llm_analyzer._do_llm_request
+    (_last_llm_call_time + _MIN_LLM_INTERVAL=5.0) имеет race condition —
+    два coroutine, начавшие вызов одновременно, оба пройдут проверку
+    elapsed >= 5.0 и оба пойдут в LLM. Semaphore решает эту проблему
+    на уровне выше (coroutine не начнёт подготовку промпта, пока не
+    получит слот).
+
+LLM cache:
+    Кэширует summary в PostgreSQL (таблица llm_cache, TTL=24h).
+    Cache key = SHA-256(reg_code | dat_hash | provider | prompt_hash | version).
+    При cache hit — LLM не вызывается, ответ возвращается мгновенно (<100 мс).
+    Кэшируется ТОЛЬКО start_llm_summary (детерминированный вход).
+    ask_llm_question НЕ кэшируется (каждый вопрос уникальный).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -23,6 +46,37 @@ from .models import AnalysisState, AnalysisStatus, Task
 from .pipeline import ensure_prev_cards
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Sprint 2: LLM_SEMAPHORE — лимит одновременных LLM-вызовов
+# ============================================================
+# Защищает от 429 Too Many Requests на free-тарифе (GLM-4.7-Flash RPM~30).
+# При превышении лимита coroutine ждёт в очереди (FIFO по умолчанию).
+#
+# ВНИМАНИЕ: создаётся ОДИН раз при импорте модуля. Если env
+# LLM_MAX_CONCURRENT меняется в runtime (например, через monkeypatch
+# в тестах) — semaphore НЕ пересоздаётся. Для тестов, которым нужно
+# другое значение, используйте pytest-фикстуру, которая патчит
+# _LLM_SEMAPHORE напрямую.
+def _init_llm_semaphore() -> asyncio.Semaphore:
+    """Создаёт semaphore с размером из env LLM_MAX_CONCURRENT."""
+    try:
+        # lazy import config (чтобы не падать, если config не настроен)
+        config = _imports._import_module("config")
+        limit = getattr(config, "LLM_MAX_CONCURRENT", 2)
+    except Exception:
+        limit = int(os.getenv("LLM_MAX_CONCURRENT", "2"))
+    if limit < 1:
+        limit = 1
+    logger.info(
+        f"LLM_SEMAPHORE: initialized with limit={limit} "
+        f"(env LLM_MAX_CONCURRENT)"
+    )
+    return asyncio.Semaphore(limit)
+
+
+_LLM_SEMAPHORE: asyncio.Semaphore = _init_llm_semaphore()
 
 
 async def start_llm_summary(task: Task, provider: str = "free") -> None:
@@ -35,6 +89,10 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
     при зависании LLM (бесконечные 5xx-ретраи, потеря соединения)
     операция гарантированно завершилась с понятной ошибкой, а не висела
     в статусе RUNNING вечно.
+
+    === Sprint 2 ===
+    Оборачивает реальную работу в _LLM_SEMAPHORE, чтобы ограничить
+    одновременные LLM-вызовы. Если слот занят — ждёт в очереди.
     """
     state = task.llm_summary_state
     state.status = AnalysisStatus.RUNNING
@@ -49,40 +107,211 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
     # бесконечные ретраи,超大 промпт) — лучше упасть с понятной ошибкой.
     MAX_LLM_DURATION_SEC = 300
 
+    # Sprint 2: проверяем кэш ДО получения semaphore.
+    # Если cache hit — LLM не нужен, semaphore не нужен, ответ мгновенный.
+    # Это позволяет 100+ одновременных cache hit без блокировок.
     try:
-        # Запускаем реальную работу в task и ограничиваем по времени.
-        # Используем shield, чтобы wait_for cancel не отменил сам task
-        # (он продолжит работать в фоне, но результат уже не запишется).
+        cached = await _check_llm_cache(task, provider, state)
+        if cached:
+            return  # cache hit — done
+    except Exception as exc:
+        logger.warning(
+            f"Task {task.id}: LLM cache check failed, proceeding to LLM: {exc}"
+        )
+
+    # Sprint 2: получаем слот semaphore.
+    # Логируем ожидание, если слот занят (видно в логах, что кто-то ждёт).
+    if _LLM_SEMAPHORE._value <= 0:  # type: ignore[attr-defined]
+        # _bound_value хранит исходный лимит semaphore (Python 3.10+).
+        # Если атрибут недоступен — показываем только "full".
+        limit_str = str(getattr(_LLM_SEMAPHORE, "_bound_value", "?"))
+        logger.info(
+            f"Task {task.id}: LLM_SEMAPHORE full "
+            f"(limit={limit_str}), waiting for slot..."
+        )
+
+    async with _LLM_SEMAPHORE:
+        logger.debug(
+            f"Task {task.id}: LLM_SEMAPHORE acquired "
+            f"(available={_LLM_SEMAPHORE._value})"  # type: ignore[attr-defined]
+        )
+
         try:
-            await asyncio.wait_for(
-                _run_llm_summary_inner(task, provider, state),
-                timeout=MAX_LLM_DURATION_SEC,
-            )
-        except asyncio.TimeoutError:
-            elapsed = int(
-                (datetime.now(timezone.utc) - state.started_at).total_seconds()
-            )
-            err_msg = (
-                f"LLM-анализ превысил максимально допустимое время "
-                f"({MAX_LLM_DURATION_SEC} сек, прошло {elapsed} сек). "
-                f"Возможно, сервис нейросети перегружен или промпт слишком большой. "
-                f"Попробуйте ещё раз через несколько минут или используйте "
-                f"другой провайдер."
-            )
-            logger.error(
-                f"Task {task.id}: LLM summary timeout after {elapsed}s"
-            )
+            # Запускаем реальную работу в task и ограничиваем по времени.
+            # Используем shield, чтобы wait_for cancel не отменил сам task
+            # (он продолжит работать в фоне, но результат уже не запишется).
+            try:
+                await asyncio.wait_for(
+                    _run_llm_summary_inner(task, provider, state),
+                    timeout=MAX_LLM_DURATION_SEC,
+                )
+            except asyncio.TimeoutError:
+                elapsed = int(
+                    (datetime.now(timezone.utc) - state.started_at).total_seconds()
+                )
+                err_msg = (
+                    f"LLM-анализ превысил максимально допустимое время "
+                    f"({MAX_LLM_DURATION_SEC} сек, прошло {elapsed} сек). "
+                    f"Возможно, сервис нейросети перегружен или промпт слишком большой. "
+                    f"Попробуйте ещё раз через несколько минут или используйте "
+                    f"другой провайдер."
+                )
+                logger.error(
+                    f"Task {task.id}: LLM summary timeout after {elapsed}s"
+                )
+                state.status = AnalysisStatus.FAILED
+                state.error = err_msg
+                state.stage = "Превышено время ожидания"
+                state.finished_at = datetime.now(timezone.utc)
+
+        except Exception as exc:
+            logger.exception(f"Task {task.id}: LLM summary failed")
             state.status = AnalysisStatus.FAILED
-            state.error = err_msg
-            state.stage = "Превышено время ожидания"
+            state.error = str(exc)
+            state.stage = "Ошибка"
             state.finished_at = datetime.now(timezone.utc)
 
+
+async def _check_llm_cache(
+    task: Task, provider: str, state: AnalysisState,
+) -> bool:
+    """
+    Sprint 2: проверяет LLM cache перед вызовом LLM.
+
+    Возвращает True, если найден cache hit (state уже заполнен результатом).
+    Возвращает False, если cache miss (нужно вызывать LLM).
+
+    Логика:
+    1. Готовит clusters_ctx и cross_tables_ctx (как в _run_llm_summary_inner).
+    2. Вычисляет cache_key.
+    3. Запрашивает summary из БД.
+    4. Если hit — заполняет state.result и завершает операцию.
+    """
+    # Проверяем доступность БД и провайдера
+    config = _imports._import_module("config")
+    if provider == "paid":
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
+            return False
+    else:
+        if not config.LLM_API_KEY:
+            return False
+
+    # Готовим clusters_ctx
+    clusters_ctx = ""
+    if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
+        llm_module = _imports._import_module("llm_analyzer")
+        fake_clusters = [
+            {
+                "road": c.get("road", ""),
+                "zone_type": c.get("zone_type", ""),
+                "total_accidents": c.get("total_accidents", 0),
+                "deaths": c.get("deaths", 0),
+                "injured": c.get("injured", 0),
+                "dominant_type": c.get("dominant_type") or "",
+                "type_counter": c.get("type_counter", {}),
+                "start_pos": c.get("start_pos"),
+                "end_pos": c.get("end_pos"),
+                "dates": c.get("dates", []),
+                "dynamics": c.get("dynamics", {}),
+                "_is_lost": c.get("is_lost", False),
+                "_is_prev_matched": c.get("is_prev_matched", False),
+            }
+            for c in task.clusters_state.result.get("clusters", [])
+        ]
+        clusters_ctx = llm_module.format_clusters_for_prompt(
+            fake_clusters, max_clusters=10,
+        )
+
+    # Готовим cross_tables_ctx (только для free)
+    cross_tables_ctx = ""
+    if provider == "free":
+        try:
+            # Гарантируем comparison (нужно для cross_tables)
+            comp_result = await ensure_comparison(task)
+            if comp_result.get("ok"):
+                llm_module = _imports._import_module("llm_analyzer")
+                analytics_module = _imports._import_module("analytics")
+                current_cross = _get_cross_tables(task, prev=False)
+                prev_cross = _get_cross_tables(task, prev=True) if task.prev_cards else None
+                cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
+                    current_cross, prev_cross,
+                    task.period_label,
+                    task.prev_label or "",
+                )
+                stats = analytics_module.calculate_statistical_metrics(current_cross)
+                stats_text = llm_module.format_statistical_metrics_for_prompt(stats)
+                if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
+                    cross_tables_ctx += "\n\n" + stats_text
+        except Exception as exc:
+            logger.warning(f"Task {task.id}: cache check cross-tables failed: {exc}")
+
+    # Получаем SYSTEM_PROMPT (для prompt_hash)
+    llm_module = _imports._import_module("llm_analyzer")
+    system_prompt = getattr(llm_module, "SYSTEM_PROMPT", "")
+
+    # Запрашиваем кэш
+    try:
+        from ..db.llm_cache import get_cached_summary
+        cached = await get_cached_summary(
+            reg_code=task.region_code,
+            dat_list=task.dat_list,
+            provider=provider,
+            clusters_ctx=clusters_ctx,
+            cross_tables_ctx=cross_tables_ctx,
+            system_prompt=system_prompt,
+        )
     except Exception as exc:
-        logger.exception(f"Task {task.id}: LLM summary failed")
-        state.status = AnalysisStatus.FAILED
-        state.error = str(exc)
-        state.stage = "Ошибка"
-        state.finished_at = datetime.now(timezone.utc)
+        logger.warning(f"Task {task.id}: llm_cache GET failed: {exc}")
+        return False
+
+    if not cached:
+        return False
+
+    # Cache hit — заполняем state и завершаем
+    state.result = {
+        "text": cached,
+        "provider": provider,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "from_cache": True,  # маркер для UI/логов
+    }
+    state.status = AnalysisStatus.DONE
+    state.progress = 100
+    state.stage = "Готово (из кэша)"
+    state.finished_at = datetime.now(timezone.utc)
+
+    # Сохраняем clusters_ctx и cross_tables_ctx для последующего PUT
+    # (после cache hit мы НЕ вызываем LLM, но хотим обновить TTL записи).
+    # Используем приватные атрибуты, чтобы не менять модель Task.
+    task._cache_clusters_ctx = clusters_ctx  # type: ignore[attr-defined]
+    task._cache_cross_tables_ctx = cross_tables_ctx  # type: ignore[attr-defined]
+    task._cache_system_prompt = system_prompt  # type: ignore[attr-defined]
+
+    # Обновляем TTL в фоне (touch existing record)
+    try:
+        from ..db.llm_cache import put_cached_summary
+        asyncio.create_task(put_cached_summary(
+            reg_code=task.region_code,
+            dat_list=task.dat_list,
+            provider=provider,
+            summary_text=cached,
+            clusters_ctx=clusters_ctx,
+            cross_tables_ctx=cross_tables_ctx,
+            system_prompt=system_prompt,
+            clusters_count=len(task.clusters_state.result.get("clusters", []))
+                if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result
+                else None,
+            total_dtp=len(task.cards) if task.cards else None,
+            region_name=task.region_name,
+            period_label=task.period_label,
+        ))
+    except Exception as exc:
+        logger.debug(f"Task {task.id}: llm_cache TTL refresh failed: {exc}")
+
+    logger.info(
+        f"Task {task.id}: LLM summary done (from cache, {provider}) — "
+        f"LLM call skipped"
+    )
+    return True
 
 
 async def _run_llm_summary_inner(
@@ -230,6 +459,33 @@ async def _run_llm_summary_inner(
 
     logger.info(f"Task {task.id}: LLM summary done ({provider})")
 
+    # Sprint 2: сохраняем summary в кэш (fire-and-forget).
+    # Если БД недоступна — put_cached_summary сам становится no-op.
+    # Если сохранение упадёт — это не должно влиять на успешный результат.
+    try:
+        from ..db.llm_cache import put_cached_summary
+        system_prompt = getattr(llm_module, "SYSTEM_PROMPT", "")
+        clusters_count = (
+            len(task.clusters_state.result.get("clusters", []))
+            if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result
+            else None
+        )
+        asyncio.create_task(put_cached_summary(
+            reg_code=task.region_code,
+            dat_list=task.dat_list,
+            provider=provider,
+            summary_text=summary,
+            clusters_ctx=clusters_ctx,
+            cross_tables_ctx=cross_tables_ctx,
+            system_prompt=system_prompt,
+            clusters_count=clusters_count,
+            total_dtp=len(task.cards) if task.cards else None,
+            region_name=task.region_name,
+            period_label=task.period_label,
+        ))
+    except Exception as exc:
+        logger.debug(f"Task {task.id}: llm_cache PUT failed: {exc}")
+
 
 async def ask_llm_question(
     task: Task,
@@ -339,19 +595,29 @@ async def ask_llm_question(
             f"provider={provider}"
         )
 
-        answer = await llm_module.get_ai_answer(
-            question=question,
-            comparison=comparison,
-            reg_name=task.region_name,
-            current_label=task.period_label,
-            prev_label=task.prev_label or "прошлый период",
-            raw_supplement="",
-            news_context="",
-            clusters_context=clusters_ctx,
-            cross_tables_context=cross_tables_ctx,
-            provider=provider,
-            history=history_for_llm,
-        )
+        # Sprint 2: получаем слот semaphore для LLM-вызова.
+        # Подготовка промпта (comparison, cross_tables, clusters) идёт БЕЗ
+        # semaphore — это локальные вычисления, не требующие LLM.
+        # Только сам HTTP-вызов к LLM — под semaphore.
+        if _LLM_SEMAPHORE._value <= 0:  # type: ignore[attr-defined]
+            logger.info(
+                f"Task {task.id}: LLM_SEMAPHORE full (Q&A), waiting for slot..."
+            )
+
+        async with _LLM_SEMAPHORE:
+            answer = await llm_module.get_ai_answer(
+                question=question,
+                comparison=comparison,
+                reg_name=task.region_name,
+                current_label=task.period_label,
+                prev_label=task.prev_label or "прошлый период",
+                raw_supplement="",
+                news_context="",
+                clusters_context=clusters_ctx,
+                cross_tables_context=cross_tables_ctx,
+                provider=provider,
+                history=history_for_llm,
+            )
 
         # Сохраняем в историю
         task.llm_qa_history.append({

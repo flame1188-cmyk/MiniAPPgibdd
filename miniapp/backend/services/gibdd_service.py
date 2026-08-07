@@ -101,7 +101,9 @@ from .point_stats_ops import (
 
 # === LLM operations ===
 from .llm_ops import (
+    _LLM_SEMAPHORE,
     _run_llm_summary_inner,
+    _init_llm_semaphore,
     ask_llm_question,
     get_llm_providers_status,
     start_llm_summary,
@@ -159,6 +161,8 @@ __all__ = [
     "generate_point_stats_excel",
     "generate_point_stats_map_html",
     # LLM
+    "_LLM_SEMAPHORE",
+    "_init_llm_semaphore",
     "_run_llm_summary_inner",
     "ask_llm_question",
     "get_llm_providers_status",
