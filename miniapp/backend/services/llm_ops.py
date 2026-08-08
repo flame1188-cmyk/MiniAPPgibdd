@@ -861,6 +861,11 @@ async def ask_llm_question_stream(
             f"Task {task.id}: LLM ask stream done — "
             f"answer_len={len(full_answer)}, saved to history"
         )
+    else:
+        logger.warning(
+            f"Task {task.id}: LLM ask stream — empty answer (0 chunks), "
+            f"NOT saved to history, provider={provider}"
+        )
 
 
 async def stream_llm_summary(

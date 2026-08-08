@@ -51,6 +51,18 @@ router = APIRouter(tags=["analyze"])
 # sse-starlette автоматически вставляет ping, пока генератор не yield'ит.
 _SSE_PING_INTERVAL_SEC = 15
 
+# SSE response headers — критично для streaming через прокси.
+# X-Accel-Buffering: no — отключает буферизацию в nginx (и других прокси,
+# которые уважают этот заголовок). Без него nginx буферизует весь ответ
+# и отдаёт клиенту только после завершения стрима — пользователь видит
+# "ничего не происходит" вместо token-by-token reveal.
+# Cache-Control: no-cache — предотвращает кэширование SSE-ответов.
+_SSE_HEADERS = {
+    "X-Accel-Buffering": "no",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+}
+
 
 # ============================================================
 # Schemas
@@ -325,13 +337,26 @@ async def ask_llm_stream(
     async def event_generator():
         """SSE-генератор: эмитит delta/done/error события."""
         try:
+            chunks_emitted = 0
             async for delta in ask_llm_question_stream(
                 task=task, question=question, provider=provider,
             ):
+                chunks_emitted += 1
                 yield {"event": "delta", "data": delta}
             # Стрим завершился нормально — эмитим done.
             # Фронтенд уже накопил текст из delta-событий.
-            yield {"event": "done", "data": ""}
+            if chunks_emitted == 0:
+                # LLM вернул пустой ответ (0 chunks) — эмитим error,
+                # чтобы фронтенд показал сообщение, а не "тихо" завершился.
+                logger.warning(
+                    f"Task {task_id}: LLM ask stream — empty response "
+                    f"(0 chunks), provider={provider}"
+                )
+                yield {"event": "error", "data": json.dumps({
+                    "error": "LLM вернул пустой ответ. Попробуйте переформулировать вопрос или сменить провайдера.",
+                })}
+            else:
+                yield {"event": "done", "data": ""}
         except asyncio.CancelledError:
             # Клиент отключился (AbortController во фронтенде)
             logger.info(
@@ -351,6 +376,7 @@ async def ask_llm_stream(
         event_generator(),
         ping=_SSE_PING_INTERVAL_SEC,
         media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
 
 
@@ -387,9 +413,20 @@ async def llm_summary_stream(
 
     async def event_generator():
         try:
+            chunks_emitted = 0
             async for delta in stream_llm_summary(task=task, provider=provider):
+                chunks_emitted += 1
                 yield {"event": "delta", "data": delta}
-            yield {"event": "done", "data": ""}
+            if chunks_emitted == 0:
+                logger.warning(
+                    f"Task {task_id}: LLM summary stream — empty response "
+                    f"(0 chunks), provider={provider}"
+                )
+                yield {"event": "error", "data": json.dumps({
+                    "error": "LLM вернул пустой ответ. Попробуйте ещё раз или смените провайдера.",
+                })}
+            else:
+                yield {"event": "done", "data": ""}
         except asyncio.CancelledError:
             logger.info(
                 f"Task {task_id}: LLM summary stream cancelled by client"
@@ -408,4 +445,5 @@ async def llm_summary_stream(
         event_generator(),
         ping=_SSE_PING_INTERVAL_SEC,
         media_type="text/event-stream",
+        headers=_SSE_HEADERS,
     )
