@@ -268,7 +268,11 @@ def _make_report_generator_stub() -> types.ModuleType:
 
 
 def _make_llm_analyzer_stub(answer_text: str = "Mock LLM summary") -> types.ModuleType:
-    """Stub для llm_analyzer — возвращает предсказуемый текст."""
+    """Stub для llm_analyzer — возвращает предсказуемый текст.
+    Включая Sprint 4 streaming-функции (get_ai_summary_stream,
+    get_ai_answer_stream), которые возвращают async generator,
+    yield'ящий ответ одним chunk'ом.
+    """
     llm = types.ModuleType("llm_analyzer")
 
     async def fake_get_ai_summary(**kwargs):
@@ -276,6 +280,17 @@ def _make_llm_analyzer_stub(answer_text: str = "Mock LLM summary") -> types.Modu
 
     async def fake_get_ai_answer(**kwargs):
         return answer_text
+
+    # Sprint 4: streaming stubs.
+    # В тестах мы обычно НЕ хотим ходить в реальный LLM — стрим-генератор
+    # просто yield'ит answer_text одним куском. Тесты, которым нужен
+    # реальный SSE-парсинг, используют respx на уровне HTTP (мокают
+    # httpx-клиент, а не модуль).
+    async def fake_get_ai_summary_stream(**kwargs):
+        yield answer_text
+
+    async def fake_get_ai_answer_stream(**kwargs):
+        yield answer_text
 
     def fake_format_clusters_for_prompt(clusters, max_clusters=10):
         return "Mock clusters context"
@@ -288,9 +303,13 @@ def _make_llm_analyzer_stub(answer_text: str = "Mock LLM summary") -> types.Modu
 
     llm.get_ai_summary = fake_get_ai_summary
     llm.get_ai_answer = fake_get_ai_answer
+    llm.get_ai_summary_stream = fake_get_ai_summary_stream
+    llm.get_ai_answer_stream = fake_get_ai_answer_stream
     llm.format_clusters_for_prompt = fake_format_clusters_for_prompt
     llm.format_cross_tables_for_prompt = fake_format_cross_tables_for_prompt
     llm.format_statistical_metrics_for_prompt = fake_format_statistical_metrics_for_prompt
+    llm.SYSTEM_PROMPT = "Mock system prompt"
+    llm.SYSTEM_PROMPT_PAID = "Mock paid system prompt"
     return llm
 
 
