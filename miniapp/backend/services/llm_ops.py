@@ -691,3 +691,406 @@ def get_llm_providers_status() -> Dict[str, bool]:
     except Exception:
         return {"free": False, "paid": False,
                 "free_model": "", "paid_model": ""}
+
+
+# ============================================================
+# Sprint 4: Streaming LLM (SSE)
+# ============================================================
+# Две streaming-функции для генерации контента token-by-token:
+#   - ask_llm_question_stream() — Q&A (не кэшируется)
+#   - stream_llm_summary()      — резюме (с cache check + cache put)
+#
+# Обе возвращают AsyncIterator[str] — дельты контента.
+# Caller (router) оборачивает в EventSourceResponse и эмитит SSE-события:
+#   event: delta  data: "токен..."
+#   event: done   data: "полный текст"
+#   event: error  data: "сообщение об ошибке"
+#
+# Semaphore: обе функции приобретают _LLM_SEMAPHORE ТОЛЬКО на время
+# HTTP-stream'а к LLM. Подготовка промпта (comparison, cross_tables,
+# clusters) идёт БЕЗ semaphore — это локальные вычисления.
+
+from typing import AsyncIterator
+
+
+async def ask_llm_question_stream(
+    task: Task,
+    question: str,
+    provider: str = "free",
+) -> AsyncIterator[str]:
+    """
+    Streaming-версия ask_llm_question: yields дельты ответа по мере
+    поступления от LLM.
+
+    Семантика:
+      - До первого yield: может поднять RuntimeError (нет ключа, не удалось
+        подготовить промпт) или ValueError (короткий вопрос). Caller решает,
+        как показать — обычно через SSE error event.
+      - После первого yield: при обрыве потока просто завершаем генератор.
+        Partial-результат НЕ сохраняется в history (сохраняем только полный).
+      - Нормальное завершение: сохраняем Q&A в task.llm_qa_history, caller
+        эмитит done event.
+
+    НЕ кэшируется (каждый вопрос уникальный).
+    """
+    if not question or len(question.strip()) < 3:
+        raise ValueError("Слишком короткий вопрос")
+    if len(question) > 1000:
+        raise ValueError("Слишком длинный вопрос (макс. 1000 символов)")
+
+    config = _imports._import_module("config")
+    if provider == "paid":
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
+            raise RuntimeError("Платный LLM не настроен")
+    else:
+        if not config.LLM_API_KEY:
+            raise RuntimeError("Бесплатный LLM не настроен")
+
+    # Sprint 3.1: гарантируем task.cards (восстановление из cards_cache).
+    cards_result = await ensure_cards(task)
+    if not cards_result.get("ok"):
+        raise RuntimeError(cards_result.get("error", "Не удалось загрузить cards"))
+
+    # Гарантируем comparison
+    comp_result = await ensure_comparison(task)
+    if not comp_result.get("ok"):
+        raise RuntimeError(comp_result.get("error", "Не удалось рассчитать comparison"))
+    comparison = comp_result["comparison"]
+
+    llm_module = _imports._import_module("llm_analyzer")
+    analytics_module = _imports._import_module("analytics")
+
+    # Кросс-таблицы (только для бесплатного)
+    cross_tables_ctx = ""
+    if provider == "free":
+        try:
+            current_cross = _get_cross_tables(task, prev=False)
+            cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
+                current_cross, None,
+                task.period_label,
+                task.prev_label or "",
+            )
+            stats = analytics_module.calculate_statistical_metrics(current_cross)
+            stats_text = llm_module.format_statistical_metrics_for_prompt(stats)
+            if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
+                cross_tables_ctx += "\n\n" + stats_text
+        except Exception as exc:
+            logger.warning(f"Task {task.id}: Q&A stream cross-tables failed: {exc}")
+
+    # Очаги (если есть)
+    clusters_ctx = ""
+    if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
+        fake_clusters = [
+            {
+                "road": c.get("road", ""),
+                "zone_type": c.get("zone_type", ""),
+                "total_accidents": c.get("total_accidents", 0),
+                "deaths": c.get("deaths", 0),
+                "injured": c.get("injured", 0),
+                "dominant_type": c.get("dominant_type") or "",
+                "type_counter": c.get("type_counter", {}),
+                "start_pos": c.get("start_pos"),
+                "end_pos": c.get("end_pos"),
+                "dates": c.get("dates", []),
+                "dynamics": c.get("dynamics", {}),
+                "_is_lost": c.get("is_lost", False),
+                "_is_prev_matched": c.get("is_prev_matched", False),
+            }
+            for c in task.clusters_state.result.get("clusters", [])
+        ]
+        clusters_ctx = llm_module.format_clusters_for_prompt(
+            fake_clusters, max_clusters=10,
+        )
+
+    # История Q&A → формат OpenAI (последние 12 сообщений = 6 пар)
+    history_for_llm: list[dict[str, str]] = []
+    for h in task.llm_qa_history:
+        q = h.get("question", "")
+        a = h.get("answer", "")
+        if q:
+            history_for_llm.append({"role": "user", "content": q})
+        if a:
+            history_for_llm.append({"role": "assistant", "content": a})
+    if len(history_for_llm) > 12:
+        history_for_llm = history_for_llm[-12:]
+
+    logger.info(
+        f"Task {task.id}: LLM ask stream — "
+        f"qa_history={len(task.llm_qa_history)} records, "
+        f"history_for_llm={len(history_for_llm)} msgs, "
+        f"provider={provider}"
+    )
+
+    # Semaphore — только на HTTP-стрим к LLM.
+    if _LLM_SEMAPHORE._value <= 0:  # type: ignore[attr-defined]
+        logger.info(
+            f"Task {task.id}: LLM_SEMAPHORE full (Q&A stream), waiting for slot..."
+        )
+
+    accumulated = []
+    async with _LLM_SEMAPHORE:
+        async for delta in llm_module.get_ai_answer_stream(
+            question=question,
+            comparison=comparison,
+            reg_name=task.region_name,
+            current_label=task.period_label,
+            prev_label=task.prev_label or "прошлый период",
+            raw_supplement="",
+            news_context="",
+            clusters_context=clusters_ctx,
+            cross_tables_context=cross_tables_ctx,
+            provider=provider,
+            history=history_for_llm,
+        ):
+            accumulated.append(delta)
+            yield delta
+
+    # Stream завершился нормально — сохраняем в history.
+    # Если стрим оборвался (exception), мы сюда не попадём — partial не сохраняем.
+    full_answer = "".join(accumulated)
+    if full_answer.strip():
+        task.llm_qa_history.append({
+            "question": question,
+            "answer": full_answer,
+            "provider": provider,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        if len(task.llm_qa_history) > 10:
+            task.llm_qa_history = task.llm_qa_history[-10:]
+        logger.info(
+            f"Task {task.id}: LLM ask stream done — "
+            f"answer_len={len(full_answer)}, saved to history"
+        )
+
+
+async def stream_llm_summary(
+    task: Task, provider: str = "free",
+) -> AsyncIterator[str]:
+    """
+    Streaming-версия start_llm_summary: yields дельты резюме по мере
+    поступления от LLM.
+
+    Семантика:
+      1. Сразу ставит state.status = RUNNING, stage = "Подготовка данных..."
+      2. Проверяет LLM cache. Если hit — обновляет state (DONE) и
+         yield'ит весь кэшированный текст одним куском (мгновенно).
+      3. Если cache miss: готовит промпт (comparison, cross_tables, clusters),
+         ставит stage = "Генерация нейросетью...", acquire semaphore,
+         стримит из LLM.
+      4. На нормальное завершение: сохраняет в cache (fire-and-forget),
+         обновляет state (DONE), accumulated текст уже у caller'а.
+
+    На ошибку до первого yield: поднимает RuntimeError, state → FAILED.
+    На обрыв потока: state оставляем RUNNING (caller может показать partial),
+      но в cache НЕ сохраняем.
+    """
+    state = task.llm_summary_state
+    state.status = AnalysisStatus.RUNNING
+    state.progress = 5
+    state.stage = "Подготовка данных..."
+    state.started_at = datetime.now(timezone.utc)
+    state.error = None
+    state.result = None
+
+    # Cache check (без semaphore — мгновенно)
+    try:
+        cached = await _check_llm_cache(task, provider, state)
+        if cached:
+            # cache hit — state уже DONE, текст уже в state.result
+            # Эмитим весь текст одним delta-событием.
+            cached_text = state.result.get("text", "") if state.result else ""
+            if cached_text:
+                logger.info(
+                    f"Task {task.id}: LLM summary stream — cache hit, "
+                    f"yielding {len(cached_text)} chars instantly"
+                )
+                yield cached_text
+            return
+    except Exception as exc:
+        logger.warning(
+            f"Task {task.id}: LLM cache check failed (stream), "
+            f"proceeding to LLM: {exc}"
+        )
+
+    # Cache miss — готовим промпт (как в _run_llm_summary_inner, но без
+    # финального вызова LLM).
+    config = _imports._import_module("config")
+    if provider == "paid":
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
+            state.status = AnalysisStatus.FAILED
+            state.error = "Платный LLM не настроен"
+            state.stage = "Ошибка"
+            state.finished_at = datetime.now(timezone.utc)
+            raise RuntimeError("Платный LLM не настроен")
+    else:
+        if not config.LLM_API_KEY:
+            state.status = AnalysisStatus.FAILED
+            state.error = "Бесплатный LLM не настроен"
+            state.stage = "Ошибка"
+            state.finished_at = datetime.now(timezone.utc)
+            raise RuntimeError("Бесплатный LLM не настроен")
+
+    state.progress = 10
+    state.stage = "Восстановление данных задачи..."
+    cards_result = await ensure_cards(task)
+    if not cards_result.get("ok"):
+        err = cards_result.get("error", "Не удалось восстановить cards")
+        state.status = AnalysisStatus.FAILED
+        state.error = err
+        state.stage = "Ошибка"
+        state.finished_at = datetime.now(timezone.utc)
+        raise RuntimeError(err)
+
+    state.stage = "Загрузка данных за прошлый год..."
+    if not task.prev_cards_loaded:
+        await ensure_prev_cards(task)
+
+    state.progress = 20
+    state.stage = "Расчёт сравнительных метрик..."
+    comp_result = await ensure_comparison(task)
+    if not comp_result.get("ok"):
+        err = comp_result.get("error", "Не удалось рассчитать comparison")
+        state.status = AnalysisStatus.FAILED
+        state.error = err
+        state.stage = "Ошибка"
+        state.finished_at = datetime.now(timezone.utc)
+        raise RuntimeError(err)
+    comparison = comp_result["comparison"]
+
+    state.progress = 35
+    state.stage = "Расчёт очагов ДТП для контекста..."
+    clusters_ctx = ""
+    if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result:
+        llm_module = _imports._import_module("llm_analyzer")
+        fake_clusters = [
+            {
+                "road": c.get("road", ""),
+                "zone_type": c.get("zone_type", ""),
+                "total_accidents": c.get("total_accidents", 0),
+                "deaths": c.get("deaths", 0),
+                "injured": c.get("injured", 0),
+                "dominant_type": c.get("dominant_type") or "",
+                "type_counter": c.get("type_counter", {}),
+                "start_pos": c.get("start_pos"),
+                "end_pos": c.get("end_pos"),
+                "dates": c.get("dates", []),
+                "dynamics": c.get("dynamics", {}),
+                "_is_lost": c.get("is_lost", False),
+                "_is_prev_matched": c.get("is_prev_matched", False),
+            }
+            for c in task.clusters_state.result.get("clusters", [])
+        ]
+        clusters_ctx = llm_module.format_clusters_for_prompt(
+            fake_clusters, max_clusters=10,
+        )
+
+    state.progress = 50
+    state.stage = "Формирование промпта..."
+    llm_module = _imports._import_module("llm_analyzer")
+    analytics_module = _imports._import_module("analytics")
+
+    cross_tables_ctx = ""
+    if provider == "free":
+        try:
+            current_cross = _get_cross_tables(task, prev=False)
+            prev_cross = _get_cross_tables(task, prev=True) if task.prev_cards else None
+            cross_tables_ctx = llm_module.format_cross_tables_for_prompt(
+                current_cross, prev_cross,
+                task.period_label,
+                task.prev_label or "",
+            )
+            stats = analytics_module.calculate_statistical_metrics(current_cross)
+            stats_text = llm_module.format_statistical_metrics_for_prompt(stats)
+            if stats_text and not stats_text.endswith("(недостаточно данных для статистического анализа)"):
+                cross_tables_ctx += "\n\n" + stats_text
+        except Exception as exc:
+            logger.warning(f"Task {task.id}: summary stream cross-tables failed: {exc}")
+
+    logger.info(
+        f"Task {task.id}: LLM summary stream prompt sizes — "
+        f"clusters_ctx={len(clusters_ctx)} симв., "
+        f"cross_tables_ctx={len(cross_tables_ctx)} симв., "
+        f"provider={provider}"
+    )
+
+    state.progress = 60
+    state.stage = "Генерация нейросетью (стрим)..."
+
+    # Semaphore — только на HTTP-стрим.
+    if _LLM_SEMAPHORE._value <= 0:  # type: ignore[attr-defined]
+        logger.info(
+            f"Task {task.id}: LLM_SEMAPHORE full (summary stream), waiting for slot..."
+        )
+
+    accumulated = []
+    try:
+        async with _LLM_SEMAPHORE:
+            async for delta in llm_module.get_ai_summary_stream(
+                comparison=comparison,
+                reg_name=task.region_name,
+                current_label=task.period_label,
+                prev_label=task.prev_label or "прошлый период",
+                raw_supplement="",
+                news_context="",
+                clusters_context=clusters_ctx,
+                cross_tables_context=cross_tables_ctx,
+                provider=provider,
+                current_cards=task.cards if provider == "paid" else None,
+                prev_cards=task.prev_cards if provider == "paid" else None,
+            ):
+                accumulated.append(delta)
+                # Прогресс плавно растёт 60→90 во время стриминга
+                if state.progress < 90:
+                    state.progress = min(90, state.progress + 1)
+                yield delta
+    except Exception as exc:
+        # Обрыв потока или 4xx/5xx от LLM
+        state.status = AnalysisStatus.FAILED
+        state.error = str(exc)[:500]
+        state.stage = "Ошибка генерации"
+        state.finished_at = datetime.now(timezone.utc)
+        logger.exception(f"Task {task.id}: LLM summary stream failed")
+        raise
+
+    # Успешное завершение стрима
+    full_summary = "".join(accumulated)
+    state.result = {
+        "text": full_summary,
+        "provider": provider,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    state.status = AnalysisStatus.DONE
+    state.progress = 100
+    state.stage = "Готово"
+    state.finished_at = datetime.now(timezone.utc)
+
+    logger.info(
+        f"Task {task.id}: LLM summary stream done ({provider}) — "
+        f"{len(full_summary)} chars"
+    )
+
+    # Сохраняем в кэш (fire-and-forget) — как в _run_llm_summary_inner
+    try:
+        from ..db.llm_cache import put_cached_summary
+        system_prompt = getattr(llm_module, "SYSTEM_PROMPT", "")
+        clusters_count = (
+            len(task.clusters_state.result.get("clusters", []))
+            if task.clusters_state.status == AnalysisStatus.DONE and task.clusters_state.result
+            else None
+        )
+        asyncio.create_task(put_cached_summary(
+            reg_code=task.region_code,
+            dat_list=task.dat_list,
+            provider=provider,
+            summary_text=full_summary,
+            clusters_ctx=clusters_ctx,
+            cross_tables_ctx=cross_tables_ctx,
+            system_prompt=system_prompt,
+            clusters_count=clusters_count,
+            total_dtp=len(task.cards) if task.cards else None,
+            region_name=task.region_name,
+            period_label=task.period_label,
+        ))
+    except Exception as exc:
+        logger.debug(f"Task {task.id}: llm_cache PUT (stream) failed: {exc}")
+

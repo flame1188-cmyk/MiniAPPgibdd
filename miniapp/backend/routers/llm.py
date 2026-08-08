@@ -2,31 +2,40 @@
 Роутер LLM-аналитики: providers + summary + Q&A.
 
 Endpoints:
-- GET  /api/dtp/tasks/{task_id}/llm/providers  — статус LLM-провайдеров
-- POST /api/dtp/tasks/{task_id}/llm/summary    — запуск генерации резюме (async)
-- GET  /api/dtp/tasks/{task_id}/llm/summary    — статус/результат резюме
-- POST /api/dtp/tasks/{task_id}/llm/ask        — вопрос нейросети (sync)
-- GET  /api/dtp/tasks/{task_id}/llm/qa-history — история вопросов/ответов
+- GET  /api/dtp/tasks/{task_id}/llm/providers           — статус LLM-провайдеров
+- POST /api/dtp/tasks/{task_id}/llm/summary             — запуск генерации резюме (async)
+- GET  /api/dtp/tasks/{task_id}/llm/summary             — статус/результат резюме (long-poll)
+- POST /api/dtp/tasks/{task_id}/llm/summary/stream      — SSE-стрим резюме (Sprint 4)
+- POST /api/dtp/tasks/{task_id}/llm/ask                 — вопрос нейросети (sync)
+- POST /api/dtp/tasks/{task_id}/llm/ask/stream          — SSE-стрим ответа (Sprint 4)
+- GET  /api/dtp/tasks/{task_id}/llm/qa-history          — история вопросов/ответов
 
 Все endpoints требуют готовую задачу (task.status == 'done').
 
 Вынесено из routers/analyze.py (Sprint 3).
+Sprint 4: добавлены /stream SSE-эндпоинты для progressive text reveal.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
 
 from ..services.gibdd_service import (
     AnalysisStatus,
     ask_llm_question,
     get_llm_providers_status,
     start_llm_summary,
+)
+from ..services.llm_ops import (
+    ask_llm_question_stream,
+    stream_llm_summary,
 )
 from ..telegram_auth import TelegramUser, get_current_user
 from ._common import AnalysisStatusResponse, _require_done_task, _state_to_response
@@ -35,6 +44,12 @@ logger = logging.getLogger(__name__)
 
 # Без prefix — analyze.py (facade) задаёт /dtp на агрегированном router.
 router = APIRouter(tags=["analyze"])
+
+
+# SSE heartbeat interval — каждые 15 сек эмитим ping,
+# чтобы прокси (nginx, Cloudflare) не закрыл соединение по idle timeout.
+# sse-starlette автоматически вставляет ping, пока генератор не yield'ит.
+_SSE_PING_INTERVAL_SEC = 15
 
 
 # ============================================================
@@ -250,3 +265,147 @@ async def get_qa_history(
     """Возвращает историю вопросов/ответов LLM (последние 10)."""
     task = await _require_done_task(task_id, user)
     return [QAHistoryItem(**item) for item in task.llm_qa_history]
+
+
+# ============================================================
+# Sprint 4: SSE streaming endpoints
+# ============================================================
+# Протокол SSE (Server-Sent Events):
+#   Content-Type: text/event-stream
+#   Формат события:
+#       event: <event_name>\n
+#       data: <payload>\n
+#       \n  (пустая строка = конец события)
+#
+# Типы событий:
+#   delta  — частичный текст (один или несколько токенов).
+#            data = plain text (НЕ JSON) — фронтенд просто конкатенирует.
+#   done   — стрим завершился успешно. data = полный текст.
+#   error  — стрим оборвался или LLM вернул ошибку. data = JSON {"error": "..."}.
+#   ping   — heartbeat, чтобы прокси не закрыл соединение. data = "".
+#
+# sse-starlette автоматически эмитит ping каждые ping_interval секунд.
+# Мы добавляем свой ping из генератора, чтобы покрыть случай, когда
+# LLM долго не отвечает (подготовка промпта 5-15 сек).
+
+
+@router.post(
+    "/tasks/{task_id}/llm/ask/stream",
+)
+async def ask_llm_stream(
+    task_id: str,
+    request: LLMAskRequest,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    SSE-стрим ответа на вопрос пользователя.
+
+    Возвращает text/event-stream с событиями delta/done/error/ping.
+    Фронтенд конкатенирует delta-события и показывает текст по мере поступления.
+
+    В отличие от POST /llm/ask (блокирует 15-60 сек и возвращает JSON),
+    этот endpoint начинает отдавать токены сразу, как только LLM их прислал —
+    UX становится интерактивным (ChatGPT-style).
+
+    sse-starlette автоматически эмитит ping-события каждые _SSE_PING_INTERVAL_SEC
+    секунд, пока генератор не yield'ит — это покрывает фазу подготовки промпта
+    (ensure_cards, ensure_comparison, cross_tables — до 15 сек).
+    """
+    task = await _require_done_task(task_id, user)
+
+    if request.provider not in ("free", "paid"):
+        raise HTTPException(
+            status_code=400,
+            detail="provider must be 'free' or 'paid'",
+        )
+
+    question = request.question
+    provider = request.provider
+
+    async def event_generator():
+        """SSE-генератор: эмитит delta/done/error события."""
+        try:
+            async for delta in ask_llm_question_stream(
+                task=task, question=question, provider=provider,
+            ):
+                yield {"event": "delta", "data": delta}
+            # Стрим завершился нормально — эмитим done.
+            # Фронтенд уже накопил текст из delta-событий.
+            yield {"event": "done", "data": ""}
+        except asyncio.CancelledError:
+            # Клиент отключился (AbortController во фронтенде)
+            logger.info(
+                f"Task {task_id}: LLM ask stream cancelled by client"
+            )
+            raise
+        except Exception as exc:
+            err_msg = str(exc)[:500]
+            logger.warning(
+                f"Task {task_id}: LLM ask stream error: {err_msg}"
+            )
+            yield {"event": "error", "data": json.dumps({
+                "error": err_msg,
+            })}
+
+    return EventSourceResponse(
+        event_generator(),
+        ping=_SSE_PING_INTERVAL_SEC,
+        media_type="text/event-stream",
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/llm/summary/stream",
+)
+async def llm_summary_stream(
+    task_id: str,
+    request: LLMSummaryRequest,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    SSE-стрим генерации аналитического резюме.
+
+    Возвращает text/event-stream с событиями delta/done/error/ping.
+
+    В отличие от связки POST /llm/summary + GET /llm/summary?wait=N
+    (long-polling), этот endpoint:
+      - Если есть cache hit — эмитит весь текст одним delta и done (мгновенно).
+      - Если cache miss — стримит из LLM token-by-token.
+
+    Прогресс (state.progress) обновляется на сервере, но фронтенду он
+    не нужен — пользователь видит растущий текст.
+    """
+    task = await _require_done_task(task_id, user)
+
+    if request.provider not in ("free", "paid"):
+        raise HTTPException(
+            status_code=400,
+            detail="provider must be 'free' or 'paid'",
+        )
+
+    provider = request.provider
+
+    async def event_generator():
+        try:
+            async for delta in stream_llm_summary(task=task, provider=provider):
+                yield {"event": "delta", "data": delta}
+            yield {"event": "done", "data": ""}
+        except asyncio.CancelledError:
+            logger.info(
+                f"Task {task_id}: LLM summary stream cancelled by client"
+            )
+            raise
+        except Exception as exc:
+            err_msg = str(exc)[:500]
+            logger.warning(
+                f"Task {task_id}: LLM summary stream error: {err_msg}"
+            )
+            yield {"event": "error", "data": json.dumps({
+                "error": err_msg,
+            })}
+
+    return EventSourceResponse(
+        event_generator(),
+        ping=_SSE_PING_INTERVAL_SEC,
+        media_type="text/event-stream",
+    )
