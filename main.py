@@ -416,8 +416,16 @@ app.add_middleware(
 # === Фаза 1.5: Rate limiting middleware ===
 # Применяем лимит 60 req/min к /api/* (кроме exempt-эндпоинтов).
 # Webhook /bot/webhook и /health* — не лимитируются.
-from miniapp.backend.middleware.rate_limit import rate_limit_middleware
-app.middleware("http")(rate_limit_middleware)
+#
+# ⚠️ Sprint 4 FIX: используем PURE ASGI middleware вместо
+# `app.middleware("http")(rate_limit_middleware)`.
+# Starlette BaseHTTPMiddleware БУФЕРИЗУЕТ streaming responses (SSE/WebSocket),
+# что ломает Sprint 4 streaming LLM — chunks доходят до клиента только
+# после завершения стрима целиком. Pure ASGI middleware не трогает response
+# body и пропускает SSE-стриминг без буферизации.
+# Подробнее: https://github.com/encode/starlette/issues/919
+from miniapp.backend.middleware.rate_limit import RateLimitASGIMiddleware
+app.add_middleware(RateLimitASGIMiddleware)
 
 # === Фаза 1.6: Prometheus metrics ===
 # /metrics endpoint для скрапирования Prometheus.
@@ -617,16 +625,48 @@ if FRONTEND_DIST.exists():
     # кеширует HTML навсегда и не подхватывает новый JS-бандл при деплое.
     # Assets (с хешированными именами типа index-Dwtow6gx.js) кешируются
     # агрессивно — это безопасно, т.к. Vite меняет имя файла при любой правке.
-    @app.middleware("http")
-    async def no_cache_index_html(request: Request, call_next):
-        response = await call_next(request)
-        path = request.url.path
-        # Только для index.html и /app/ — НЕ трогаем assets (они с хешем)
-        if path in ("/app", "/app/", "/app/index.html"):
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
-            response.headers["Expires"] = "0"
-        return response
+    #
+    # ⚠️ Sprint 4 FIX: pure ASGI middleware вместо `@app.middleware("http")`.
+    # BaseHTTPMiddleware буферизует streaming responses (SSE/WebSocket).
+    # Pure ASGI перехватывает send() и добавляет заголовки только для
+    # http.response.start message — НЕ трогает body chunks, стриминг идёт
+    # напрямую клиенту.
+    class NoCacheIndexHTMLASGIMiddleware:
+        """Pure ASGI: добавляет no-cache заголовки только для index.html.
+
+        Не буферизует streaming responses (SSE/WebSocket).
+        Перехватывает http.response.start message и добавляет заголовки
+        ДО того, как body chunks начнут отправляться клиенту.
+        """
+        _TARGET_PATHS = frozenset({"/app", "/app/", "/app/index.html"})
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") != "http":
+                await self.app(scope, receive, send)
+                return
+
+            path = scope.get("path", "")
+            if path not in self._TARGET_PATHS:
+                # Не наш путь — пропускаем напрямую
+                await self.app(scope, receive, send)
+                return
+
+            # Перехватываем send, чтобы добавить заголовки в response.start
+            async def send_wrapper(message):
+                if message["type"] == "http.response.start":
+                    headers = list(message.get("headers", []))
+                    headers.append([b"cache-control", b"no-cache, no-store, must-revalidate"])
+                    headers.append([b"pragma", b"no-cache"])
+                    headers.append([b"expires", b"0"])
+                    message["headers"] = headers
+                await send(message)
+
+            await self.app(scope, receive, send_wrapper)
+
+    app.add_middleware(NoCacheIndexHTMLASGIMiddleware)
 else:
     logger.warning(
         f"Frontend не собран ({FRONTEND_DIST} не существует). "
