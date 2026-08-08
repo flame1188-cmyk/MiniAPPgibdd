@@ -48,6 +48,16 @@ def stub_db_not_ready(monkeypatch):
 
 
 @pytest.fixture
+def stub_db_ready(monkeypatch):
+    """DB готова — но pool=None (тесты используют monkeypatched clusters_cache,
+    который не вызывает реальный pool, так что pool не нужен)."""
+    fake_db = types.ModuleType("connection")
+    fake_db.is_db_ready = lambda: True
+    fake_db.get_pool = lambda: None
+    monkeypatch.setitem(sys.modules, "backend.db.connection", fake_db)
+
+
+@pytest.fixture
 def stub_clusters_cache(monkeypatch):
     """Подменяет db.clusters_cache — всегда cache miss."""
     fake_cc = types.ModuleType("clusters_cache")
@@ -421,6 +431,199 @@ class TestStartClustersCalculation:
         # Camera_match должен быть установлен stub'ом enrich
         assert task.raw_clusters[0].get("camera_match") is not None
         assert task.raw_clusters[0]["camera_match"]["count"] == 1
+
+
+# ============================================================
+# Sprint 3.2: clusters_cache recovery (raw_clusters=None → recompute)
+# ============================================================
+class TestSprint32ClustersCacheRecovery:
+    """Sprint 3.2 — фикс простой карты для старых задач.
+
+    Сценарий: пользователь открывает старую задачу (созданную до Stage 4
+    fix, когда raw_clusters не сохранялся в clusters_cache). Cache HIT
+    возвращает result, но raw_clusters=None. Без Sprint 3.2 карта падает
+    в simple map (без слоёв/попапов), Excel возвращает None.
+
+    Фикс: при cache HIT с raw_clusters=None игнорируем кэш и пересчитываем,
+    после чего put_cached_clusters сохраняет уже полную запись (с raw).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_without_raw_triggers_recompute(
+        self, monkeypatch, clear_in_memory_tasks, stub_repository,
+        stub_db_ready, stub_excel_cache, tmp_path,
+    ):
+        """Cache HIT, но raw_clusters=None → игнор кэша, пересчёт.
+
+        Проверяем, что:
+        1. Кэш вернул result с total_clusters=5
+        2. Но т.к. raw_clusters=None, идёт пересчёт
+        3. После пересчёта: total_clusters=1 (от concentration stub),
+           raw_clusters заполнены
+        4. put_cached_clusters вызван с новыми raw_clusters
+        """
+        from backend.services import gibdd_service
+
+        monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
+        # Stub clusters_cache: cache HIT, но БЕЗ raw_clusters (старая запись)
+        fake_cc = types.ModuleType("clusters_cache")
+        cached_no_raw = {
+            "result": {
+                "total_clusters": 5,  # в кэше было 5 очагов
+                "total_lost": 0, "total_prev_matched": 0,
+                "total_preclusters": 0,
+                "current_total_dtp": 50, "current_deaths": 1, "current_injured": 10,
+                "dynamics": {"new": 5},
+                "clusters": [], "preclusters": [],
+                "has_prev_data": False, "prev_label": None,
+                "current_label": "Май 2025", "region_name": "Рег",
+            },
+            "raw_clusters": None,  # ← главная причина Sprint 3.2
+            "raw_preclusters": None,
+        }
+        put_calls = []
+        async def fake_get(**kw): return cached_no_raw
+        async def fake_put(**kw):
+            put_calls.append(kw)
+            return None
+        fake_cc.get_cached_clusters = fake_get
+        fake_cc.put_cached_clusters = fake_put
+        monkeypatch.setitem(sys.modules, "backend.db.clusters_cache", fake_cc)
+
+        # Stub concentration_points: вернёт 1 очаг (а не 5 из кэша)
+        clusters = [_make_cluster(road="ул. Пересчёта", total_accidents=5)]
+        _install_clusters_stubs(monkeypatch, clusters=clusters)
+
+        task = gibdd_service.create_task(
+            user_id=1, region_code="1101", region_name="Рег",
+            period_label="Май 2025", dat_list=["5.2025"], raw_query="q",
+        )
+        task.cards = make_minimal_cards(3)
+
+        await gibdd_service.start_clusters_calculation(task)
+
+        state = task.clusters_state
+        assert state.status == gibdd_service.AnalysisStatus.DONE
+        # Пересчёт дал 1 очаг (не 5 из кэша)
+        assert state.result["total_clusters"] == 1, (
+            f"Expected 1 (recomputed), got {state.result['total_clusters']}"
+        )
+        # raw_clusters заполнены пересчётом
+        assert len(task.raw_clusters) == 1
+        # PUT вызван с новыми raw_clusters
+        assert len(put_calls) == 1
+        assert put_calls[0].get("raw_clusters") is not None
+        assert len(put_calls[0]["raw_clusters"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_with_raw_uses_cache_no_recompute(
+        self, monkeypatch, clear_in_memory_tasks, stub_repository,
+        stub_db_ready, stub_excel_cache, tmp_path,
+    ):
+        """Cache HIT с raw_clusters → кэш используется, без пересчёта.
+
+        Это проверка, что Sprint 3.2 фикс не сломал штатный cache hit.
+        concentration_points НЕ должен вызываться.
+        """
+        from backend.services import gibdd_service
+
+        monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
+        # Stub clusters_cache: cache HIT С raw_clusters (новая запись)
+        fake_cc = types.ModuleType("clusters_cache")
+        cached_full = {
+            "result": {
+                "total_clusters": 3,  # в кэше 3 очага
+                "total_lost": 0, "total_prev_matched": 0,
+                "total_preclusters": 0,
+                "current_total_dtp": 30, "current_deaths": 0, "current_injured": 5,
+                "dynamics": {"new": 3},
+                "clusters": [], "preclusters": [],
+                "has_prev_data": False, "prev_label": None,
+                "current_label": "Май 2025", "region_name": "Рег",
+            },
+            "raw_clusters": [{"road": "ул. ИзКэша", "cards": []}],  # есть raw!
+            "raw_preclusters": None,
+        }
+        async def fake_get(**kw): return cached_full
+        async def fake_put(**kw): return None
+        fake_cc.get_cached_clusters = fake_get
+        fake_cc.put_cached_clusters = fake_put
+        monkeypatch.setitem(sys.modules, "backend.db.clusters_cache", fake_cc)
+
+        # Stub concentration_points — должен НЕ вызываться
+        conc_called = []
+        clusters = [_make_cluster(road="ул. НЕдолжноБыть", total_accidents=99)]
+        stubs = _install_clusters_stubs(monkeypatch, clusters=clusters)
+        # Перехватываем calculate_concentration_dynamics
+        original_calc = stubs["concentration_points"].calculate_concentration_dynamics
+        async def spy_calc(*a, **kw):
+            conc_called.append(True)
+            return await original_calc(*a, **kw)
+        stubs["concentration_points"].calculate_concentration_dynamics = spy_calc
+
+        task = gibdd_service.create_task(
+            user_id=1, region_code="1101", region_name="Рег",
+            period_label="Май 2025", dat_list=["5.2025"], raw_query="q",
+        )
+        task.cards = make_minimal_cards(3)
+
+        await gibdd_service.start_clusters_calculation(task)
+
+        state = task.clusters_state
+        assert state.status == gibdd_service.AnalysisStatus.DONE
+        # Кэш вернул 3 очага (не пересчитано в 1)
+        assert state.result["total_clusters"] == 3
+        # raw_clusters восстановлены из кэша
+        assert len(task.raw_clusters) == 1
+        assert task.raw_clusters[0]["road"] == "ул. ИзКэша"
+        # concentration_points НЕ вызывался
+        assert conc_called == [], (
+            f"concentration_points called {len(conc_called)} times — "
+            f"cache should have been used"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_proceeds_normal_calculation(
+        self, monkeypatch, clear_in_memory_tasks, stub_repository,
+        stub_db_ready, stub_excel_cache, tmp_path,
+    ):
+        """Cache MISS → штатный расчёт через concentration_points.
+
+        Регрессионный тест: Sprint 3.2 фикс не должен ломать cache miss.
+        """
+        from backend.services import gibdd_service
+
+        monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
+
+        # Stub clusters_cache: cache MISS (возвращает None)
+        fake_cc = types.ModuleType("clusters_cache")
+        async def fake_get(**kw): return None
+        async def fake_put(**kw): return None
+        fake_cc.get_cached_clusters = fake_get
+        fake_cc.put_cached_clusters = fake_put
+        monkeypatch.setitem(sys.modules, "backend.db.clusters_cache", fake_cc)
+
+        clusters = [_make_cluster(road="ул. Новая", total_accidents=3)]
+        _install_clusters_stubs(monkeypatch, clusters=clusters)
+
+        task = gibdd_service.create_task(
+            user_id=1, region_code="1101", region_name="Рег",
+            period_label="Май 2025", dat_list=["5.2025"], raw_query="q",
+        )
+        task.cards = make_minimal_cards(2)
+
+        await gibdd_service.start_clusters_calculation(task)
+
+        state = task.clusters_state
+        assert state.status == gibdd_service.AnalysisStatus.DONE
+        assert state.result["total_clusters"] == 1
+        assert len(task.raw_clusters) == 1
+        assert task.raw_clusters[0]["road"] == "ул. Новая"
 
 
 # ============================================================
