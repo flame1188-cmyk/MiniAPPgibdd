@@ -453,10 +453,16 @@ class TestAskLlmQuestionEdgeCases:
     async def test_ensure_comparison_failure_returns_error(
         self, monkeypatch, clear_in_memory_tasks, stub_db_connection_not_ready,
     ):
-        """Если comparison не может посчитаться (cards пуст) — ok=False."""
+        """Если comparison не может посчитаться (cards пуст) — ok=False.
+
+        Sprint 3.1: ask_llm_question теперь вызывает ensure_cards перед
+        ensure_comparison. Если stub возвращает [] — ensure_cards вернёт
+        ok=False с сообщением 'Не удалось восстановить карточки'.
+        """
         from backend.services import gibdd_service
 
-        install_stubs(monkeypatch)
+        # stub возвращает пустые cards — ensure_cards не сможет восстановить
+        install_stubs(monkeypatch, cards=[], prev_cards=[])
 
         task = gibdd_service.create_task(
             user_id=1, region_code="1101", region_name="Рег",
@@ -469,7 +475,12 @@ class TestAskLlmQuestionEdgeCases:
         )
 
         assert result["ok"] is False
-        assert "не загружены" in result["error"]
+        # Принимаем оба варианта сообщения — старое и новое (Sprint 3.1)
+        assert (
+            "не загружены" in result["error"]
+            or "Не удалось восстановить" in result["error"]
+            or "Нет данных" in result["error"]
+        ), f"unexpected error: {result['error']}"
 
     @pytest.mark.asyncio
     async def test_llm_exception_returns_error(

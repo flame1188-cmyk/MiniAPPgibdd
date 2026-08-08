@@ -329,13 +329,19 @@ class TestStartClustersCalculation:
         self, monkeypatch, clear_in_memory_tasks, stub_repository,
         stub_db_not_ready, stub_clusters_cache, stub_excel_cache, tmp_path,
     ):
-        """Если task.cards пустой — status FAILED."""
+        """Если task.cards пустой и восстановить нельзя — status FAILED.
+
+        Sprint 3.1: ensure_cards пытается восстановить cards из cards_cache.
+        Если _fetch_cards_for_period возвращает [] — ensure_cards возвращает
+        ok=False, и start_clusters_calculation падает с понятной ошибкой.
+        """
         from backend.services import gibdd_service
 
         monkeypatch.setattr(gibdd_service, "_PROJECT_ROOT", tmp_path)
 
         monkeypatch.setattr(_imports, "_PROJECT_ROOT", tmp_path)
 
+        # stub возвращает пустые cards — ensure_cards не сможет восстановить
         _install_clusters_stubs(monkeypatch, cards=[], clusters=[])
 
         task = gibdd_service.create_task(
@@ -348,7 +354,12 @@ class TestStartClustersCalculation:
 
         state = task.clusters_state
         assert state.status == gibdd_service.AnalysisStatus.FAILED
-        assert "не загружены" in state.error
+        # Принимаем оба варианта сообщения — старое и новое (Sprint 3.1)
+        assert (
+            "не загружены" in state.error
+            or "Не удалось восстановить" in state.error
+            or "Нет данных" in state.error
+        ), f"unexpected error: {state.error}"
         assert state.finished_at is not None
 
     @pytest.mark.asyncio

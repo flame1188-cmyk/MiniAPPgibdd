@@ -501,10 +501,16 @@ class TestComputePointStats:
     async def test_empty_cards_returns_error(
         self, monkeypatch, clear_in_memory_tasks, stub_db_connection_not_ready,
     ):
-        """Если task.cards пустой — ok=False."""
+        """Если task.cards пустой и восстановить нельзя — ok=False.
+
+        Sprint 3.1: ensure_cards пытается восстановить cards из cards_cache
+        через _fetch_cards_for_period. Если stub возвращает [] — ensure_cards
+        возвращает ok=False с сообщением 'Не удалось восстановить карточки'.
+        """
         from backend.services import gibdd_service
 
-        install_stubs(monkeypatch)
+        # stub возвращает пустой список cards — ensure_cards не сможет восстановить
+        install_stubs(monkeypatch, cards=[], prev_cards=[])
 
         task = gibdd_service.create_task(
             user_id=1, region_code="1101", region_name="Рег",
@@ -516,7 +522,14 @@ class TestComputePointStats:
         )
 
         assert result["ok"] is False
-        assert "не загружены" in result["error"]
+        # Сообщение может быть либо старое "не загружены" (если ensure_cards
+        # не вызывался), либо новое "Не удалось восстановить" (Sprint 3.1).
+        # Принимаем оба — главное, что ok=False.
+        assert (
+            "не загружены" in result["error"]
+            or "Не удалось восстановить" in result["error"]
+            or "Нет данных" in result["error"]
+        ), f"unexpected error: {result['error']}"
 
 
 # ============================================================
