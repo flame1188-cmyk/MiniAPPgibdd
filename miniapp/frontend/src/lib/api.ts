@@ -527,18 +527,22 @@ async function consumeSSE(
 
       buffer += decoder.decode(value, { stream: true })
 
-      // Режем буфер по двойному \n (разделитель SSE-событий).
-      // Каждое событие может состоять из нескольких строк (event:, data:),
-      // заканчивается пустой строкой.
-      let sepIdx: number
-      while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
-        const rawEvent = buffer.slice(0, sepIdx)
-        buffer = buffer.slice(sepIdx + 2)
+      // Режем буфер по разделителю SSE-событий.
+      // SSE spec допускает три разделителя: "\n\n", "\r\n\r\n", "\r\r".
+      // sse_starlette по умолчанию использует "\r\n" → разделитель "\r\n\r\n".
+      // Sprint 4 FIX: используем regex /\r?\n\r?\n/ — покрывает и \n\n, и \r\n\r\n.
+      // Раньше был indexOf('\n\n'), который НЕ находил \r\n\r\n —
+      // frontend не парсил events, chunks копились в буфере до конца стрима.
+      let match: RegExpExecArray | null
+      const SSE_EVENT_SEP = /\r?\n\r?\n/
+      while ((match = SSE_EVENT_SEP.exec(buffer)) !== null) {
+        const rawEvent = buffer.slice(0, match.index)
+        buffer = buffer.slice(match.index + match[0].length)
 
         // Парсим событие
         let eventType = 'message'
         let dataLines: string[] = []
-        for (const line of rawEvent.split('\n')) {
+        for (const line of rawEvent.split(/\r?\n/)) {
           if (line.startsWith('event:')) {
             eventType = line.slice(6).trim()
           } else if (line.startsWith('data:')) {
