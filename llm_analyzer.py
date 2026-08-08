@@ -18,7 +18,7 @@ import io
 import json
 import logging
 import time
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 
 import httpx
 
@@ -2130,6 +2130,273 @@ async def _do_llm_request(
     return content
 
 
+# ============================================================
+# Sprint 4: Streaming LLM (SSE)
+# ============================================================
+# ask_llm_stream() — async generator, yields content deltas (token-by-token).
+# Использует OpenAI-совместимый streaming protocol:
+#   - payload: {..., "stream": true}
+#   - response: SSE-поток `data: {json}\n\n`, финальный `data: [DONE]\n\n`
+#   - каждый chunk: choices[0].delta.content (может быть пустым)
+#
+# ВНИМАНИЕ: streaming НЕ делает ретраев внутри потока —
+# retry на 429/5xx ДО начала потока OK, но как только первый chunk
+# получен, мы коммитимся к этому ответу. Если упало в середине —
+# пользователь видит partial-ответ + error event.
+#
+# Semaphore (_LLM_SEMAPHORE в llm_ops) — НЕ здесь, на уровне выше,
+# чтобы подготовка промпта (comparison, cross_tables) шла без слота.
+# Здесь — только HTTP-stream к LLM.
+
+async def ask_llm_stream(
+    user_message: str,
+    system_prompt: str | None = None,
+    provider: LLMProvider = "free",
+    history: list[dict[str, str]] | None = None,
+    temperature: float = 0.7,
+) -> AsyncIterator[str]:
+    """
+    Streaming-версия ask_llm: асинхронный генератор, yields текстовые
+    дельты по мере их поступления от LLM.
+
+    Семантика:
+      - До первого yield: может упасть с httpx.HTTPStatusError (429/5xx/4xx)
+        или ValueError (нет API-ключа). Caller должен решить, как это показать.
+      - После первого yield: при ошибке потока (обрыв соединения, невалидный
+        chunk) логируем warning и завершаем генератор. Partial-результат
+        остаётся у caller'а.
+      - Нормальное завершение: генератор просто выходит (StopAsyncIteration).
+
+    НЕ делает ретраев. НЕ кэширует. НЕ обновляет state (это на caller'е).
+
+    Args идентичны ask_llm(), кроме max_retries — его нет (см. выше).
+    """
+    if provider == "paid":
+        async for delta in _ask_llm_stream_paid(
+            user_message, system_prompt, history, temperature,
+        ):
+            yield delta
+        return
+    async for delta in _ask_llm_stream_free(
+        user_message, system_prompt, history, temperature,
+    ):
+        yield delta
+
+
+async def _build_stream_messages(
+    system_prompt: str | None,
+    default_system_prompt: str,
+    user_message: str,
+    history: list[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    """Собирает messages: system + история + новый вопрос (shared helper)."""
+    if system_prompt is None:
+        system_prompt = default_system_prompt
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt},
+    ]
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_message})
+    return messages
+
+
+async def _ask_llm_stream_free(
+    user_message: str,
+    system_prompt: str | None,
+    history: list[dict[str, str]] | None,
+    temperature: float,
+) -> AsyncIterator[str]:
+    """Streaming-запрос к бесплатному провайдеру (ZhipuAI/GLM)."""
+    if not LLM_API_KEY:
+        raise ValueError(
+            "LLM_API_KEY не задан. Добавьте его в .env файл. "
+            "Получить ключ: https://open.bigmodel.cn"
+        )
+
+    messages = await _build_stream_messages(
+        system_prompt, SYSTEM_PROMPT, user_message, history,
+    )
+    payload = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 8192,
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+
+    async for delta in _do_llm_stream_request(
+        api_url=ZHIPU_API_URL,
+        headers=headers,
+        payload=payload,
+        model_name=LLM_MODEL,
+        prompt_len=len(user_message),
+        client_getter=_get_free_llm_client,
+    ):
+        yield delta
+
+
+async def _ask_llm_stream_paid(
+    user_message: str,
+    system_prompt: str | None,
+    history: list[dict[str, str]] | None,
+    temperature: float,
+) -> AsyncIterator[str]:
+    """Streaming-запрос к платному провайдеру (OpenAI-compatible)."""
+    if not LLM_PAID_API_KEY:
+        raise ValueError("LLM_PAID_API_KEY не задан. Добавьте его в .env файл.")
+
+    base_url = LLM_PAID_API_URL.rstrip("/")
+    api_url = f"{base_url}/chat/completions"
+
+    messages = await _build_stream_messages(
+        system_prompt, SYSTEM_PROMPT_PAID, user_message, history,
+    )
+    payload = {
+        "model": LLM_PAID_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 8192,
+        "stream": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {LLM_PAID_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
+
+    async for delta in _do_llm_stream_request(
+        api_url=api_url,
+        headers=headers,
+        payload=payload,
+        model_name=LLM_PAID_MODEL,
+        prompt_len=len(user_message),
+        client_getter=_get_paid_llm_client,
+    ):
+        yield delta
+
+
+async def _do_llm_stream_request(
+    api_url: str,
+    headers: dict,
+    payload: dict,
+    model_name: str,
+    prompt_len: int,
+    client_getter,
+) -> AsyncIterator[str]:
+    """
+    Универсальный streaming-вызов LLM API.
+    Парсит SSE-ответ OpenAI-совместимого формата.
+
+    НЕ делает ретраев. Если первый байт получен и потом поток оборвался —
+    логируем и завершаемся (caller сохранит partial-результат).
+    """
+    # --- Глобальный rate limiter (один раз до запроса) ---
+    global _last_llm_call_time
+    now = time.monotonic()
+    elapsed_since_last = now - _last_llm_call_time
+    if elapsed_since_last < _MIN_LLM_INTERVAL and _last_llm_call_time > 0:
+        cooldown = _MIN_LLM_INTERVAL - elapsed_since_last
+        logger.info(f"Rate limiter (stream): ждём {cooldown:.0f} сек перед LLM-вызовом...")
+        await asyncio.sleep(cooldown)
+
+    msgs_count = len(payload.get("messages", []))
+    logger.info(
+        f"LLM stream запрос: модель={model_name}, url={api_url}, "
+        f"user_msg_len={prompt_len}, messages={msgs_count}"
+    )
+
+    client = client_getter()
+    # stream=True → httpx не скачивает тело сразу, отдаёт по chunk'ам
+    # через async with client.stream(...). timeout у клиента уже 300/600 сек.
+    try:
+        async with client.stream(
+            "POST", api_url, headers=headers, json=payload,
+        ) as response:
+            # Проверяем статус ДО чтения потока.
+            # 4xx/5xx — тело может содержать JSON с ошибкой, читаем его целиком.
+            if response.status_code != 200:
+                body_text = ""
+                try:
+                    async for chunk in response.aiter_bytes():
+                        body_text += chunk.decode("utf-8", errors="replace")
+                        if len(body_text) > 2000:
+                            break
+                except Exception:
+                    pass
+                _last_llm_call_time = time.monotonic()
+                err_preview = body_text[:300] if body_text else response.reason_phrase
+                logger.error(
+                    f"LLM stream: HTTP {response.status_code} "
+                    f"({response.reason_phrase}): {err_preview}"
+                )
+                raise httpx.HTTPStatusError(
+                    f"LLM stream API вернул {response.status_code}: {err_preview}",
+                    request=response.request,
+                    response=response,
+                )
+
+            # 200 OK — стримим SSE-чанки
+            _last_llm_call_time = time.monotonic()
+            chunks_emitted = 0
+            total_chars = 0
+
+            async for line in response.aiter_lines():
+                # SSE-формат: строки вида "data: {...}" разделены пустой строкой.
+                # aiter_lines уже убирает \n, но пустые строки остаются как "".
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    # Комментарий (":keep-alive") или что-то странное — игнорируем
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    logger.info(
+                        f"LLM stream done: chunks={chunks_emitted}, "
+                        f"chars={total_chars}"
+                    )
+                    return
+                # Парсим JSON-чанк
+                try:
+                    chunk_json = json.loads(data_str)
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"LLM stream: невалидный JSON chunk ({e}): "
+                        f"{data_str[:120]}"
+                    )
+                    continue
+                choices = chunk_json.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                content_piece = delta.get("content") or ""
+                if content_piece:
+                    chunks_emitted += 1
+                    total_chars += len(content_piece)
+                    yield content_piece
+
+    except httpx.HTTPStatusError:
+        raise
+    except httpx.TimeoutException as e:
+        logger.error(f"LLM stream: timeout ({e})")
+        raise
+    except Exception:
+        # Обрыв соединения посреди потока — логируем и завершаем.
+        # Если уже что-то yielded — caller сохранит partial. Если ничего —
+        # caller увидит пустой результат.
+        logger.exception("LLM stream: обрыв соединения посреди потока")
+        return
+
+
 async def get_ai_summary(
     comparison: dict[str, Any],
     reg_name: str,
@@ -2263,3 +2530,118 @@ async def get_ai_answer(
         history=history,
         temperature=0.3,
     )
+
+
+# ============================================================
+# Sprint 4: Streaming-обёртки для get_ai_summary / get_ai_answer
+# ============================================================
+# Те же prompt builders, но вызывают ask_llm_stream() вместо ask_llm().
+# Возвращают AsyncIterator[str] — дельты контента по мере поступления.
+# Caller (llm_ops) отвечает за:
+#   - semaphore (acquire до вызова)
+#   - сохранение результата в state/history
+#   - кэширование (для summary)
+
+async def get_ai_summary_stream(
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+    raw_supplement: str = "",
+    news_context: str = "",
+    clusters_context: str = "",
+    cross_tables_context: str = "",
+    provider: LLMProvider = "free",
+    current_cards: list[dict[str, Any]] | None = None,
+    prev_cards: list[dict[str, Any]] | None = None,
+) -> AsyncIterator[str]:
+    """
+    Streaming-версия get_ai_summary: yields дельты резюме по мере
+    поступления от LLM.
+
+    Семантика идентична ask_llm_stream() — до первого yield может упасть
+    с HTTPStatusError (429/5xx/4xx), после — partial при обрыве.
+    """
+    if provider == "paid" and current_cards is not None:
+        logger.info(
+            f"Платный метод (stream): формирую полные данные для LLM "
+            f"(текущий: {len(current_cards)} ДТП, "
+            f"прошлый: {len(prev_cards) if prev_cards else 0} ДТП)"
+        )
+        current_full_data = format_full_data_as_csv(current_cards, current_label)
+        prev_full_data = ""
+        if prev_cards:
+            prev_full_data = format_full_data_as_csv(prev_cards, prev_label)
+        logger.info(
+            f"Платный метод (stream): данные текущего = {len(current_full_data)} симв., "
+            f"предыдущего = {len(prev_full_data)} символ."
+        )
+        prompt = build_paid_summary_prompt(
+            comparison, reg_name, current_label, prev_label,
+            current_full_data=current_full_data,
+            prev_full_data=prev_full_data,
+            news_context=news_context,
+            clusters_context=clusters_context,
+        )
+        async for delta in ask_llm_stream(
+            user_message=prompt, provider=provider,
+        ):
+            yield delta
+        return
+
+    # Бесплатный метод
+    prompt = build_summary_prompt(
+        comparison, reg_name, current_label, prev_label,
+        raw_supplement=raw_supplement,
+        news_context=news_context,
+        clusters_context=clusters_context,
+        cross_tables_context=cross_tables_context,
+    )
+    async for delta in ask_llm_stream(
+        user_message=prompt, provider=provider,
+    ):
+        yield delta
+
+
+async def get_ai_answer_stream(
+    question: str,
+    comparison: dict[str, Any],
+    reg_name: str,
+    current_label: str,
+    prev_label: str,
+    raw_supplement: str = "",
+    news_context: str = "",
+    clusters_context: str = "",
+    cross_tables_context: str = "",
+    provider: LLMProvider = "free",
+    history: list[dict[str, str]] | None = None,
+) -> AsyncIterator[str]:
+    """
+    Streaming-версия get_ai_answer: yields дельты ответа по мере
+    поступления от LLM. Используется для Q&A в реальном времени.
+    """
+    prompt = build_question_prompt(
+        question, comparison, reg_name, current_label, prev_label,
+        raw_supplement=raw_supplement,
+        news_context=news_context,
+        clusters_context=clusters_context,
+        cross_tables_context=cross_tables_context,
+    )
+
+    if history:
+        prompt = (
+            "[ПРОДОЛЖЕНИЕ ДИАЛОГА]\n"
+            "Выше приведены предыдущие вопросы пользователя и твои ответы. "
+            "Учитывай их при ответе на текущий вопрос — не противоречь, "
+            "опирайся на уже сказанное, для follow-up раскрывай новые аспекты.\n\n"
+            + prompt
+        )
+
+    async for delta in ask_llm_stream(
+        user_message=prompt,
+        provider=provider,
+        history=history,
+        temperature=0.3,
+    ):
+        yield delta
+
