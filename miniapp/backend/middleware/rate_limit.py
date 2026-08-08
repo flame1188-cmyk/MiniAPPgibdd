@@ -13,6 +13,14 @@ Rate limiting для Mini App API (Фаза 1.5).
 
 Реализация через slowapi (Limiter на базе in-memory sliding window).
 Для multi-instance деплоя — заменить на Redis-backed limiter.
+
+⚠️ Sprint 4 FIX: переписано как PURE ASGI middleware.
+   Предыдущая версия использовала `app.middleware("http")` (BaseHTTPMiddleware),
+   который БУФЕРИЗУЕТ streaming responses (SSE/WebSocket). Из-за этого
+   SSE chunks доходили до клиента только после завершения стрима целиком,
+   что ломало Sprint 4 streaming LLM.
+   Pure ASGI middleware НЕ трогает response body — оно просто вызывает
+   downstream app, который сам стримит клиенту.
 """
 from __future__ import annotations
 
@@ -25,6 +33,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -78,23 +87,106 @@ def rate_limit_exempt(path: str) -> bool:
     return False
 
 
-async def rate_limit_middleware(request: Request, call_next: Callable):
-    """ASGI middleware: применяет rate limit ко всем запросам, кроме exempt.
+# ============================================================
+# Sprint 4 FIX: Pure ASGI middleware
+# ============================================================
+# Раньше использовался паттерн `app.middleware("http")(rate_limit_middleware)`
+# с `async def (request, call_next)`. Это BaseHTTPMiddleware, который
+# буферизует streaming responses (SSE/WebSocket) — см.:
+#   https://github.com/encode/starlette/issues/919
+#
+# Pure ASGI middleware НЕ трогает response body: оно просто проверяет
+# rate limit ДО вызова app, и если лимит превышен — возвращает 429.
+# Если лимит OK — просто вызывает downstream app, который сам стримит
+# ответ клиенту без буферизации.
+# ============================================================
 
-    Использование в main.py:
-        from miniapp.backend.middleware.rate_limit import rate_limit_middleware
-        app.middleware("http")(rate_limit_middleware)
+
+class RateLimitASGIMiddleware:
+    """
+    Pure ASGI middleware для rate limiting.
+
+    Не буферизует streaming responses (SSE/WebSocket).
+    Применяет rate limit ко всем запросам, кроме exempt-эндпоинтов.
+
+    Использование:
+        app.add_middleware(RateLimitASGIMiddleware)
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        # Пропускаем non-HTTP запросы (websocket, lifespan)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        # Пропускаем exempt-эндпоинты
+        if rate_limit_exempt(path):
+            await self.app(scope, receive, send)
+            return
+
+        # Создаём Request для совместимости с slowapi
+        # (slowapi ждёт starlette.Request)
+        request = Request(scope, receive=receive)
+
+        # Применяем лимит
+        try:
+            key = _get_user_key(request)
+            limiter._check_request_limit(request, DEFAULT_LIMIT, key, True)
+        except RateLimitExceeded as exc:
+            logger.warning(
+                f"Rate limit exceeded: {key} on {path} — {exc.detail}"
+            )
+            # Возвращаем 429 JSON — это обычный response, не streaming
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "error": "rate_limit_exceeded",
+                    "detail": "Слишком много запросов. Подождите минуту.",
+                    "retry_after_seconds": 60,
+                },
+                headers={
+                    "Retry-After": "60",
+                    "X-RateLimit-Limit": DEFAULT_LIMIT,
+                    "X-RateLimit-Reset": "60",
+                },
+            )
+            await response(scope, receive, send)
+            return
+        except Exception as exc:
+            # Rate limiter не должен ронять запросы — логируем и пропускаем
+            logger.debug(f"Rate limit check skipped: {exc}")
+            await self.app(scope, receive, send)
+            return
+
+        # Лимит OK — пропускаем запрос дальше (БЕЗ буферизации!)
+        await self.app(scope, receive, send)
+
+
+# ============================================================
+# Legacy: оставлено для обратной совместимости со старыми тестами,
+# но в main.py больше НЕ используется.
+# ============================================================
+async def rate_limit_middleware(request: Request, call_next: Callable):
+    """DEPRECATED: BaseHTTPMiddleware-style rate limiter.
+
+    ⚠️ БУФЕРИЗУЕТ streaming responses (SSE) — не использовать!
+    Используйте RateLimitASGIMiddleware через app.add_middleware().
+    Оставлено только для старых тестов, которые импортируют эту функцию.
     """
     path = request.url.path
 
-    # Пропускаем exempt-эндпоинты
     if rate_limit_exempt(path):
         return await call_next(request)
 
-    # Применяем лимит
     try:
         key = _get_user_key(request)
-        # Проверяем лимит через slowapi internal API
         limiter._check_request_limit(request, DEFAULT_LIMIT, key, True)
     except RateLimitExceeded as exc:
         logger.warning(
@@ -114,7 +206,6 @@ async def rate_limit_middleware(request: Request, call_next: Callable):
             },
         )
     except Exception as exc:
-        # Rate limiter не должен ронять запросы — логируем и пропускаем
         logger.debug(f"Rate limit check skipped: {exc}")
         return await call_next(request)
 
