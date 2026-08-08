@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 from . import _imports
 from .models import Task
-from .pipeline import ensure_prev_cards
+from .pipeline import ensure_cards, ensure_prev_cards
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +205,11 @@ async def compute_point_stats(
             "current_label": "...",
         }
     """
-    if not task.cards:
-        return {"ok": False, "error": "Карточки текущего периода не загружены"}
+    # Sprint 3.1: восстанавливаем task.cards из cards_cache, если задача
+    # была выгружена из in-memory LRU или после рестарта.
+    cards_result = await ensure_cards(task)
+    if not cards_result.get("ok"):
+        return {"ok": False, "error": cards_result.get("error")}
 
     point_stats_module = _imports._import_module("point_statistics")
 

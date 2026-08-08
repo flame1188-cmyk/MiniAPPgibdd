@@ -532,3 +532,108 @@ async def ensure_prev_cards(task: Task) -> Dict[str, Any]:
         logger.exception(f"Task {task.id}: ensure_prev_cards failed")
         task.prev_cards_loaded = True  # не пытаемся снова
         return {"ok": False, "error": str(exc)}
+
+
+# ============================================================
+# Sprint 3.1: Восстановление task.cards из cards_cache
+# ============================================================
+async def ensure_cards(task: Task) -> Dict[str, Any]:
+    """
+    Гарантирует, что task.cards загружены.
+
+    Проблема, которую решает эта функция:
+      После рестарта контейнера или LRU eviction задачи из _tasks,
+      тяжёлые поля (cards, prev_cards) теряются. attach_heavy_state()
+      читает из _TASKS_HEAVY_STATE, но это in-memory кэш — после
+      рестарта он пуст. cards_cache (PostgreSQL) при этом может быть
+      жив (TTL=7 дней), но никто его не читает для восстановления
+      task.cards при get_task_async().
+
+      Результат: пользователь открывает старую задачу → task.cards=[]
+      → ensure_comparison падает с "Карточки текущего периода не загружены"
+      → LLM summary / clusters / point stats не работают.
+
+    Решение:
+      Вызывать _fetch_cards_for_period (он сам идёт в cards_cache → HIT,
+      или скачивает заново → PUT в кэш). Это дешёвая операция при cache hit
+      (<50 мс), и она восстанавливает task.cards до рабочего состояния.
+
+    Возвращает:
+        {"ok": True, "cards": [...]}
+        или {"ok": False, "error": "..."}
+    """
+    # Быстрый путь: cards уже есть
+    if task.cards:
+        return {"ok": True, "cards": task.cards}
+
+    # Если задача ещё в статусе FETCHING/PARSING/ANALYTICS — не вмешиваемся,
+    # pipeline.execute_task сам заполнит task.cards. Иначе можем перезаписать
+    # данные в процессе их загрузки.
+    if task.status in (TaskStatus.FETCHING, TaskStatus.PARSING, TaskStatus.ANALYTICS):
+        return {
+            "ok": False,
+            "error": (
+                f"Задача ещё выполняется (статус={task.status.value}), "
+                f"карточки загружаются. Попробуйте через несколько секунд."
+            ),
+        }
+
+    # Если задача упала на этапе выгрузки — нет смысла пытаться снова
+    # (cards всё равно не скачаются). Возвращаем понятную ошибку.
+    if task.status == TaskStatus.FAILED:
+        return {
+            "ok": False,
+            "error": (
+                f"Задача завершилась с ошибкой: {task.error or 'неизвестная'}. "
+                f"Создайте новую задачу для этого региона."
+            ),
+        }
+
+    # Восстанавливаем cards из cards_cache (или скачиваем заново)
+    try:
+        bot_module = _imports._import_module("bot")
+        cards, errors = await bot_module._fetch_cards_for_period(
+            dat_list=task.dat_list,
+            reg_code=task.region_code,
+            log_prefix=f"MiniApp[{task.id}]/restore",
+            cache_result=True,
+        )
+
+        if not cards:
+            return {
+                "ok": False,
+                "error": (
+                    "Не удалось восстановить карточки ДТП. "
+                    f"Ошибки: {'; '.join(errors[:3]) if errors else 'нет данных'}. "
+                    "Создайте новую задачу для этого региона."
+                ),
+            }
+
+        # Восстанавливаем сводные поля (могут быть пустыми после load_task)
+        if not task.total_dtp:
+            task.total_dtp = len(cards)
+            task.total_dead = sum(int(c.get("pog", 0) or 0) for c in cards)
+            task.total_injured = sum(int(c.get("ran", 0) or 0) for c in cards)
+
+        task.cards = cards
+
+        logger.info(
+            f"Task {task.id}: cards restored from cache/API — "
+            f"{len(cards)} ДТП, region={task.region_code}"
+        )
+
+        # Сбрасываем in-memory кэш analytics-расчётов, т.к. id(cards)
+        # изменился. Иначе ensure_comparison может думать, что кэш валиден
+        # (сравнивая id(task.cards) с cross_tables_cards_id), но cards
+        # теперь другой объект.
+        task.cross_tables = None
+        task.cross_tables_cards_id = None
+        task.current_metrics = None
+        task.current_metrics_cards_id = None
+        task.comparison = None  # пересчитать comparison с новыми cards
+
+        return {"ok": True, "cards": task.cards}
+
+    except Exception as exc:
+        logger.exception(f"Task {task.id}: ensure_cards failed")
+        return {"ok": False, "error": str(exc)}

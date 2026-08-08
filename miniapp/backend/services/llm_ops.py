@@ -43,7 +43,7 @@ from typing import Any, Dict
 from . import _imports
 from .analytics_ops import _get_cross_tables, ensure_comparison
 from .models import AnalysisState, AnalysisStatus, Task
-from .pipeline import ensure_prev_cards
+from .pipeline import ensure_cards, ensure_prev_cards
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,17 @@ async def _check_llm_cache(
     cross_tables_ctx = ""
     if provider == "free":
         try:
+            # Sprint 3.1: гарантируем, что task.cards есть, прежде чем
+            # считать cross_tables. Если cache hit был на старой задаче
+            # после рестарта — cards может быть пустым.
+            cards_result = await ensure_cards(task)
+            if not cards_result.get("ok"):
+                logger.warning(
+                    f"Task {task.id}: LLM cache check — ensure_cards failed: "
+                    f"{cards_result.get('error')}"
+                )
+                return False
+
             # Гарантируем comparison (нужно для cross_tables)
             comp_result = await ensure_comparison(task)
             if comp_result.get("ok"):
@@ -335,6 +346,19 @@ async def _run_llm_summary_inner(
             )
 
     state.progress = 10
+    state.stage = "Восстановление данных задачи..."
+    # Sprint 3.1: гарантируем, что task.cards есть (восстанавливаем из
+    # cards_cache, если задача была выгружена из in-memory LRU или
+    # после рестарта контейнера).
+    cards_result = await ensure_cards(task)
+    if not cards_result.get("ok"):
+        raise RuntimeError(
+            cards_result.get(
+                "error",
+                "Не удалось восстановить карточки текущего периода",
+            )
+        )
+
     state.stage = "Загрузка данных за прошлый год..."
     if not task.prev_cards_loaded:
         await ensure_prev_cards(task)
@@ -343,7 +367,15 @@ async def _run_llm_summary_inner(
     state.stage = "Расчёт сравнительных метрик..."
     comp_result = await ensure_comparison(task)
     if not comp_result.get("ok"):
-        raise RuntimeError(comp_result.get("error", "Не удалось рассчитать comparison"))
+        # Sprint 3.1: улучшенное сообщение — объясняем, что делать.
+        err = comp_result.get("error", "Не удалось рассчитать comparison")
+        if "Карточки текущего периода не загружены" in err:
+            err = (
+                "Карточки текущего периода не загружены. "
+                "Возможно, данные устарели в кэше. "
+                "Попробуйте создать новую задачу для этого региона."
+            )
+        raise RuntimeError(err)
     comparison = comp_result["comparison"]
 
     state.progress = 35
@@ -508,6 +540,12 @@ async def ask_llm_question(
         else:
             if not config.LLM_API_KEY:
                 return {"ok": False, "error": "Бесплатный LLM не настроен"}
+
+        # Sprint 3.1: гарантируем, что task.cards есть (восстановление
+        # из cards_cache для старых задач после рестарта).
+        cards_result = await ensure_cards(task)
+        if not cards_result.get("ok"):
+            return {"ok": False, "error": cards_result.get("error")}
 
         # Гарантируем comparison
         comp_result = await ensure_comparison(task)

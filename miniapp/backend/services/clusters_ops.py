@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from . import _imports
 from .models import AnalysisStatus, Task
-from .pipeline import ensure_prev_cards
+from .pipeline import ensure_cards, ensure_prev_cards
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,18 @@ async def start_clusters_calculation(task: Task) -> None:
     state.result = None
 
     try:
-        if not task.cards:
-            raise RuntimeError("Карточки текущего периода не загружены")
+        # Sprint 3.1: восстанавливаем task.cards из cards_cache, если
+        # задача была выгружена из in-memory LRU или после рестарта.
+        # Раньше тут была жёсткая проверка `if not task.cards: raise`
+        # — она стреляла для старых задач.
+        cards_result = await ensure_cards(task)
+        if not cards_result.get("ok"):
+            raise RuntimeError(
+                cards_result.get(
+                    "error",
+                    "Карточки текущего периода не загружены",
+                )
+            )
 
         # === Этап 4: проверяем кэш очагов в PostgreSQL ===
         # Если для данного (reg_code, current_dat, prev_dat) уже есть

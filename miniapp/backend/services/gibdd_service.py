@@ -8,6 +8,7 @@ Facade для service-слоя MiniApp.
                        list_user_tasks, _task_factory, MAX_INMEMORY_TASKS
 - query_ops.py       — parse_user_query, get_regions
 - pipeline.py        — create_task, execute_task, ensure_prev_cards,
+                       ensure_cards (Sprint 3.1: cards recovery),
                        _parse_files_sync, _task_dir, _EXECUTE_SEMAPHORE,
                        MAX_CONCURRENT_TASKS
 - analytics_ops.py   — _get_cross_tables, ensure_comparison, compute_point_stats
@@ -72,6 +73,7 @@ from .pipeline import (
     _parse_files_sync,
     _task_dir,
     create_task,
+    ensure_cards,
     ensure_prev_cards,
     execute_task,
 )
@@ -144,6 +146,7 @@ __all__ = [
     "_parse_files_sync",
     "_task_dir",
     "create_task",
+    "ensure_cards",
     "ensure_prev_cards",
     "execute_task",
     # Analytics
