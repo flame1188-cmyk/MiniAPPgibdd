@@ -59,6 +59,12 @@ pydantic-settings==2.7.1
 # --- Logging ---
 loguru==0.7.3
 
+# --- SSE streaming (Sprint 4) ---
+# sse-starlette — Server-Sent Events для FastAPI.
+# Используется в routers/llm.py для /llm/ask/stream и /llm/summary/stream.
+# Позволяет стримить LLM-ответ token-by-token вместо 30-60 сек блокирующего запроса.
+sse-starlette>=2.0,<4
+
 # ====================================
 # GIBDD Stat Bot — dev dependencies
 # ====================================
