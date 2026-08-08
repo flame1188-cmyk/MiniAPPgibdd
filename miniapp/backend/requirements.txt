@@ -35,3 +35,6 @@ prometheus-fastapi-instrumentator>=7.0.0
 
 # Logging
 loguru==0.7.3
+
+# SSE streaming (Sprint 4) — Server-Sent Events для LLM streaming endpoints
+sse-starlette>=2.0,<4
