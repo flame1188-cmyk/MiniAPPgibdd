@@ -158,8 +158,32 @@ async def start_clusters(
     task = await _require_done_task(task_id, user)
     state = task.clusters_state
 
-    # Если уже выполнено — возвращаем готовое
+    # Если уже выполнено — возвращаем готовое.
+    # НО: Sprint 3.2 — если task.raw_clusters и task.raw_preclusters пусты,
+    # значит кэш восстановил state.result, но без raw-данных (старая запись
+    # без raw_clusters). В этом случае форсируем recompute, иначе карта
+    # упадёт в simple map (без слоёв/попапов), а Excel вернёт None.
     if state.status == AnalysisStatus.DONE:
+        if not task.raw_clusters and not task.raw_preclusters:
+            logger.info(
+                f"Task {task_id}: clusters state=DONE, но raw_clusters/"
+                f"raw_preclusters пусты — форсируем recompute (Sprint 3.2)"
+            )
+            # Сбрасываем state и запускаем расчёт заново.
+            # После пересчёта state.result и raw_clusters заполнятся,
+            # а put_cached_clusters обновит запись в clusters_cache
+            # (теперь уже с raw_clusters). Следующий запрос вернёт DONE
+            # без recompute.
+            state.status = AnalysisStatus.IDLE
+            state.progress = 0
+            state.stage = "Запуск..."
+            state.started_at = None
+            state.finished_at = None
+            state.result = None
+            # raw_clusters/raw_preclusters и так пустые
+            loop = asyncio.get_running_loop()
+            loop.create_task(start_clusters_calculation(task))
+            return ClustersResponse(state=_state_to_response(state))
         return ClustersResponse(
             state=_state_to_response(state),
             result=_clusters_result_to_response(state.result),
