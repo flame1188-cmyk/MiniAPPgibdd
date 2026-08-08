@@ -74,36 +74,49 @@ async def start_clusters_calculation(task: Task) -> None:
                 prev_dat_list=prev_dat_list_for_cache if prev_dat_list_for_cache else None,
             )
             if cached is not None:
-                # Кэш хит — подставляем result и выходим.
-                # Если в кэше есть raw_clusters / raw_preclusters —
-                # восстанавливаем их тоже, иначе карта/Excel упадут в fallback.
+                # Кэш хит. Если в кэше есть raw_clusters / raw_preclusters —
+                # восстанавливаем их и выходим (15-30 сек → <100 мс).
+                # Если они None (старая запись, созданная до Stage 4 fix,
+                # когда raw_clusters не сохранялся) — игнорируем кэш и идём
+                # штатным путём, иначе карта упадёт в simple map, а Excel
+                # вернёт None (Sprint 3.2 fix).
                 cached_result = cached["result"]
                 cached_raw_clusters = cached.get("raw_clusters")
                 cached_raw_preclusters = cached.get("raw_preclusters")
 
-                task.clusters_state.result = cached_result
-                task.clusters_state.status = AnalysisStatus.DONE
-                task.clusters_state.progress = 100
-                task.clusters_state.stage = "Готово (из кэша)"
-                task.clusters_state.started_at = datetime.now(timezone.utc)
-                task.clusters_state.finished_at = datetime.now(timezone.utc)
-
-                # Восстанавливаем raw-данные для карты/Excel.
-                # Если они None (старая запись без raw_clusters) — оставляем
-                # пустыми, generate_clusters_map_html сам упадёт в simple map.
-                if cached_raw_clusters is not None:
-                    task.raw_clusters = cached_raw_clusters
-                if cached_raw_preclusters is not None:
-                    task.raw_preclusters = cached_raw_preclusters
-
                 has_raw = bool(cached_raw_clusters or cached_raw_preclusters)
-                logger.info(
-                    f"Task {task.id}: clusters loaded from cache — "
-                    f"{cached_result.get('total_clusters', 0)} очагов, "
-                    f"{cached_result.get('total_preclusters', 0)} предочагов, "
-                    f"raw={'yes' if has_raw else 'no (fallback to simple map)'}"
-                )
-                return
+
+                if not has_raw:
+                    # Старая запись без raw-данных. Протухнет сама по TTL,
+                    # а пока — игнорируем и пересчитываем. После пересчёта
+                    # put_cached_clusters сохранит уже полную запись (с raw).
+                    logger.info(
+                        f"Task {task.id}: clusters cache HIT, но raw_clusters/"
+                        f"raw_preclusters=None (старая запись) — "
+                        f"игнорируем кэш, пересчитываем"
+                    )
+                    # Важно: не выходим из функции, идём к штатному расчёту.
+                else:
+                    task.clusters_state.result = cached_result
+                    task.clusters_state.status = AnalysisStatus.DONE
+                    task.clusters_state.progress = 100
+                    task.clusters_state.stage = "Готово (из кэша)"
+                    task.clusters_state.started_at = datetime.now(timezone.utc)
+                    task.clusters_state.finished_at = datetime.now(timezone.utc)
+
+                    # Восстанавливаем raw-данные для карты/Excel.
+                    if cached_raw_clusters is not None:
+                        task.raw_clusters = cached_raw_clusters
+                    if cached_raw_preclusters is not None:
+                        task.raw_preclusters = cached_raw_preclusters
+
+                    logger.info(
+                        f"Task {task.id}: clusters loaded from cache — "
+                        f"{cached_result.get('total_clusters', 0)} очагов, "
+                        f"{cached_result.get('total_preclusters', 0)} предочагов, "
+                        f"raw=yes"
+                    )
+                    return
         except Exception as exc:
             logger.debug(
                 f"Task {task.id}: clusters cache lookup failed: {exc}"
