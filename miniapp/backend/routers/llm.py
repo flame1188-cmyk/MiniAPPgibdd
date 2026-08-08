@@ -63,6 +63,15 @@ _SSE_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# ⚠️ Sprint 4 FIX: разделитель строк в SSE — "\n" (НЕ дефолтный "\r\n").
+# sse_starlette по умолчанию использует "\r\n", из-за чего events разделяются
+# "\r\n\r\n". Frontend (consumeSSE в api.ts) ищет "\n\n" через indexOf —
+# и НЕ находит, потому что между двумя \n стоит \r. В итоге chunks
+# накапливаются в buffer, но НЕ парсятся — пользователь видит ответ
+# только после завершения стрима целиком. С sep="\n" events разделяются
+# "\n\n", и frontend корректно парсит их в реальном времени.
+_SSE_SEP = "\n"
+
 
 # ============================================================
 # Schemas
@@ -377,6 +386,7 @@ async def ask_llm_stream(
         ping=_SSE_PING_INTERVAL_SEC,
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
+        sep=_SSE_SEP,  # Sprint 4 FIX: "\n" вместо дефолтного "\r\n"
     )
 
 
@@ -446,4 +456,5 @@ async def llm_summary_stream(
         ping=_SSE_PING_INTERVAL_SEC,
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
+        sep=_SSE_SEP,  # Sprint 4 FIX: "\n" вместо дефолтного "\r\n"
     )
