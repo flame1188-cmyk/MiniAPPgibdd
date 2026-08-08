@@ -431,6 +431,31 @@ app.mount("/api", miniapp_app)
 
 
 # ============================================================
+# Sprint 4: диагностическое логирование SSE-эндпоинтов
+# Выводит при старте, зарегистрированы ли /stream маршруты,
+# чтобы сразу видеть на проде, попал ли Sprint 4 в образ.
+# ============================================================
+try:
+    _sse_routes = []
+    for _route in miniapp_app.routes:
+        _path = getattr(_route, "path", "")
+        if "/stream" in _path and "/llm/" in _path:
+            _methods = ",".join(sorted(getattr(_route, "methods", set()) or set()))
+            _sse_routes.append(f"{_methods} {_path}")
+    if _sse_routes:
+        logger.info(f"Sprint 4: SSE endpoints registered ({len(_sse_routes)}):")
+        for _r in _sse_routes:
+            logger.info(f"  SSE: {_r}")
+    else:
+        logger.warning(
+            "Sprint 4: SSE endpoints NOT registered! "
+            "Проверьте miniapp/backend/routers/llm.py и sse-starlette в requirements.txt"
+        )
+except Exception as _e:
+    logger.warning(f"Sprint 4: SSE diagnostic failed: {_e}")
+
+
+# ============================================================
 # Webhook для Telegram
 # ============================================================
 @app.post(WEBHOOK_PATH)
