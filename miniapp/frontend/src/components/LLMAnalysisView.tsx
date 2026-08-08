@@ -260,6 +260,21 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                   },
                   ...prev,
                 ])
+                return null
+              }
+              // Fallback: если answer пустой (proxy буферизовал stream и
+              // deltas не дошли до frontend), но сервер уже сохранил ответ
+              // в qa-history — запросим его через REST API.
+              if (final) {
+                api.getQAHistory(task.task_id).then((history) => {
+                  if (history.length > 0) {
+                    const latest = history[0]
+                    setQaHistory((prev) => [latest, ...prev])
+                  }
+                }).catch(() => {
+                  // Если и fallback не сработал — показываем ошибку
+                  setQaError('Ответ не получен. Попробуйте ещё раз или смените провайдера.')
+                })
               }
               return null
             })
