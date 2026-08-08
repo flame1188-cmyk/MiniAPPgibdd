@@ -442,6 +442,145 @@ export interface NpBddFrozenYear {
 // ============================================================
 // API methods
 // ============================================================
+
+/**
+ * Sprint 4: Универсальный SSE-клиент через fetch + ReadableStream.
+ *
+ * Почему НЕ EventSource:
+ *  - EventSource не умеет передавать кастомные заголовки (нужен X-Tg-Init-Data)
+ *  - EventSource поддерживает только GET (наш /ask/stream — POST)
+ *  - EventSource авто-реконнектит, что плохо для стриминга LLM (дубликат ответов)
+ *
+ * Формат SSE, который мы парсим:
+ *   event: delta\n
+ *   data: текст токена\n
+ *   \n
+ *   event: done\n
+ *   data: \n
+ *   \n
+ *   event: error\n
+ *   data: {"error":"сообщение"}\n
+ *   \n
+ *   event: ping\n
+ *   data: \n
+ *   \n
+ *
+ * Поддерживает partial-чанки (TCP-фрагментация): накапливаем буфер,
+ * режем по двойному \n\n (разделитель SSE-событий).
+ */
+async function consumeSSE(
+  path: string,
+  body: Record<string, unknown>,
+  handlers: {
+    onDelta: (text: string) => void
+    onDone?: () => void
+    onError?: (err: string) => void
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const initData = getInitData()
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'X-Tg-Init-Data': initData,
+    Accept: 'text/event-stream',
+  })
+
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return
+    handlers.onError?.(err?.message ?? 'Ошибка соединения')
+    return
+  }
+
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`
+    try {
+      const errBody = await response.json()
+      detail = errBody?.detail ?? detail
+    } catch {
+      // не JSON
+    }
+    handlers.onError?.(detail)
+    return
+  }
+
+  if (!response.body) {
+    handlers.onError?.('Потоковый ответ не поддерживается')
+    return
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // Режем буфер по двойному \n (разделитель SSE-событий).
+      // Каждое событие может состоять из нескольких строк (event:, data:),
+      // заканчивается пустой строкой.
+      let sepIdx: number
+      while ((sepIdx = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, sepIdx)
+        buffer = buffer.slice(sepIdx + 2)
+
+        // Парсим событие
+        let eventType = 'message'
+        let dataLines: string[] = []
+        for (const line of rawEvent.split('\n')) {
+          if (line.startsWith('event:')) {
+            eventType = line.slice(6).trim()
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).replace(/^ /, ''))
+          }
+          // строки, начинающиеся с ':' — комментарии (heartbeat), игнорируем
+        }
+        const data = dataLines.join('\n')
+
+        if (eventType === 'delta') {
+          handlers.onDelta(data)
+        } else if (eventType === 'done') {
+          handlers.onDone?.()
+          return
+        } else if (eventType === 'error') {
+          let errMsg = data
+          try {
+            const parsed = JSON.parse(data)
+            errMsg = parsed?.error ?? data
+          } catch {
+            // не JSON — оставляем как есть
+          }
+          handlers.onError?.(errMsg)
+          return
+        }
+        // event: ping — игнорируем (heartbeat)
+      }
+    }
+    // Поток закончился без явного done event — считаем, что всё OK
+    handlers.onDone?.()
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return
+    handlers.onError?.(err?.message ?? 'Ошибка чтения потока')
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // уже освобождён
+    }
+  }
+}
+
 export const api = {
   health: () => request<{ status: string }>('/health'),
 
@@ -598,6 +737,62 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question, provider }),
     }),
+
+  /**
+   * Sprint 4: SSE-стрим ответа на вопрос нейросети.
+   *
+   * Использует fetch + ReadableStream (НЕ EventSource, т.к. EventSource
+   * не умеет передавать кастомные заголовки, а нам нужен X-Tg-Init-Data).
+   *
+   * @param taskId    — ID задачи
+   * @param question  — текст вопроса
+   * @param provider  — 'free' | 'paid'
+   * @param handlers  — { onDelta, onDone, onError }
+   * @param signal    — AbortSignal для отмены (кнопка «Стоп»)
+   * @returns AbortController (вызовите .abort() для отмены)
+   */
+  askLLMStream: (
+    taskId: string,
+    question: string,
+    provider: 'free' | 'paid',
+    handlers: {
+      onDelta: (text: string) => void
+      onDone?: () => void
+      onError?: (err: string) => void
+    },
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    return consumeSSE(
+      `/api/dtp/tasks/${taskId}/llm/ask/stream`,
+      { question, provider },
+      handlers,
+      signal,
+    )
+  },
+
+  /**
+   * Sprint 4: SSE-стрим генерации аналитического резюме.
+   *
+   * Если есть cache hit — сервер эмитит весь текст одним delta и done (мгновенно).
+   * Если cache miss — стримит token-by-token.
+   */
+  getLLMSummaryStream: (
+    taskId: string,
+    provider: 'free' | 'paid',
+    handlers: {
+      onDelta: (text: string) => void
+      onDone?: () => void
+      onError?: (err: string) => void
+    },
+    signal?: AbortSignal,
+  ): Promise<void> => {
+    return consumeSSE(
+      `/api/dtp/tasks/${taskId}/llm/summary/stream`,
+      { provider },
+      handlers,
+      signal,
+    )
+  },
 
   getQAHistory: (taskId: string) =>
     request<QAHistoryItem[]>(`/api/dtp/tasks/${taskId}/llm/qa-history`),

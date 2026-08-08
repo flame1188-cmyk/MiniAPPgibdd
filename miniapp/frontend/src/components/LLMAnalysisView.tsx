@@ -4,17 +4,21 @@
  * Логика:
  *  1. Проверяем доступность провайдеров (free/paid)
  *  2. Пользователь выбирает провайдера (radio)
- *  3. Раздел «Резюме»: кнопка «Сгенерировать» → polling → текст
- *  4. Раздел «Вопрос-ответ»: input + «Спросить» → loading → ответ
- *  5. История вопросов сохраняется на задаче (последние 10)
+ *  3. Раздел «Резюме»: кнопка «Сгенерировать» → SSE-стрим → текст по мере поступления
+ *  4. Раздел «Вопрос-ответ»: input + «Спросить» → SSE-стрим → ответ по мере поступления
+ *  5. История вопросов сохраняется на сервере (последние 10)
+ *
+ * Sprint 4: Q&A и резюме используют SSE-стриминг (token-by-token).
+ *  - Старые JSON-эндпоинты (/llm/ask, /llm/summary) сохранены для совместимости,
+ *    но UI использует только /stream-версии.
+ *  - Кнопка «Стоп» во время стрима — AbortController.
  *
  * UX:
- *  - Резюме кэшируется на задаче (повторное открытие = мгновенно)
- *  - Если сменили провайдера — кнопка «Перегенерировать с <provider>»
+ *  - Резюме кэшируется на сервере (cache hit = мгновенно одним delta)
  *  - Длинный текст разбит на абзацы с переносами
- *  - Подсказки: типичные вопросы (что росло, какие рекомендации и т.д.)
+ *  - Подсказки: типичные вопросы
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import {
   api,
@@ -77,11 +81,26 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
   // первого long-polling ответа (который может идти 25 сек).
   const [starting, setStarting] = useState(false)
 
-  // Вопрос-ответ
+  // === Q&A (Sprint 4: streaming) ===
   const [question, setQuestion] = useState('')
   const [qaLoading, setQaLoading] = useState(false)
   const [qaError, setQaError] = useState<string | null>(null)
   const [qaHistory, setQaHistory] = useState<QAHistoryItem[]>([])
+  // Streaming-ответ, который ещё не сохранён в history.
+  // Показываем его отдельной карточкой с «typing cursor».
+  const [streamingQA, setStreamingQA] = useState<{
+    question: string
+    answer: string
+    provider: 'free' | 'paid'
+  } | null>(null)
+  // AbortController для отмены стрима (кнопка «Стоп»)
+  const qaAbortRef = useRef<AbortController | null>(null)
+
+  // === Summary (Sprint 4: streaming) ===
+  // Streaming-резюме — накапливается по delta.
+  const [streamingSummary, setStreamingSummary] = useState<string>('')
+  const [summaryStreaming, setSummaryStreaming] = useState(false)
+  const summaryAbortRef = useRef<AbortController | null>(null)
 
   // 3 случайных подсказки из полного списка — при каждом монтировании
   // компонента пользователь видит разные, что расширяет охват возможностей
@@ -91,11 +110,13 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     [],
   )
 
-  // Polling для summary
-  const { data: summaryData } = useLLMSummaryPolling(task.task_id, started)
+  // Polling для summary — нужен для получения статуса из кэша при первом открытии.
+  // Sprint 4: если summary уже готово в кэше, показываем мгновенно.
+  // Для новой генерации используем SSE-стрим ниже.
+  const { data: summaryData } = useLLMSummaryPolling(task.task_id, started && !summaryStreaming)
 
   // Elapsed time — пока статус running, показываем сколько секунд идёт анализ
-  const isRunning = summaryData?.state.status === 'running' || starting
+  const isRunning = summaryStreaming || summaryData?.state.status === 'running' || starting
   const elapsedSec = useElapsedSeconds(isRunning ? summaryData?.state.started_at : null)
   // Если прошло больше 90 сек — показываем предупреждение, что это дольше обычного
   const isSlow = isRunning && elapsedSec > 90
@@ -108,7 +129,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     api.getQAHistory(task.task_id).then(setQaHistory).catch(() => {})
   }, [task.task_id])
 
-  // Авто-показ готового резюме
+  // Авто-показ готового резюме (из polling)
   useEffect(() => {
     if (summaryData?.state.status === 'done' && summaryData.result) {
       setStarted(true)
@@ -132,55 +153,175 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     }
   }, [providers, provider])
 
-  const handleGenerate = async () => {
-    // СБРОС кэша polling: при retry после ошибки статус в кэше = 'failed',
-    // и polling отключён. Чтобы он запустился заново, нужно очистить кэш.
-    // Без этого кнопка «Повторить» возвращает мгновенно старую ошибку.
+  // Cleanup: отменяем стримы при размонтировании
+  useEffect(() => {
+    return () => {
+      qaAbortRef.current?.abort()
+      summaryAbortRef.current?.abort()
+    }
+  }, [])
+
+  // === Summary streaming (Sprint 4) ===
+  const handleGenerateStream = async () => {
+    // Сброс polling-кэша
     queryClient.removeQueries({ queryKey: ['llm-summary', task.task_id] })
-    setStarting(true)  // мгновенно показываем прогресс
-    setStarted(true)   // запускаем polling
+    setStarting(true)
+    setStarted(true)
+    setSummaryStreaming(true)
+    setStreamingSummary('')
     haptic('medium')
+
+    // Отменяем предыдущий стрим, если был
+    summaryAbortRef.current?.abort()
+    const controller = new AbortController()
+    summaryAbortRef.current = controller
+
     try {
-      await api.startLLMSummary(task.task_id, provider)
-      // Если POST вернулся быстро — polling подхватит статус running.
-      // Если POST вернул уже done — polling подхватит результат.
+      await api.getLLMSummaryStream(
+        task.task_id,
+        provider,
+        {
+          onDelta: (delta) => {
+            setStreamingSummary((prev) => prev + delta)
+            setStarting(false)  // первый токен пришёл — больше не "запускаем"
+          },
+          onDone: () => {
+            setSummaryStreaming(false)
+            setStarting(false)
+            // Обновляем polling-кэш, чтобы получить финальный state
+            queryClient.invalidateQueries({ queryKey: ['llm-summary', task.task_id] })
+            haptic('success')
+          },
+          onError: (err) => {
+            setSummaryStreaming(false)
+            setStarting(false)
+            setQaError(err)  // используем тот же error-state для простоты
+            haptic('error')
+          },
+        },
+        controller.signal,
+      )
     } catch (e: any) {
-      haptic('error')
-      setStarted(false)
-      setStarting(false)
+      if (e?.name !== 'AbortError') {
+        setSummaryStreaming(false)
+        setStarting(false)
+      }
     }
   }
 
-  const handleAsk = async () => {
-    if (!question.trim()) return
+  const handleStopSummary = () => {
+    summaryAbortRef.current?.abort()
+    setSummaryStreaming(false)
+    setStarting(false)
+    haptic('light')
+    // Частичный текст остаётся в streamingSummary — пользователь видит, что уже сгенерировалось
+  }
+
+  // === Q&A streaming (Sprint 4) ===
+  const handleAskStream = async () => {
+    const trimmed = question.trim()
+    if (!trimmed) return
     setQaError(null)
     setQaLoading(true)
+    setStreamingQA({
+      question: trimmed,
+      answer: '',
+      provider,
+    })
     haptic('medium')
+
+    // Отменяем предыдущий стрим, если был
+    qaAbortRef.current?.abort()
+    const controller = new AbortController()
+    qaAbortRef.current = controller
+
     try {
-      const resp = await api.askLLM(task.task_id, question, provider)
-      if (resp.ok && resp.answer) {
-        // Добавляем в локальную историю
+      await api.askLLMStream(
+        task.task_id,
+        trimmed,
+        provider,
+        {
+          onDelta: (delta) => {
+            setStreamingQA((prev) => prev
+              ? { ...prev, answer: prev.answer + delta }
+              : prev,
+            )
+          },
+          onDone: () => {
+            // Сохраняем в локальную историю (сервер уже сохранил в task.llm_qa_history)
+            setStreamingQA((final) => {
+              if (final && final.answer.trim()) {
+                setQaHistory((prev) => [
+                  {
+                    question: final.question,
+                    answer: final.answer,
+                    provider: final.provider,
+                    timestamp: new Date().toISOString(),
+                  },
+                  ...prev,
+                ])
+              }
+              return null
+            })
+            setQaLoading(false)
+            setQuestion('')
+            haptic('success')
+          },
+          onError: (err) => {
+            setStreamingQA(null)
+            setQaError(err)
+            setQaLoading(false)
+            haptic('error')
+          },
+        },
+        controller.signal,
+      )
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        setStreamingQA(null)
+        setQaError(e?.message ?? 'Ошибка запроса')
+        setQaLoading(false)
+        haptic('error')
+      } else {
+        // Abort — сохраняем partial в историю, если есть
+        setStreamingQA((partial) => {
+          if (partial && partial.answer.trim().length > 10) {
+            setQaHistory((prev) => [
+              {
+                question: partial.question,
+                answer: partial.answer + '\n\n_[ответ прерван пользователем]_',
+                provider: partial.provider,
+                timestamp: new Date().toISOString(),
+              },
+              ...prev,
+            ])
+          }
+          return null
+        })
+        setQaLoading(false)
+      }
+    }
+  }
+
+  const handleStopQA = () => {
+    qaAbortRef.current?.abort()
+    haptic('light')
+    // onDone/onError не вызвался — обрабатываем здесь
+    setStreamingQA((partial) => {
+      if (partial && partial.answer.trim().length > 10) {
         setQaHistory((prev) => [
           {
-            question,
-            answer: resp.answer!,
-            provider: resp.provider || provider,
+            question: partial.question,
+            answer: partial.answer + '\n\n_[ответ прерван пользователем]_',
+            provider: partial.provider,
             timestamp: new Date().toISOString(),
           },
           ...prev,
         ])
-        setQuestion('')
-        haptic('success')
-      } else {
-        setQaError(resp.error ?? 'Не удалось получить ответ')
-        haptic('error')
       }
-    } catch (e: any) {
-      setQaError(e?.message ?? 'Ошибка запроса')
-      haptic('error')
-    } finally {
-      setQaLoading(false)
-    }
+      return null
+    })
+    setQaLoading(false)
   }
 
   // === Заглушка если LLM не настроен ===
@@ -241,15 +382,16 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
       <div className="tg-card">
         <div className="tg-section-header mb-2">Аналитическое резюме</div>
 
-        {!started && !summaryData?.result && !starting && (
+        {!started && !summaryData?.result && !starting && !summaryStreaming && (
           <>
             <p className="text-sm opacity-80 mb-3">
               Нейросеть проанализирует метрики ДТП, кросс-таблицы
               корреляций и очаги (если рассчитаны), затем сформирует
-              развёрнутое резюме с рекомендациями.
+              развёрнутое резюме с рекомендациями. Текст появится здесь
+              по мере генерации (token-by-token).
             </p>
             <button
-              onClick={handleGenerate}
+              onClick={handleGenerateStream}
               disabled={!providers}
               className="w-full py-2.5 rounded-xl font-medium text-sm disabled:opacity-50"
               style={{
@@ -265,20 +407,20 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           </>
         )}
 
-        {(summaryData?.state.status === 'running' || starting) && (
+        {(summaryStreaming || starting) && (
           <div className="text-center py-4">
             <div className="text-3xl mb-2 animate-pulse">{isVerySlow ? '⏰' : '⏳'}</div>
             <div className="font-medium mb-1">
               {isVerySlow
                 ? 'Анализ идёт дольше обычного...'
-                : starting && !summaryData
+                : starting && !streamingSummary
                   ? 'Запуск нейросети...'
-                  : 'Нейросеть анализирует...'}
+                  : 'Нейросеть генерирует...'}
             </div>
             <div className="text-xs opacity-70 mb-3">
               {summaryData?.state.stage || 'Подготовка промпта...'}
             </div>
-            {/* Elapsed time — показываем после 5 сек, чтобы не мелькал «0 сек» */}
+            {/* Elapsed time */}
             {elapsedSec >= 5 && (
               <div
                 className="text-xs mb-3 font-mono"
@@ -305,50 +447,65 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                 }}
               >
                 Сервис нейросети не отвечает достаточно долго. Подождите ещё
-                минуту или нажмите «Отменить» и попробуйте другой провайдер.
+                минуту или нажмите «Стоп» и попробуйте другой провайдер.
               </div>
             )}
-            <div
-              className="w-full h-2 rounded-full overflow-hidden"
-              style={{
-                backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
-              }}
-            >
+            {/* Streaming text — показываем по мере поступления */}
+            {streamingSummary && (
               <div
-                className="h-full transition-all duration-500"
+                className="text-sm leading-relaxed whitespace-pre-wrap text-left mb-3"
                 style={{
-                  width: `${summaryData?.state.progress ?? 5}%`,
-                  backgroundColor: isVerySlow
-                    ? '#ff3b30'
-                    : isSlow
-                      ? '#ff9500'
-                      : 'var(--tg-color-button, #2481cc)',
-                }}
-              />
-            </div>
-            <div className="text-xs opacity-60 mt-1">
-              {summaryData?.state.progress ?? 5}%
-            </div>
-            {/* Кнопка «Отменить» — после 60 сек ожидания */}
-            {elapsedSec > 60 && (
-              <button
-                onClick={() => {
-                  haptic('light')
-                  setStarted(false)
-                }}
-                className="mt-3 text-xs px-3 py-1.5 rounded-lg"
-                style={{
-                  backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
-                  color: 'var(--tg-color-text, #000)',
+                  fontFamily:
+                    '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                  borderLeft: '2px solid var(--tg-color-button, #2481cc)',
+                  paddingLeft: '8px',
                 }}
               >
-                ✕ Отменить ожидание
-              </button>
+                {streamingSummary}
+                <span className="animate-pulse">▌</span>
+              </div>
             )}
+            {/* Прогресс-бар (фаза подготовки промпта) */}
+            {!streamingSummary && (
+              <>
+                <div
+                  className="w-full h-2 rounded-full overflow-hidden"
+                  style={{
+                    backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+                  }}
+                >
+                  <div
+                    className="h-full transition-all duration-500"
+                    style={{
+                      width: `${summaryData?.state.progress ?? 5}%`,
+                      backgroundColor: isVerySlow
+                        ? '#ff3b30'
+                        : isSlow
+                          ? '#ff9500'
+                          : 'var(--tg-color-button, #2481cc)',
+                    }}
+                  />
+                </div>
+                <div className="text-xs opacity-60 mt-1">
+                  {summaryData?.state.progress ?? 5}%
+                </div>
+              </>
+            )}
+            {/* Кнопка «Стоп» — во время стрима всегда доступна */}
+            <button
+              onClick={handleStopSummary}
+              className="mt-3 text-xs px-3 py-1.5 rounded-lg"
+              style={{
+                backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+                color: 'var(--tg-color-text, #000)',
+              }}
+            >
+              ✕ Остановить
+            </button>
           </div>
         )}
 
-        {summaryData?.state.status === 'failed' && (
+        {summaryData?.state.status === 'failed' && !summaryStreaming && (
           <div className="text-center py-4">
             <div className="text-3xl mb-2">❌</div>
             <div className="font-medium mb-1" style={{ color: '#ff3b30' }}>
@@ -358,7 +515,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
               {summaryData.state.error}
             </div>
             <button
-              onClick={handleGenerate}
+              onClick={handleGenerateStream}
               className="px-4 py-2 rounded-xl text-sm font-medium"
               style={{
                 backgroundColor: 'var(--tg-color-button, #2481cc)',
@@ -370,7 +527,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           </div>
         )}
 
-        {summaryData?.state.status === 'done' && summaryData.result && (
+        {summaryData?.state.status === 'done' && summaryData.result && !summaryStreaming && (
           <>
             <div className="flex items-center justify-between mb-2">
               <div className="text-xs opacity-60">
@@ -378,7 +535,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                 {summaryData.result.provider}
               </div>
               <button
-                onClick={handleGenerate}
+                onClick={handleGenerateStream}
                 className="text-xs px-2 py-1 rounded-lg"
                 style={{
                   backgroundColor:
@@ -422,7 +579,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           />
 
           {/* Подсказки */}
-          {!question && (
+          {!question && !qaLoading && (
             <div className="flex flex-wrap gap-1.5">
               {suggestedQuestions.map((q) => (
                 <button
@@ -445,17 +602,30 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
             </div>
           )}
 
-          <button
-            onClick={handleAsk}
-            disabled={qaLoading || !question.trim()}
-            className="w-full py-2 rounded-xl text-sm font-medium disabled:opacity-50"
-            style={{
-              backgroundColor: 'var(--tg-color-button, #2481cc)',
-              color: 'var(--tg-color-button-text, #ffffff)',
-            }}
-          >
-            {qaLoading ? '🤔 Думаю...' : '💬 Спросить'}
-          </button>
+          {!qaLoading ? (
+            <button
+              onClick={handleAskStream}
+              disabled={!question.trim()}
+              className="w-full py-2 rounded-xl text-sm font-medium disabled:opacity-50"
+              style={{
+                backgroundColor: 'var(--tg-color-button, #2481cc)',
+                color: 'var(--tg-color-button-text, #ffffff)',
+              }}
+            >
+              💬 Спросить
+            </button>
+          ) : (
+            <button
+              onClick={handleStopQA}
+              className="w-full py-2 rounded-xl text-sm font-medium"
+              style={{
+                backgroundColor: 'rgba(255, 59, 48, 0.15)',
+                color: '#ff3b30',
+              }}
+            >
+              ⏹ Остановить генерацию
+            </button>
+          )}
 
           {qaError && (
             <div
@@ -470,8 +640,20 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           )}
         </div>
 
+        {/* Streaming-ответ (показываем во время генерации) */}
+        {streamingQA && (
+          <div className="space-y-2 pt-2 border-t border-current/10">
+            <div className="text-xs opacity-60 mb-1">Генерация ответа...</div>
+            <StreamingQACard
+              question={streamingQA.question}
+              answer={streamingQA.answer}
+              provider={streamingQA.provider}
+            />
+          </div>
+        )}
+
         {/* История вопросов */}
-        {qaHistory.length > 0 && (
+        {!streamingQA && qaHistory.length > 0 && (
           <div className="space-y-2 pt-2 border-t border-current/10">
             <div className="text-xs opacity-60 mb-1">История:</div>
             {qaHistory.map((item, idx) => (
@@ -527,6 +709,38 @@ function ProviderButton({
         {subtitle}
       </div>
     </button>
+  )
+}
+
+// Streaming-карточка: показывает partial-ответ с typing-cursor.
+function StreamingQACard({
+  question,
+  answer,
+  provider,
+}: {
+  question: string
+  answer: string
+  provider: 'free' | 'paid'
+}) {
+  return (
+    <div
+      className="rounded-lg p-2.5"
+      style={{
+        backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+        borderLeft: '2px solid var(--tg-color-button, #2481cc)',
+      }}
+    >
+      <div className="text-xs font-medium mb-1 opacity-80">
+        ❓ {question}
+      </div>
+      <div className="text-xs whitespace-pre-wrap leading-relaxed">
+        {answer}
+        <span className="animate-pulse">▌</span>
+      </div>
+      <div className="text-[10px] opacity-50 mt-1">
+        {provider === 'free' ? '⚡ GLM' : '🔬 DeepSeek'} · генерация...
+      </div>
+    </div>
   )
 }
 
