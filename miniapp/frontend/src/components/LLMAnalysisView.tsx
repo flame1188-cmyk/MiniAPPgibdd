@@ -373,6 +373,30 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
               return
             }
 
+            // Sprint 5.1: EmptyResponseError — GLM-4.7-Flash «выдохся» на
+            // reasoning (chunks=0, completion=max_tokens). Backend НЕ делает
+            // retry (это не 429, а success с пустым content). Делаем 1
+            // auto-retry на клиенте с короткой задержкой 5 сек — обычно
+            // следующий запрос проходит успешно.
+            if (
+              retryable &&
+              errorType === 'EmptyResponseError' &&
+              qaRetryRef.current < 1 &&
+              !controller.signal.aborted
+            ) {
+              qaRetryRef.current += 1
+              const retryInSec = 5
+              setQaCooldownUntil(Date.now() + retryInSec * 1000)
+              setQaError(
+                `${err}\n\n⏳ Авто-повтор через ${retryInSec} сек...`
+              )
+              setTimeout(() => {
+                if (controller.signal.aborted) return
+                void handleAskStream(trimmed)
+              }, retryInSec * 1000)
+              return
+            }
+
             // Не retryable или retries закончились — показываем ошибку.
             setStreamingQA(null)
             setQaError(err)
