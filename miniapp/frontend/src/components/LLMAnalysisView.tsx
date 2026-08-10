@@ -8,26 +8,23 @@
  *  4. Раздел «Вопрос-ответ»: input + «Спросить» → SSE-стрим → ответ по мере поступления
  *  5. История вопросов сохраняется на сервере (последние 10)
  *
- * Sprint 4: Q&A и резюме используют SSE-стриминг (token-by-token).
- *  - Старые JSON-эндпоинты (/llm/ask, /llm/summary) сохранены для совместимости,
- *    но UI использует только /stream-версии.
- *  - Кнопка «Стоп» во время стрима — AbortController.
- *
- * UX:
- *  - Резюме кэшируется на сервере (cache hit = мгновенно одним delta)
- *  - Длинный текст разбит на абзацы с переносами
- *  - Подсказки: типичные вопросы
+ * Sprint 5: polling fallback (?wait=25) полностью удалён.
+ *  - Резюме — единственный источник правды: streamingSummary + finalSummary
+ *  - При монтировании: one-shot GET /llm/summary (без wait) для cache-hit
+ *  - Стрим: SSE, после onDone — finalSummary = streamingSummary
+ *  - Q&A: onDone использует streamingQA.answer, не дёргает qa-history
+ *  - Markdown-рендер: bold/italic/headings/lists/code
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
 import {
   api,
   type LLMProvidersResponse,
+  type LLMSummaryResponse,
   type QAHistoryItem,
   type TaskStatusResponse,
 } from '@/lib/api'
 import { haptic } from '@/lib/telegram'
-import { useLLMSummaryPolling } from '@/hooks/useAnalysisPolling'
+import { MarkdownText } from '@/components/MarkdownText'
 
 interface LLMAnalysisViewProps {
   task: TaskStatusResponse
@@ -72,7 +69,6 @@ function formatElapsed(sec: number): string {
 }
 
 export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
-  const queryClient = useQueryClient()
   const [providers, setProviders] = useState<LLMProvidersResponse | null>(null)
   const [provider, setProvider] = useState<'free' | 'paid'>('free')
   const [started, setStarted] = useState(false)
@@ -110,14 +106,37 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     [],
   )
 
-  // Polling для summary — нужен для получения статуса из кэша при первом открытии.
-  // Sprint 4: если summary уже готово в кэше, показываем мгновенно.
-  // Для новой генерации используем SSE-стрим ниже.
-  const { data: summaryData } = useLLMSummaryPolling(task.task_id, started && !summaryStreaming)
+  // === Sprint 5: one-shot загрузка готового резюме из кэша ===
+  // При первом открытии вкладки — если summary уже готово на сервере,
+  // показываем его без запуска стрима (cache hit).
+  // polling с ?wait=25 удалён — он был лишним после перехода на SSE.
+  const [cachedSummary, setCachedSummary] = useState<{
+    text: string
+    provider: string
+    generated_at: string
+  } | null>(null)
+  const [summaryError, setSummaryError] = useState<string | null>(null)
+  const summaryStartedAtRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    api.getLLMSummary(task.task_id, 0).then((resp: LLMSummaryResponse) => {
+      if (cancelled) return
+      if (resp.state.status === 'done' && resp.result) {
+        setCachedSummary(resp.result)
+        setStarted(true)
+      } else if (resp.state.status === 'failed') {
+        setSummaryError(resp.state.error ?? 'Ошибка генерации')
+      }
+    }).catch(() => {
+      // тихо — пользователь может запустить генерацию вручную
+    })
+    return () => { cancelled = true }
+  }, [task.task_id])
 
   // Elapsed time — пока статус running, показываем сколько секунд идёт анализ
-  const isRunning = summaryStreaming || summaryData?.state.status === 'running' || starting
-  const elapsedSec = useElapsedSeconds(isRunning ? summaryData?.state.started_at : null)
+  const isRunning = summaryStreaming || starting
+  const elapsedSec = useElapsedSeconds(summaryStartedAtRef.current)
   // Если прошло больше 90 сек — показываем предупреждение, что это дольше обычного
   const isSlow = isRunning && elapsedSec > 90
   // Если прошло больше 240 сек (4 мин) — показываем рекомендацию отменить
@@ -129,17 +148,10 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     api.getQAHistory(task.task_id).then(setQaHistory).catch(() => {})
   }, [task.task_id])
 
-  // Авто-показ готового резюме (из polling)
+  // Сброс ошибки при переключении провайдера
   useEffect(() => {
-    if (summaryData?.state.status === 'done' && summaryData.result) {
-      setStarted(true)
-      setStarting(false)
-    }
-    // Когда пришёл первый ответ со статусом running — локальный loading можно снять
-    if (summaryData?.state.status === 'running') {
-      setStarting(false)
-    }
-  }, [summaryData?.state.status, summaryData?.result])
+    setSummaryError(null)
+  }, [provider])
 
   // Авто-выбор доступного провайдера
   useEffect(() => {
@@ -161,14 +173,15 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     }
   }, [])
 
-  // === Summary streaming (Sprint 4) ===
+  // === Summary streaming (Sprint 5: без polling fallback) ===
   const handleGenerateStream = async () => {
-    // Сброс polling-кэша
-    queryClient.removeQueries({ queryKey: ['llm-summary', task.task_id] })
     setStarting(true)
     setStarted(true)
     setSummaryStreaming(true)
     setStreamingSummary('')
+    setCachedSummary(null)
+    setSummaryError(null)
+    summaryStartedAtRef.current = new Date().toISOString()
     haptic('medium')
 
     // Отменяем предыдущий стрим, если был
@@ -188,14 +201,26 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           onDone: () => {
             setSummaryStreaming(false)
             setStarting(false)
-            // Обновляем polling-кэш, чтобы получить финальный state
-            queryClient.invalidateQueries({ queryKey: ['llm-summary', task.task_id] })
+            // Sprint 5: берём финальный текст из streamingSummary,
+            // НЕ дёргаем /llm/summary?wait=25 — он лишний.
+            setStreamingSummary((finalText) => {
+              if (finalText.trim()) {
+                setCachedSummary({
+                  text: finalText,
+                  provider,
+                  generated_at: new Date().toISOString(),
+                })
+              }
+              return finalText
+            })
+            summaryStartedAtRef.current = null
             haptic('success')
           },
           onError: (err) => {
             setSummaryStreaming(false)
             setStarting(false)
-            setQaError(err)  // используем тот же error-state для простоты
+            setSummaryError(err)
+            summaryStartedAtRef.current = null
             haptic('error')
           },
         },
@@ -205,6 +230,8 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
       if (e?.name !== 'AbortError') {
         setSummaryStreaming(false)
         setStarting(false)
+        setSummaryError(e?.message ?? 'Ошибка запроса')
+        summaryStartedAtRef.current = null
       }
     }
   }
@@ -213,8 +240,19 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
     summaryAbortRef.current?.abort()
     setSummaryStreaming(false)
     setStarting(false)
+    summaryStartedAtRef.current = null
     haptic('light')
-    // Частичный текст остаётся в streamingSummary — пользователь видит, что уже сгенерировалось
+    // Частичный текст сохраняем как кэшированный (с маркером)
+    setStreamingSummary((partial) => {
+      if (partial.trim().length > 30) {
+        setCachedSummary({
+          text: partial + '\n\n_[генерация прервана пользователем]_',
+          provider,
+          generated_at: new Date().toISOString(),
+        })
+      }
+      return partial
+    })
   }
 
   // === Q&A streaming (Sprint 4) ===
@@ -248,7 +286,9 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
             )
           },
           onDone: () => {
-            // Сохраняем в локальную историю (сервер уже сохранил в task.llm_qa_history)
+            // Sprint 5: streamingQA.answer — единственный источник правды.
+            // Старый fallback с api.getQAHistory удалён — стриминг работает,
+            // и запрос истории был лишним (давал дубликат).
             setStreamingQA((final) => {
               if (final && final.answer.trim()) {
                 setQaHistory((prev) => [
@@ -260,21 +300,9 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                   },
                   ...prev,
                 ])
-                return null
-              }
-              // Fallback: если answer пустой (proxy буферизовал stream и
-              // deltas не дошли до frontend), но сервер уже сохранил ответ
-              // в qa-history — запросим его через REST API.
-              if (final) {
-                api.getQAHistory(task.task_id).then((history) => {
-                  if (history.length > 0) {
-                    const latest = history[0]
-                    setQaHistory((prev) => [latest, ...prev])
-                  }
-                }).catch(() => {
-                  // Если и fallback не сработал — показываем ошибку
-                  setQaError('Ответ не получен. Попробуйте ещё раз или смените провайдера.')
-                })
+              } else {
+                // Защита от пустого ответа — без запроса qa-history
+                setQaError('Ответ пустой. Попробуйте переформулировать вопрос или сменить провайдер.')
               }
               return null
             })
@@ -397,13 +425,13 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
       <div className="tg-card">
         <div className="tg-section-header mb-2">Аналитическое резюме</div>
 
-        {!started && !summaryData?.result && !starting && !summaryStreaming && (
+        {!started && !cachedSummary && !starting && !summaryStreaming && !summaryError && (
           <>
             <p className="text-sm opacity-80 mb-3">
               Нейросеть проанализирует метрики ДТП, кросс-таблицы
               корреляций и очаги (если рассчитаны), затем сформирует
               развёрнутое резюме с рекомендациями. Текст появится здесь
-              по мере генерации (token-by-token).
+              по мере генерации (token-by-token) с markdown-форматированием.
             </p>
             <button
               onClick={handleGenerateStream}
@@ -433,7 +461,9 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                   : 'Нейросеть генерирует...'}
             </div>
             <div className="text-xs opacity-70 mb-3">
-              {summaryData?.state.stage || 'Подготовка промпта...'}
+              {starting && !streamingSummary
+                ? 'Подготовка промпта...'
+                : 'Стриминг ответа...'}
             </div>
             {/* Elapsed time */}
             {elapsedSec >= 5 && (
@@ -465,10 +495,10 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                 минуту или нажмите «Стоп» и попробуйте другой провайдер.
               </div>
             )}
-            {/* Streaming text — показываем по мере поступления */}
+            {/* Streaming text — показываем по мере поступления (markdown) */}
             {streamingSummary && (
               <div
-                className="text-sm leading-relaxed whitespace-pre-wrap text-left mb-3"
+                className="text-sm leading-relaxed text-left mb-3"
                 style={{
                   fontFamily:
                     '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
@@ -476,11 +506,10 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                   paddingLeft: '8px',
                 }}
               >
-                {streamingSummary}
-                <span className="animate-pulse">▌</span>
+                <MarkdownText text={streamingSummary} streaming />
               </div>
             )}
-            {/* Прогресс-бар (фаза подготовки промпта) */}
+            {/* Прогресс-бар (фаза подготовки промпта, до первого токена) */}
             {!streamingSummary && (
               <>
                 <div
@@ -492,7 +521,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                   <div
                     className="h-full transition-all duration-500"
                     style={{
-                      width: `${summaryData?.state.progress ?? 5}%`,
+                      width: '5%',
                       backgroundColor: isVerySlow
                         ? '#ff3b30'
                         : isSlow
@@ -501,9 +530,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                     }}
                   />
                 </div>
-                <div className="text-xs opacity-60 mt-1">
-                  {summaryData?.state.progress ?? 5}%
-                </div>
+                <div className="text-xs opacity-60 mt-1">5%</div>
               </>
             )}
             {/* Кнопка «Стоп» — во время стрима всегда доступна */}
@@ -520,14 +547,15 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           </div>
         )}
 
-        {summaryData?.state.status === 'failed' && !summaryStreaming && (
+        {/* Ошибка генерации */}
+        {summaryError && !summaryStreaming && (
           <div className="text-center py-4">
             <div className="text-3xl mb-2">❌</div>
             <div className="font-medium mb-1" style={{ color: '#ff3b30' }}>
               Ошибка генерации
             </div>
             <div className="text-xs opacity-80 mb-3">
-              {summaryData.state.error}
+              {summaryError}
             </div>
             <button
               onClick={handleGenerateStream}
@@ -542,12 +570,13 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           </div>
         )}
 
-        {summaryData?.state.status === 'done' && summaryData.result && !summaryStreaming && (
+        {/* Готовое резюме (из кэша или после стрима) */}
+        {cachedSummary && !summaryStreaming && !summaryError && (
           <>
             <div className="flex items-center justify-between mb-2">
               <div className="text-xs opacity-60">
-                Провайдер: {summaryData.result.provider === 'free' ? '⚡' : '🔬'}{' '}
-                {summaryData.result.provider}
+                Провайдер: {cachedSummary.provider === 'free' ? '⚡' : '🔬'}{' '}
+                {cachedSummary.provider}
               </div>
               <button
                 onClick={handleGenerateStream}
@@ -562,13 +591,13 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
               </button>
             </div>
             <div
-              className="text-sm leading-relaxed whitespace-pre-wrap"
+              className="text-sm leading-relaxed"
               style={{
                 fontFamily:
                   '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
               }}
             >
-              {summaryData.result.text}
+              <MarkdownText text={cachedSummary.text} />
             </div>
           </>
         )}
@@ -593,7 +622,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
             }}
           />
 
-          {/* Подсказки */}
+        {/* Подсказки */}
           {!question && !qaLoading && (
             <div className="flex flex-wrap gap-1.5">
               {suggestedQuestions.map((q) => (
@@ -748,9 +777,8 @@ function StreamingQACard({
       <div className="text-xs font-medium mb-1 opacity-80">
         ❓ {question}
       </div>
-      <div className="text-xs whitespace-pre-wrap leading-relaxed">
-        {answer}
-        <span className="animate-pulse">▌</span>
+      <div className="text-xs leading-relaxed">
+        <MarkdownText text={answer} streaming />
       </div>
       <div className="text-[10px] opacity-50 mt-1">
         {provider === 'free' ? '⚡ GLM' : '🔬 DeepSeek'} · генерация...
@@ -774,10 +802,8 @@ function QACard({ item }: { item: QAHistoryItem }) {
       <div className="text-xs font-medium mb-1 opacity-80">
         ❓ {item.question}
       </div>
-      <div className="text-xs whitespace-pre-wrap leading-relaxed">
-        {expanded || !hasMore
-          ? item.answer
-          : `${answerPreview}...`}
+      <div className="text-xs leading-relaxed">
+        <MarkdownText text={expanded || !hasMore ? item.answer : answerPreview + '...'} />
       </div>
       {hasMore && (
         <button
