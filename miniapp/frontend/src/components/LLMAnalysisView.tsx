@@ -14,6 +14,14 @@
  *  - Стрим: SSE, после onDone — finalSummary = streamingSummary
  *  - Q&A: onDone использует streamingQA.answer, не дёргает qa-history
  *  - Markdown-рендер: bold/italic/headings/lists/code
+ *
+ * Sprint 6: сохранение LLM-сессий в PostgreSQL + UX-правки.
+ *  - Backend: после стрима summary/QA — fire-and-forget save в llm_sessions.
+ *  - При открытии задачи: get_task_async() восстанавливает llm_summary_state
+ *    и llm_qa_history из БД (если они не были восстановлены из in-memory).
+ *  - UI: кнопки «⧉ Копировать» (финальный ответ + partial во время стрима
+ *    + резюме) и «↻ Повторить» (запускает новый стрим с тем же вопросом).
+ *  - CopyButton с fallback на execCommand для не-secure context (Telegram WebView).
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -668,22 +676,27 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
         {/* Готовое резюме (из кэша или после стрима) */}
         {cachedSummary && !summaryStreaming && !summaryError && (
           <>
-            <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center justify-between mb-2 gap-2">
               <div className="text-xs opacity-60">
                 Провайдер: {cachedSummary.provider === 'free' ? '⚡' : '🔬'}{' '}
                 {cachedSummary.provider}
               </div>
-              <button
-                onClick={handleGenerateStream}
-                className="text-xs px-2 py-1 rounded-lg"
-                style={{
-                  backgroundColor:
-                    'var(--tg-color-secondary-bg, #f1f1f1)',
-                  color: 'var(--tg-color-text, #000)',
-                }}
-              >
-                ↻ Перегенерировать
-              </button>
+              <div className="flex items-center gap-1">
+                {/* Sprint 6: копировать резюме — часто просят передать
+                    аналитику в Telegram-чат или сохранить локально. */}
+                <CopyButton text={cachedSummary.text} />
+                <button
+                  onClick={handleGenerateStream}
+                  className="text-xs px-2 py-1 rounded-lg"
+                  style={{
+                    backgroundColor:
+                      'var(--tg-color-secondary-bg, #f1f1f1)',
+                    color: 'var(--tg-color-text, #000)',
+                  }}
+                >
+                  ↻ Перегенерировать
+                </button>
+              </div>
             </div>
             <div
               className="text-sm leading-relaxed"
@@ -802,7 +815,18 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           <div className="space-y-2 pt-2 border-t border-current/10">
             <div className="text-xs opacity-60 mb-1">История:</div>
             {qaHistory.map((item, idx) => (
-              <QACard key={idx} item={item} />
+              <QACard
+                key={idx}
+                item={item}
+                onRepeat={(q) => {
+                  // Sprint 6: кнопка «Повторить» — копирует вопрос в input
+                  // и сразу запускает новый стрим. Если в данный момент
+                  // идёт другой стрим — он отменяется через handleAskStream
+                  // (controller.abort() в первой строке).
+                  setQuestion(q)
+                  void handleAskStream(q)
+                }}
+              />
             ))}
           </div>
         )}
@@ -881,14 +905,81 @@ function StreamingQACard({
       <div className="text-xs leading-relaxed">
         <MarkdownText text={answer} streaming />
       </div>
-      <div className="text-[10px] opacity-50 mt-1">
-        {provider === 'free' ? '⚡ GLM' : '🔬 DeepSeek'} · генерация...
+      <div className="flex items-center justify-between mt-1 gap-2">
+        <div className="text-[10px] opacity-50">
+          {provider === 'free' ? '⚡ GLM' : '🔬 DeepSeek'} · генерация...
+        </div>
+        {/* Sprint 6: копировать partial-ответ — полезно, если пользователь
+            устал ждать и хочет сохранить уже сгенерированный кусок. */}
+        {answer.trim().length > 20 && (
+          <CopyButton text={answer} />
+        )}
       </div>
     </div>
   )
 }
 
-function QACard({ item }: { item: QAHistoryItem }) {
+// Sprint 6: унифицированная кнопка «копировать» — используется и в
+// StreamingQACard (partial), и в QACard (финальный ответ). Имеет
+// встроенный fallback для не-secure context (Telegram WebView на
+// HTTP-доменах), где navigator.clipboard может быть недоступен.
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async () => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        // Fallback: временный textarea + execCommand('copy').
+        // Устаревший API, но единственный надёжный способ в старых WebView.
+        const textarea = document.createElement('textarea')
+        textarea.value = text
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setCopied(true)
+      haptic('success')
+      setTimeout(() => setCopied(false), 2000)
+    } catch (e) {
+      console.warn('Copy failed:', e)
+      haptic('error')
+    }
+  }
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="text-[10px] px-2 py-0.5 rounded-md transition-all"
+      style={{
+        backgroundColor: copied
+          ? 'rgba(48, 209, 88, 0.15)'
+          : 'var(--tg-color-secondary-bg, #e5e5e5)',
+        color: copied
+          ? '#30d158'
+          : 'var(--tg-color-text, #000)',
+        border: copied
+          ? '1px solid rgba(48, 209, 88, 0.4)'
+          : '1px solid transparent',
+      }}
+      title="Скопировать ответ в буфер обмена"
+    >
+      {copied ? '✓ Скопировано' : '⧉ Копировать'}
+    </button>
+  )
+}
+
+function QACard({
+  item,
+  onRepeat,
+}: {
+  item: QAHistoryItem
+  onRepeat: (question: string) => void
+}) {
   const [expanded, setExpanded] = useState(false)
   const answerPreview = item.answer.slice(0, 200)
   const hasMore = item.answer.length > 200
@@ -917,14 +1008,37 @@ function QACard({ item }: { item: QAHistoryItem }) {
           {expanded ? 'Свернуть' : 'Читать далее'}
         </button>
       )}
-      <div className="text-[10px] opacity-50 mt-1">
-        {item.provider === 'free' ? '⚡ GLM' : '🔬 DeepSeek'} ·{' '}
-        {new Date(item.timestamp).toLocaleString('ru-RU', {
-          day: 'numeric',
-          month: 'short',
-          hour: '2-digit',
-          minute: '2-digit',
-        })}
+      <div className="flex items-center justify-between mt-2 gap-2">
+        <div className="text-[10px] opacity-50">
+          {item.provider === 'free' ? '⚡ GLM' : '🔬 DeepSeek'} ·{' '}
+          {new Date(item.timestamp).toLocaleString('ru-RU', {
+            day: 'numeric',
+            month: 'short',
+            hour: '2-digit',
+            minute: '2-digit',
+          })}
+        </div>
+        {/* Sprint 6: кнопки «копировать» и «повторить» — компактные,
+            в правой части карточки. Иконки + текст, чтобы было понятно
+            даже без подсказок. */}
+        <div className="flex items-center gap-1">
+          <CopyButton text={item.answer} />
+          <button
+            onClick={() => {
+              haptic('light')
+              onRepeat(item.question)
+            }}
+            className="text-[10px] px-2 py-0.5 rounded-md transition-all"
+            style={{
+              backgroundColor: 'var(--tg-color-secondary-bg, #e5e5e5)',
+              color: 'var(--tg-color-text, #000)',
+              border: '1px solid transparent',
+            }}
+            title="Задать этот вопрос ещё раз (переформулировать или получить новый ответ)"
+          >
+            ↻ Повторить
+          </button>
+        </div>
       </div>
     </div>
   )
