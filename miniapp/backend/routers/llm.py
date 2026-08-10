@@ -74,6 +74,73 @@ _SSE_SEP = "\n"
 
 
 # ============================================================
+# Sprint 5: человекопонятные сообщения об ошибках LLM для фронтенда
+# ============================================================
+def _humanize_llm_error(exc: Exception) -> tuple[str, bool]:
+    """
+    Преобразует техническую ошибку LLM в понятное русское сообщение
+    для пользователя + флаг retryable (можно ли автоматически повторить).
+
+    Возвращает кортеж (human_message, retryable).
+
+    Логика:
+      - HTTPStatusError с 429 → «Сервис LLM перегружен», retryable=True
+      - HTTPStatusError с 5xx → «Сервис LLM недоступен», retryable=True
+      - HTTPStatusError с 4xx → «Нейросеть отклонила запрос», retryable=False
+      - httpx.TimeoutException → «Превышен таймаут», retryable=True
+      - httpx.ConnectError → «Не удалось подключиться», retryable=True
+      - RuntimeError с «не настроен» → «LLM не настроен», retryable=False
+      - Прочее → обрезаем, retryable=False
+    """
+    err_str = str(exc)
+    exc_class = exc.__class__.__name__
+
+    if exc_class == "HTTPStatusError":
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code == 429:
+            return (
+                "Сервис нейросети временно перегружен (HTTP 429). "
+                "ZhipuAI ограничивает частоту запросов на бесплатном тарифе. "
+                "Подождите ~60 секунд и попробуйте снова.",
+                True,
+            )
+        if status_code and 500 <= status_code < 600:
+            return (
+                f"Сервис нейросети недоступен (HTTP {status_code}). "
+                f"Попробуйте позже или смените провайдер.",
+                True,
+            )
+        if status_code and 400 <= status_code < 500:
+            return (
+                f"Нейросеть отклонила запрос (HTTP {status_code}). "
+                f"Возможно, промпт слишком длинный. Попробуйте переформулировать.",
+                False,
+            )
+
+    if exc_class == "TimeoutException":
+        return (
+            "Превышен таймаут запроса к нейросети (300 сек). Попробуйте ещё раз.",
+            True,
+        )
+
+    if exc_class in ("ConnectError", "NetworkError", "ReadError", "RemoteProtocolError"):
+        return (
+            "Не удалось подключиться к сервису нейросети. Проверьте интернет.",
+            True,
+        )
+
+    # RuntimeError с типичными сообщениями
+    if "не настроен" in err_str or "API_KEY" in err_str:
+        return (
+            "Нейросеть не настроена на сервере. Обратитесь к администратору.",
+            False,
+        )
+
+    # Прочее — возвращаем как есть, но обрезаем
+    return (err_str[:200] if err_str else "Неизвестная ошибка", False)
+
+
+# ============================================================
 # Schemas
 # ============================================================
 class LLMProvidersResponse(BaseModel):
@@ -380,12 +447,19 @@ async def ask_llm_stream(
             await inner_gen.aclose()
             raise
         except Exception as exc:
-            err_msg = str(exc)[:500]
+            # Sprint 5: человекопонятное сообщение для фронтенда.
+            # Технические детали (raw HTTP 429, китайский текст ZhipuAI)
+            # логируем на сервере, но клиенту шлём понятное русское сообщение.
+            raw_err = str(exc)[:500]
+            human_err, retryable = _humanize_llm_error(exc)
             logger.warning(
-                f"Task {task_id}: LLM ask stream error: {err_msg}"
+                f"Task {task_id}: LLM ask stream error: "
+                f"raw={raw_err!r} | human={human_err!r} | retryable={retryable}"
             )
             yield {"event": "error", "data": json.dumps({
-                "error": err_msg,
+                "error": human_err,
+                "error_type": exc.__class__.__name__,
+                "retryable": retryable,
             })}
         finally:
             # На любой исход — закрываем inner generator.
@@ -465,12 +539,17 @@ async def llm_summary_stream(
                 pass
             raise
         except Exception as exc:
-            err_msg = str(exc)[:500]
+            # Sprint 5: человекопонятное сообщение + retryable flag.
+            raw_err = str(exc)[:500]
+            human_err, retryable = _humanize_llm_error(exc)
             logger.warning(
-                f"Task {task_id}: LLM summary stream error: {err_msg}"
+                f"Task {task_id}: LLM summary stream error: "
+                f"raw={raw_err!r} | human={human_err!r} | retryable={retryable}"
             )
             yield {"event": "error", "data": json.dumps({
-                "error": err_msg,
+                "error": human_err,
+                "error_type": exc.__class__.__name__,
+                "retryable": retryable,
             })}
         finally:
             # На любой исход — закрываем inner generator.
