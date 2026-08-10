@@ -108,7 +108,13 @@ async def get_task_async(task_id: str) -> Optional[Task]:
         with _tasks_lock:
             if task_id in _tasks:
                 _tasks.move_to_end(task_id)
-        return _tasks[task_id]
+        task = _tasks[task_id]
+        # Sprint 6: даже если задача in-memory, LLM-сессия могла быть
+        # утеряна (например, task создан заново после рестарта, а
+        # llm_sessions в БД осталась). Пробуем восстановить, если
+        # оба поля пустые — это no-op если уже заполнено.
+        await _try_restore_llm_session(task)
+        return task
 
     # Потом БД (если есть)
     try:
@@ -120,10 +126,89 @@ async def get_task_async(task_id: str) -> Optional[Task]:
         if task is not None:
             attach_heavy_state(task)
             _register_task(task)  # добавляем в LRU-кэш
+            # Sprint 6: восстанавливаем llm_summary_state + llm_qa_history
+            # из llm_sessions (если они не были восстановлены через
+            # attach_heavy_state из _TASKS_HEAVY_STATE).
+            await _try_restore_llm_session(task)
         return task
     except Exception as exc:
         logger.debug(f"get_task_async: DB load failed: {exc}")
         return _tasks.get(task_id)
+
+
+async def _try_restore_llm_session(task: Task) -> None:
+    """
+    Sprint 6: восстанавливает llm_summary_state и llm_qa_history из БД.
+
+    Логика:
+      - Если task.llm_qa_history пустой И task.llm_summary_state.status != DONE
+        → загружаем из llm_sessions.
+      - Если хотя бы одно заполнено (in-memory или из _TASKS_HEAVY_STATE)
+        → ничего не делаем (не затираем актуальное состояние).
+
+    Это гарантирует, что после рестарта приложения пользователь
+    увидит резюме и Q&A-историю, не перегенерируя их.
+    """
+    # Быстрая проверка — нужно ли вообще что-то делать.
+    has_summary = (
+        task.llm_summary_state
+        and task.llm_summary_state.status is not None
+        and task.llm_summary_state.status.value == "done"
+        and bool(task.llm_summary_state.result)
+    )
+    has_qa = bool(task.llm_qa_history)
+    if has_summary and has_qa:
+        return  # оба поля уже заполнены — ничего не делаем
+
+    try:
+        from ..db.repository import load_llm_session
+        session = await load_llm_session(task.id)
+        if session is None:
+            return  # записи в БД нет — пользователь ещё не пользовался LLM
+
+        # Восстанавливаем summary, если он пустой
+        if not has_summary and session.get("summary_text"):
+            try:
+                from .gibdd_service import AnalysisStatus
+                state = task.llm_summary_state
+                state.status = AnalysisStatus.DONE
+                state.progress = 100
+                state.stage = "Готово (восстановлено из БД)"
+                state.result = {
+                    "text": session["summary_text"],
+                    "provider": session.get("summary_provider") or "free",
+                    "generated_at": (
+                        session.get("summary_generated_at").isoformat()
+                        if hasattr(session.get("summary_generated_at"), "isoformat")
+                        else (session.get("summary_generated_at") or "")
+                    ),
+                    "from_session_db": True,  # маркер для диагностики
+                }
+                state.finished_at = session.get("summary_generated_at")
+                logger.info(
+                    f"Sprint 6: restored LLM summary for task={task.id} "
+                    f"({len(session['summary_text'])} chars)"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Sprint 6: restore summary for task={task.id} failed: {exc}"
+                )
+
+        # Восстанавливаем Q&A-историю, если она пустая
+        if not has_qa and session.get("qa_history"):
+            try:
+                # Глубокая копия — чтобы избежать мутаций общих объектов
+                task.llm_qa_history = list(session["qa_history"])
+                logger.info(
+                    f"Sprint 6: restored Q&A history for task={task.id} "
+                    f"({len(task.llm_qa_history)} entries)"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Sprint 6: restore qa_history for task={task.id} failed: {exc}"
+                )
+    except Exception as exc:
+        logger.debug(f"Sprint 6: _try_restore_llm_session({task.id}) failed: {exc}")
 
 
 def get_task(task_id: str) -> Optional[Task]:

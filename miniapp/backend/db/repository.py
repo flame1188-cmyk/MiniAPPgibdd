@@ -680,3 +680,241 @@ async def recover_incomplete_tasks() -> int:
 
     return recovered_count
 
+
+# ====================================================================
+# Sprint 6: Сохранение LLM-сессий (summary + qa_history)
+# ====================================================================
+# Раньше task.llm_summary_state и task.llm_qa_history были чисто
+# in-memory — после рестарта приложения пользователь терял всё:
+# резюме (нужно было перегенерировать) и Q&A-историю (массив пустой).
+# Sprint 6: персистим в таблице llm_sessions и восстанавливаем
+# при первом обращении через get_task_async().
+#
+# Три функции:
+#   - save_llm_session: upsert — сохраняет summary (полная перезапись).
+#   - append_qa_entry: atomic jsonb insert — добавляет один Q&A в конец
+#     массива qa_history, тримит до 10 последних. НЕ трогает summary.
+#   - load_llm_session: возвращает dict {summary_text, summary_provider,
+#     summary_generated_at, qa_history} или None. Вызывается при
+#     восстановлении задачи в get_task_async.
+# ====================================================================
+
+
+async def save_llm_session(
+    task_id: str,
+    user_id: int,
+    summary_text: str,
+    summary_provider: str,
+    summary_generated_at: Optional[datetime] = None,
+    qa_history: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """
+    Sprint 6: upsert LLM-сессии в БД.
+
+    Сохраняет summary-текст (перезаписывает, если уже было). qa_history
+    обновляется только если передан явно (для полного восстановления
+    при save_task — обычно нет, т.к. append_qa_entry добавляет по одной).
+
+    Если БД недоступна — тихо пропускает (in-memory fallback: сессия
+    всё равно потеряется при рестарте, но текущая работа пользователя
+    не должна обрываться).
+    """
+    if not is_db_ready():
+        return
+
+    pool = get_pool()
+    if pool is None:
+        return
+
+    if summary_generated_at is None:
+        summary_generated_at = datetime.now(timezone.utc)
+
+    try:
+        async with pool.connection() as conn:
+            # qa_history — опциональный, COALESCE сохраняет существующий.
+            qa_json = Json(qa_history) if qa_history is not None else None
+            await conn.execute(
+                """
+                INSERT INTO llm_sessions (
+                    task_id, user_id,
+                    summary_text, summary_provider, summary_generated_at,
+                    qa_history, updated_at
+                ) VALUES (
+                    %(tid)s, %(uid)s,
+                    %(st)s, %(sp)s, %(sgt)s,
+                    COALESCE(%(qh)s, '[]'::jsonb), NOW()
+                )
+                ON CONFLICT (task_id) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    summary_text = EXCLUDED.summary_text,
+                    summary_provider = EXCLUDED.summary_provider,
+                    summary_generated_at = EXCLUDED.summary_generated_at,
+                    qa_history = COALESCE(%(qh)s, llm_sessions.qa_history),
+                    updated_at = NOW()
+                """,
+                params={
+                    "tid": task_id,
+                    "uid": user_id,
+                    "st": summary_text,
+                    "sp": summary_provider,
+                    "sgt": summary_generated_at,
+                    "qh": qa_json,
+                },
+            )
+            await conn.commit()
+        logger.info(
+            f"Sprint 6: saved LLM session for task={task_id} "
+            f"(summary {len(summary_text)} chars, provider={summary_provider})"
+        )
+    except Exception as exc:
+        logger.warning(
+            f"Sprint 6: save_llm_session({task_id}) failed: {exc}"
+        )
+
+
+async def append_qa_entry(
+    task_id: str,
+    user_id: int,
+    question: str,
+    answer: str,
+    provider: str,
+    timestamp: Optional[datetime] = None,
+) -> None:
+    """
+    Sprint 6: atomic append Q&A-записи в llm_sessions.qa_history JSONB.
+
+    Использует jsonb_insert для добавления в конец массива, затем
+    тримит до 10 последних (по аналогии с task.llm_qa_history logic).
+
+    summary НЕ трогает — он сохраняется отдельно через save_llm_session.
+
+    Если записи для task_id ещё нет — создаёт с пустым summary и одним
+    Q&A. Это нормально: summary будет сохранён позже, либо вообще не
+    был сгенерирован (пользователь сразу пошёл в Q&A).
+    """
+    if not is_db_ready():
+        return
+
+    pool = get_pool()
+    if pool is None:
+        return
+
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+
+    new_entry = {
+        "question": question,
+        "answer": answer,
+        "provider": provider,
+        "timestamp": timestamp.isoformat() if hasattr(timestamp, "isoformat")
+        else str(timestamp),
+    }
+
+    try:
+        async with pool.connection() as conn:
+            # Сначала upsert пустой записи (если ещё нет) — это гарантирует,
+            # что INSERT ниже не упадёт по FOREIGN KEY / NOT NULL.
+            await conn.execute(
+                """
+                INSERT INTO llm_sessions (
+                    task_id, user_id, qa_history, updated_at
+                ) VALUES (
+                    %(tid)s, %(uid)s, '[]'::jsonb, NOW()
+                )
+                ON CONFLICT (task_id) DO NOTHING
+                """,
+                params={"tid": task_id, "uid": user_id},
+            )
+
+            # atomic append + trim до 10 последних:
+            # 1. qa_history || new_entry → добавляет в конец
+            # 2. CASE WHEN jsonb_array_length > 10 → берём последние 10
+            #    через jsonb_path_query_array ('$[last 10 to last]')
+            await conn.execute(
+                """
+                UPDATE llm_sessions
+                SET qa_history = (
+                    CASE
+                        WHEN jsonb_array_length(qa_history || %(entry)s) > 10
+                        THEN (
+                            SELECT jsonb_agg(elem)
+                            FROM jsonb_array_elements(qa_history || %(entry)s)
+                            WITH ORDINALITY AS arr(elem, idx)
+                            WHERE idx > jsonb_array_length(qa_history || %(entry)s) - 10
+                        )
+                        ELSE qa_history || %(entry)s
+                    END
+                ),
+                user_id = %(uid)s,
+                updated_at = NOW()
+                WHERE task_id = %(tid)s
+                """,
+                params={
+                    "tid": task_id,
+                    "uid": user_id,
+                    "entry": Json(new_entry),
+                },
+            )
+            await conn.commit()
+        logger.info(
+            f"Sprint 6: appended Q&A to session task={task_id} "
+            f"(answer {len(answer)} chars)"
+        )
+    except Exception as exc:
+        logger.warning(
+            f"Sprint 6: append_qa_entry({task_id}) failed: {exc}"
+        )
+
+
+async def load_llm_session(task_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Sprint 6: загружает LLM-сессию из БД.
+
+    Возвращает dict:
+        {
+            "summary_text": str | None,
+            "summary_provider": str | None,
+            "summary_generated_at": datetime | None,
+            "qa_history": list[dict],     # []
+        }
+    или None, если записи нет / БД недоступна.
+
+    Вызывается из get_task_async() при cache-miss в in-memory, чтобы
+    восстановить task.llm_summary_state и task.llm_qa_history.
+    """
+    if not is_db_ready():
+        return None
+
+    pool = get_pool()
+    if pool is None:
+        return None
+
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                """
+                SELECT summary_text, summary_provider, summary_generated_at,
+                       qa_history
+                FROM llm_sessions
+                WHERE task_id = %(tid)s
+                """,
+                params={"tid": task_id},
+                prepare=False,
+            )
+            row = await cur.fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "summary_text": row.get("summary_text"),
+            "summary_provider": row.get("summary_provider"),
+            "summary_generated_at": row.get("summary_generated_at"),
+            "qa_history": list(row.get("qa_history") or []),
+        }
+    except Exception as exc:
+        logger.warning(
+            f"Sprint 6: load_llm_session({task_id}) failed: {exc}"
+        )
+        return None
+

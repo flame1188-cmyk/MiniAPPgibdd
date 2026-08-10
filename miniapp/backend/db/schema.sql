@@ -337,3 +337,53 @@ CREATE INDEX IF NOT EXISTS idx_llm_cache_expires
 -- Для invalidate_by_region — быстрое удаление всех записей региона.
 CREATE INDEX IF NOT EXISTS idx_llm_cache_reg
     ON llm_cache(reg_code);
+
+
+-- ============================================================
+-- llm_sessions: сохранение LLM-сессий пользователей (Sprint 6).
+-- ============================================================
+-- Зачем: после рестарта приложения task.llm_summary_state и
+-- task.llm_qa_history терялись (in-memory только) — пользователь
+-- открывал задачу и видел пустую историю, а резюме нужно было
+-- перегенерировать. Sprint 6: персистим в БД, восстанавливаем
+-- при первом обращении через get_task_async().
+--
+-- Ключ: task_id (1 сессия = 1 задача). user_id дублируется для
+-- быстрой фильтрации списка сессий пользователя и авторизации.
+--
+-- Что хранится:
+--   - summary_text + summary_provider + summary_generated_at:
+--     финальный текст резюме, чтобы показать мгновенно без
+--     перегенерации (даже если llm_cache протух, по task_id
+--     резюме всё ещё доступно).
+--   - qa_history JSONB: массив {question, answer, provider,
+--     timestamp}, последние 10 (как в task.llm_qa_history).
+--
+-- Запросы:
+--   - load_llm_session(task_id) — при открытии задачи (fast path).
+--   - save_llm_session(task_id, summary, ...) — после генерации
+--     резюме (upsert, перезаписывает summary).
+--   - append_qa_entry(task_id, question, answer, provider) —
+--     после каждого Q&A (atomic jsonb_insert, не перезаписывает
+--     summary). Trim до 10 последних.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS llm_sessions (
+    task_id              VARCHAR(32)  PRIMARY KEY,
+    user_id              BIGINT       NOT NULL,
+    summary_text         TEXT,
+    summary_provider     VARCHAR(16),
+    summary_generated_at TIMESTAMPTZ,
+    qa_history           JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Для списка сессий пользователя (история).
+CREATE INDEX IF NOT EXISTS idx_llm_sessions_user
+    ON llm_sessions(user_id, updated_at DESC);
+
+-- Триггер для авто-обновления updated_at (как в tasks).
+DROP TRIGGER IF EXISTS trg_llm_sessions_updated_at ON llm_sessions;
+CREATE TRIGGER trg_llm_sessions_updated_at
+    BEFORE UPDATE ON llm_sessions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();

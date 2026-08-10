@@ -318,6 +318,22 @@ async def _check_llm_cache(
     except Exception as exc:
         logger.debug(f"Task {task.id}: llm_cache TTL refresh failed: {exc}")
 
+    # Sprint 6: при cache-hit тоже персистим сессию в llm_sessions —
+    # иначе после рестарта приложения llm_cache может протухнуть (24ч TTL),
+    # и пользователь увидит пустое резюме. А по task_id резюме будет
+    # доступно через llm_sessions (без TTL).
+    try:
+        from ..db.repository import save_llm_session
+        asyncio.create_task(save_llm_session(
+            task_id=task.id,
+            user_id=task.user_id,
+            summary_text=cached,
+            summary_provider=provider,
+            summary_generated_at=state.finished_at,
+        ))
+    except Exception as exc:
+        logger.debug(f"Task {task.id}: save_llm_session (cache-hit) failed: {exc}")
+
     logger.info(
         f"Task {task.id}: LLM summary done (from cache, {provider}) — "
         f"LLM call skipped"
@@ -518,6 +534,19 @@ async def _run_llm_summary_inner(
     except Exception as exc:
         logger.debug(f"Task {task.id}: llm_cache PUT failed: {exc}")
 
+    # Sprint 6: персистим сессию в llm_sessions (как в streaming-версии).
+    try:
+        from ..db.repository import save_llm_session
+        asyncio.create_task(save_llm_session(
+            task_id=task.id,
+            user_id=task.user_id,
+            summary_text=summary,
+            summary_provider=provider,
+            summary_generated_at=state.finished_at,
+        ))
+    except Exception as exc:
+        logger.debug(f"Task {task.id}: save_llm_session failed: {exc}")
+
 
 async def ask_llm_question(
     task: Task,
@@ -658,15 +687,30 @@ async def ask_llm_question(
             )
 
         # Сохраняем в историю
+        qa_timestamp = datetime.now(timezone.utc)
         task.llm_qa_history.append({
             "question": question,
             "answer": answer,
             "provider": provider,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": qa_timestamp.isoformat(),
         })
         # Ограничиваем историю 10 записями
         if len(task.llm_qa_history) > 10:
             task.llm_qa_history = task.llm_qa_history[-10:]
+
+        # Sprint 6: персистим Q&A в llm_sessions (как в streaming-версии).
+        try:
+            from ..db.repository import append_qa_entry
+            asyncio.create_task(append_qa_entry(
+                task_id=task.id,
+                user_id=task.user_id,
+                question=question,
+                answer=answer,
+                provider=provider,
+                timestamp=qa_timestamp,
+            ))
+        except Exception as exc:
+            logger.debug(f"Task {task.id}: append_qa_entry (sync) failed: {exc}")
 
         return {"ok": True, "answer": answer, "provider": provider}
 
@@ -873,11 +917,12 @@ async def ask_llm_question_stream(
     # Если стрим оборвался (exception), мы сюда не попадём — partial не сохраняем.
     full_answer = "".join(accumulated)
     if full_answer.strip():
+        qa_timestamp = datetime.now(timezone.utc)
         task.llm_qa_history.append({
             "question": question,
             "answer": full_answer,
             "provider": provider,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": qa_timestamp.isoformat(),
         })
         if len(task.llm_qa_history) > 10:
             task.llm_qa_history = task.llm_qa_history[-10:]
@@ -885,6 +930,21 @@ async def ask_llm_question_stream(
             f"Task {task.id}: LLM ask stream done — "
             f"answer_len={len(full_answer)}, saved to history"
         )
+
+        # Sprint 6: персистим Q&A в llm_sessions.qa_history (atomic append).
+        # Fire-and-forget — не роняем ответ при ошибке БД.
+        try:
+            from ..db.repository import append_qa_entry
+            asyncio.create_task(append_qa_entry(
+                task_id=task.id,
+                user_id=task.user_id,
+                question=question,
+                answer=full_answer,
+                provider=provider,
+                timestamp=qa_timestamp,
+            ))
+        except Exception as exc:
+            logger.debug(f"Task {task.id}: append_qa_entry failed: {exc}")
     else:
         logger.warning(
             f"Task {task.id}: LLM ask stream — empty answer (0 chunks), "
@@ -1151,4 +1211,20 @@ async def stream_llm_summary(
         ))
     except Exception as exc:
         logger.debug(f"Task {task.id}: llm_cache PUT (stream) failed: {exc}")
+
+    # Sprint 6: персистим сессию в llm_sessions — после рестарта
+    # приложения пользователь откроет задачу и сразу увидит резюме,
+    # без перегенерации (даже если llm_cache протух, по task_id резюме
+    # всё ещё доступно). Fire-and-forget — не роняем стрим при ошибке.
+    try:
+        from ..db.repository import save_llm_session
+        asyncio.create_task(save_llm_session(
+            task_id=task.id,
+            user_id=task.user_id,
+            summary_text=full_summary,
+            summary_provider=provider,
+            summary_generated_at=state.finished_at,
+        ))
+    except Exception as exc:
+        logger.debug(f"Task {task.id}: save_llm_session (stream) failed: {exc}")
 
