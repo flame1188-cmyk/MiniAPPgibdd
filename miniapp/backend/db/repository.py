@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from psycopg.types.json import Json
+from psycopg.types.json import Json, Jsonb
 from psycopg.rows import dict_row
 
 from .connection import get_pool, is_db_ready
@@ -732,7 +732,12 @@ async def save_llm_session(
     try:
         async with pool.connection() as conn:
             # qa_history — опциональный, COALESCE сохраняет существующий.
-            qa_json = Json(qa_history) if qa_history is not None else None
+            # Используем Jsonb (а не Json) — колонка qa_history имеет тип
+            # JSONB, и только Jsonb адаптируется к JSONB без необходимости
+            # явного каста. Json даёт json-тип, который при использовании в
+            # бинарных операторах (jsonb || json) падает с ошибкой
+            # "operator does not exist: jsonb || json".
+            qa_json = Jsonb(qa_history) if qa_history is not None else None
             await conn.execute(
                 """
                 INSERT INTO llm_sessions (
@@ -830,19 +835,27 @@ async def append_qa_entry(
             # 1. qa_history || new_entry → добавляет в конец
             # 2. CASE WHEN jsonb_array_length > 10 → берём последние 10
             #    через jsonb_path_query_array ('$[last 10 to last]')
+            #
+            # ВАЖНО: используем Jsonb (не Json) — колонка qa_history имеет
+            # тип JSONB, и оператор `||` определён только для (jsonb, jsonb).
+            # Json адаптируется к типу json, что вызывало ошибку:
+            #   operator does not exist: jsonb || json
+            # Дополнительно добавлен явный каст %(entry)s::jsonb для
+            # надёжности (на случай если пул вернёт кэшированный prepared
+            # statement с другим типом параметра).
             await conn.execute(
                 """
                 UPDATE llm_sessions
                 SET qa_history = (
                     CASE
-                        WHEN jsonb_array_length(qa_history || %(entry)s) > 10
+                        WHEN jsonb_array_length(qa_history || %(entry)s::jsonb) > 10
                         THEN (
                             SELECT jsonb_agg(elem)
-                            FROM jsonb_array_elements(qa_history || %(entry)s)
+                            FROM jsonb_array_elements(qa_history || %(entry)s::jsonb)
                             WITH ORDINALITY AS arr(elem, idx)
-                            WHERE idx > jsonb_array_length(qa_history || %(entry)s) - 10
+                            WHERE idx > jsonb_array_length(qa_history || %(entry)s::jsonb) - 10
                         )
-                        ELSE qa_history || %(entry)s
+                        ELSE qa_history || %(entry)s::jsonb
                     END
                 ),
                 user_id = %(uid)s,
@@ -852,7 +865,7 @@ async def append_qa_entry(
                 params={
                     "tid": task_id,
                     "uid": user_id,
-                    "entry": Json(new_entry),
+                    "entry": Jsonb(new_entry),
                 },
             )
             await conn.commit()
