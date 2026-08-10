@@ -828,22 +828,46 @@ async def ask_llm_question_stream(
         )
 
     accumulated = []
+    # Sprint 5: явная ссылка на inner LLM-stream generator.
+    # При cancel/disconnect от клиента — вызываем aclose(), что обрывает
+    # HTTP-stream к ZhipuAI через async with client.stream(...) внутри
+    # _do_llm_stream_request.
+    llm_stream = llm_module.get_ai_answer_stream(
+        question=question,
+        comparison=comparison,
+        reg_name=task.region_name,
+        current_label=task.period_label,
+        prev_label=task.prev_label or "прошлый период",
+        raw_supplement="",
+        news_context="",
+        clusters_context=clusters_ctx,
+        cross_tables_context=cross_tables_ctx,
+        provider=provider,
+        history=history_for_llm,
+    )
     async with _LLM_SEMAPHORE:
-        async for delta in llm_module.get_ai_answer_stream(
-            question=question,
-            comparison=comparison,
-            reg_name=task.region_name,
-            current_label=task.period_label,
-            prev_label=task.prev_label or "прошлый период",
-            raw_supplement="",
-            news_context="",
-            clusters_context=clusters_ctx,
-            cross_tables_context=cross_tables_ctx,
-            provider=provider,
-            history=history_for_llm,
-        ):
-            accumulated.append(delta)
-            yield delta
+        try:
+            async for delta in llm_stream:
+                accumulated.append(delta)
+                yield delta
+        except (asyncio.CancelledError, GeneratorExit):
+            # Клиент отменил стрим (AbortController / http.disconnect).
+            # Закрываем inner generator — это закрывает httpx.stream()
+            # к ZhipuAI, экономя токены.
+            logger.info(
+                f"Task {task.id}: LLM ask stream cancelled by client "
+                f"(partial_len={len(''.join(accumulated))})"
+            )
+            try:
+                await llm_stream.aclose()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                await llm_stream.aclose()
+            except Exception:
+                pass
 
     # Stream завершился нормально — сохраняем в history.
     # Если стрим оборвался (exception), мы сюда не попадём — partial не сохраняем.
@@ -1030,7 +1054,8 @@ async def stream_llm_summary(
     accumulated = []
     try:
         async with _LLM_SEMAPHORE:
-            async for delta in llm_module.get_ai_summary_stream(
+            # Sprint 5: явная ссылка для надёжной отмены.
+            llm_stream = llm_module.get_ai_summary_stream(
                 comparison=comparison,
                 reg_name=task.region_name,
                 current_label=task.period_label,
@@ -1042,12 +1067,40 @@ async def stream_llm_summary(
                 provider=provider,
                 current_cards=task.cards if provider == "paid" else None,
                 prev_cards=task.prev_cards if provider == "paid" else None,
-            ):
-                accumulated.append(delta)
-                # Прогресс плавно растёт 60→90 во время стриминга
-                if state.progress < 90:
-                    state.progress = min(90, state.progress + 1)
-                yield delta
+            )
+            try:
+                async for delta in llm_stream:
+                    accumulated.append(delta)
+                    # Прогресс плавно растёт 60→90 во время стриминга
+                    if state.progress < 90:
+                        state.progress = min(90, state.progress + 1)
+                    yield delta
+            except (asyncio.CancelledError, GeneratorExit):
+                # Клиент отменил стрим. Закрываем inner generator,
+                # что закрывает httpx.stream() к ZhipuAI.
+                logger.info(
+                    f"Task {task.id}: LLM summary stream cancelled by client "
+                    f"(partial_len={len(''.join(accumulated))})"
+                )
+                # State: оставляем RUNNING с пометкой — пользователь видит
+                # partial-результат в UI, но в кэш НЕ сохраняем.
+                state.status = AnalysisStatus.FAILED
+                state.error = "Генерация прервана пользователем"
+                state.stage = "Прервано"
+                state.finished_at = datetime.now(timezone.utc)
+                try:
+                    await llm_stream.aclose()
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    await llm_stream.aclose()
+                except Exception:
+                    pass
+    except (asyncio.CancelledError, GeneratorExit):
+        # Propagate up — router обработает.
+        raise
     except Exception as exc:
         # Обрыв потока или 4xx/5xx от LLM
         state.status = AnalysisStatus.FAILED

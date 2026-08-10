@@ -345,18 +345,20 @@ async def ask_llm_stream(
 
     async def event_generator():
         """SSE-генератор: эмитит delta/done/error события."""
+        # Sprint 5: явно храним ссылку на inner generator, чтобы вызвать
+        # aclose() при cancel/disconnect. Без этого Python полагается на GC,
+        # что ненадёжно по времени — LLM-стрим к ZhipuAI может продолжаться
+        # ещё десятки секунд после того, как клиент нажал «Стоп».
+        inner_gen = ask_llm_question_stream(
+            task=task, question=question, provider=provider,
+        )
         try:
             chunks_emitted = 0
-            async for delta in ask_llm_question_stream(
-                task=task, question=question, provider=provider,
-            ):
+            async for delta in inner_gen:
                 chunks_emitted += 1
                 yield {"event": "delta", "data": delta}
             # Стрим завершился нормально — эмитим done.
-            # Фронтенд уже накопил текст из delta-событий.
             if chunks_emitted == 0:
-                # LLM вернул пустой ответ (0 chunks) — эмитим error,
-                # чтобы фронтенд показал сообщение, а не "тихо" завершился.
                 logger.warning(
                     f"Task {task_id}: LLM ask stream — empty response "
                     f"(0 chunks), provider={provider}"
@@ -367,10 +369,15 @@ async def ask_llm_stream(
             else:
                 yield {"event": "done", "data": ""}
         except asyncio.CancelledError:
-            # Клиент отключился (AbortController во фронтенде)
+            # Клиент отключился (AbortController во фронтенде) ИЛИ
+            # sse_starlette получил http.disconnect.
+            # Гарантированно закрываем inner generator — это обрывает
+            # HTTP-stream к ZhipuAI, экономя токены.
             logger.info(
-                f"Task {task_id}: LLM ask stream cancelled by client"
+                f"Task {task_id}: LLM ask stream cancelled by client "
+                f"(chunks_emitted={chunks_emitted})"
             )
+            await inner_gen.aclose()
             raise
         except Exception as exc:
             err_msg = str(exc)[:500]
@@ -380,6 +387,13 @@ async def ask_llm_stream(
             yield {"event": "error", "data": json.dumps({
                 "error": err_msg,
             })}
+        finally:
+            # На любой исход — закрываем inner generator.
+            # aclose() идемпотентен (можно вызвать несколько раз).
+            try:
+                await inner_gen.aclose()
+            except Exception:
+                pass
 
     return EventSourceResponse(
         event_generator(),
@@ -422,9 +436,12 @@ async def llm_summary_stream(
     provider = request.provider
 
     async def event_generator():
+        # Sprint 5: явная ссылка на inner generator для надёжной отмены.
+        # Определяем ДО try: чтобы finally всегда мог вызвать aclose().
+        inner_gen = stream_llm_summary(task=task, provider=provider)
         try:
             chunks_emitted = 0
-            async for delta in stream_llm_summary(task=task, provider=provider):
+            async for delta in inner_gen:
                 chunks_emitted += 1
                 yield {"event": "delta", "data": delta}
             if chunks_emitted == 0:
@@ -439,8 +456,13 @@ async def llm_summary_stream(
                 yield {"event": "done", "data": ""}
         except asyncio.CancelledError:
             logger.info(
-                f"Task {task_id}: LLM summary stream cancelled by client"
+                f"Task {task_id}: LLM summary stream cancelled by client "
+                f"(chunks_emitted={chunks_emitted})"
             )
+            try:
+                await inner_gen.aclose()
+            except Exception:
+                pass
             raise
         except Exception as exc:
             err_msg = str(exc)[:500]
@@ -450,6 +472,12 @@ async def llm_summary_stream(
             yield {"event": "error", "data": json.dumps({
                 "error": err_msg,
             })}
+        finally:
+            # На любой исход — закрываем inner generator.
+            try:
+                await inner_gen.aclose()
+            except Exception:
+                pass
 
     return EventSourceResponse(
         event_generator(),

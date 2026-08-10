@@ -573,3 +573,110 @@ def attach_heavy_state(task: Any) -> None:
             current = getattr(task, field_name)
             if not current and cache[field_name]:
                 setattr(task, field_name, cache[field_name])
+
+
+# ====================================================================
+# Sprint 5: Task recovery на startup
+# ====================================================================
+# При рестарте сервера in-flight задачи (status='fetching'/'parsing'/'analytics'
+# 'generating'/'running') остаются в этом статусе вечно — рабочий процесс,
+# который их обрабатывал, умер вместе с сервером.
+# Эта функция находит такие задачи в БД и помечает их как failed с понятным
+# сообщением, чтобы пользователь увидел ошибку и мог пересоздать задачу
+# вместо бесконечного ожидания.
+_INCOMPLETE_STATUSES = ("fetching", "parsing", "analytics", "generating", "running")
+
+
+async def recover_incomplete_tasks() -> int:
+    """
+    Sprint 5: помечает незавершённые задачи как failed.
+
+    Вызывается один раз при старте сервера (после init_pool).
+    Возвращает количество восстановленных задач.
+
+    Логика:
+      - status IN (fetching, parsing, analytics, generating, running) → failed
+      - error = 'Прервано рестартом сервера (Sprint 5 recovery)'
+      - progress не трогаем (полезно для отладки — видно, где оборвалось)
+      - clusters_state.status='running' / llm_summary_state.status='running'
+        тоже помечаем как failed (тяжёлые state-объекты лежат в БД только
+        частично — JSONB-колонки clusters_result и т.д., но status-строка
+        в самих колонках не персистится; здесь работает только на in-memory).
+    """
+    if not is_db_ready():
+        # Без БД — in-memory задачи и так пусты после рестарта.
+        return 0
+
+    pool = get_pool()
+    if pool is None:
+        return 0
+
+    recovered_count = 0
+    try:
+        async with pool.connection() as conn:
+            # Сначала собираем ID задач для логирования
+            cur = await conn.execute(
+                """
+                SELECT id, status, progress FROM tasks
+                WHERE status = ANY(%(statuses)s)
+                """,
+                params={"statuses": list(_INCOMPLETE_STATUSES)},
+                prepare=False,
+            )
+            rows = await cur.fetchall()
+
+            if not rows:
+                return 0
+
+            # UPDATE одним запросом — помечаем все как failed
+            await conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed',
+                    error = %(error_msg)s,
+                    updated_at = NOW()
+                WHERE status = ANY(%(statuses)s)
+                """,
+                params={
+                    "error_msg": "Прервано рестартом сервера (Sprint 5 recovery)",
+                    "statuses": list(_INCOMPLETE_STATUSES),
+                },
+            )
+            await conn.commit()
+            recovered_count = len(rows)
+
+        # Логируем каждую восстановленную задачу
+        for row in rows:
+            logger.warning(
+                f"Sprint 5 recovery: task {row['id']} "
+                f"was status='{row['status']}' progress={row['progress']} "
+                f"→ marked as failed (server restart)"
+            )
+
+        # Также чистим in-memory кэш от мёртвых задач
+        for tid in list(_TASKS_MEMORY.keys()):
+            task = _TASKS_MEMORY[tid]
+            try:
+                if hasattr(task, "status") and hasattr(task.status, "value"):
+                    if task.status.value in _INCOMPLETE_STATUSES:
+                        # Не удаляем из памяти — оставляем с пометкой failed,
+                        # чтобы пользователь увидел ошибку в UI.
+                        from ..services.gibdd_service import TaskStatus
+                        task.status = TaskStatus.FAILED
+                        task.error = (
+                            "Прервано рестартом сервера (Sprint 5 recovery)"
+                        )
+            except Exception:
+                pass
+
+        if recovered_count:
+            logger.info(
+                f"Sprint 5 recovery: {recovered_count} incomplete tasks "
+                f"marked as failed"
+            )
+
+    except Exception as exc:
+        logger.warning(f"Sprint 5 recovery failed: {exc}")
+
+    return recovered_count
+
