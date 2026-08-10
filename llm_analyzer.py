@@ -1878,7 +1878,7 @@ async def _ask_free_llm(
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
     }
 
     headers = {
@@ -1933,7 +1933,7 @@ async def _ask_paid_llm(
         "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
     }
 
     headers = {
@@ -2325,7 +2325,12 @@ async def _ask_llm_stream_free(
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 8192,
+        # Sprint 5.1: GLM-4.7-Flash имеет reasoning mode (thinking).
+        # reasoning_content не входит в лимит max_tokens, но если вопрос
+        # сложный и требует много reasoning, может сгенерировать 8192+ токенов
+        # reasoning, после чего content так и не появится (finish_reason=length).
+        # Увеличиваем max_tokens до 16384 (раньше было 8192).
+        "max_tokens": 16384,
         "stream": True,
         # Sprint 5: запрашиваем usage (prompt_tokens, completion_tokens, total_tokens)
         # в финальном chunk'е стрима. Без этого ZhipuAI не возвращает usage в streaming mode.
@@ -2368,7 +2373,7 @@ async def _ask_llm_stream_paid(
         "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 8192,
+        "max_tokens": 16384,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -2579,6 +2584,10 @@ async def _do_llm_stream_request(
                 total_chars = 0
                 # Sprint 5: usage из финального chunk'а (если stream_options.include_usage=true)
                 usage_data: dict | None = None
+                # Sprint 5.1: накапливаем reasoning_content для диагностики.
+                # Локальная переменная — никаких race condition между параллельными вызовами.
+                reasoning_accum: int = 0
+                finish_reason: str | None = None
 
                 async for line in response.aiter_lines():
                     # SSE-формат: строки вида "data: {...}" разделены пустой строкой.
@@ -2592,6 +2601,14 @@ async def _do_llm_stream_request(
                     if data_str == "[DONE]":
                         # Sprint 5: логируем cost перед выходом
                         _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
+                        # Sprint 5.1: детектируем reasoning-burnout (chunks=0, но
+                        # были reasoning chunks). Логируем для последующей диагностики.
+                        if chunks_emitted == 0 and reasoning_accum > 0:
+                            logger.warning(
+                                f"LLM stream: empty content but {reasoning_accum} симв. "
+                                f"reasoning было сгенерировано (finish_reason={finish_reason}). "
+                                f"Возможно, model упёрлась в max_tokens во время reasoning."
+                            )
                         return
                     # Парсим JSON-чанк
                     try:
@@ -2610,8 +2627,28 @@ async def _do_llm_stream_request(
                     choices = chunk_json.get("choices") or []
                     if not choices:
                         continue
-                    delta = choices[0].get("delta", {}) or {}
+                    choice0 = choices[0]
+                    delta = choice0.get("delta", {}) or {}
+                    # Sprint 5.1: сохраняем finish_reason для диагностики burnout
+                    if choice0.get("finish_reason"):
+                        finish_reason = choice0["finish_reason"]
                     content_piece = delta.get("content") or ""
+                    # Sprint 5.1: GLM-4.7-Flash в streaming mode отдаёт reasoning
+                    # отдельно в delta.reasoning_content. Это «thinking» модель —
+                    # при сложных вопросах reasoning может занять 8-12k токенов.
+                    # Если content_piece пустой, но есть reasoning_content —
+                    # НЕ стримим его (пользователю не нужен ход размышлений),
+                    # но логируем для диагностики.
+                    reasoning_piece = delta.get("reasoning_content") or ""
+                    if reasoning_piece:
+                        reasoning_accum += len(reasoning_piece)
+                        # Логируем раз в ~4000 символов, чтобы не спамить.
+                        if reasoning_accum % 4000 < len(reasoning_piece):
+                            logger.info(
+                                f"LLM stream: reasoning в процессе "
+                                f"(накоплено ~{reasoning_accum} симв., "
+                                f"content ещё не начался)"
+                            )
                     if content_piece:
                         chunks_emitted += 1
                         total_chars += len(content_piece)
@@ -2620,6 +2657,12 @@ async def _do_llm_stream_request(
                 # Stream закончился без явного [DONE] (некоторые провайдеры так делают).
                 # Sprint 5: всё равно логируем cost, если есть usage.
                 _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
+                # Sprint 5.1: детектируем reasoning-burnout
+                if chunks_emitted == 0 and reasoning_accum > 0:
+                    logger.warning(
+                        f"LLM stream: empty content (no [DONE]) but {reasoning_accum} симв. "
+                        f"reasoning было сгенерировано. finish_reason={finish_reason}."
+                    )
                 # Успешно завершилось — выходим из retry-loop
                 return
 
