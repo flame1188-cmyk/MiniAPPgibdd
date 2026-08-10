@@ -426,12 +426,23 @@ async def ask_llm_stream(
                 yield {"event": "delta", "data": delta}
             # Стрим завершился нормально — эмитим done.
             if chunks_emitted == 0:
+                # Sprint 5.1: empty response — это обычно reasoning-burnout
+                # (GLM-4.7-Flash «думал» слишком долго и не успел выдать ответ
+                # в лимит токенов) либо проблема с промптом. Retry поможет с
+                # большой вероятностью (часто следующий запрос проходит успешно).
                 logger.warning(
                     f"Task {task_id}: LLM ask stream — empty response "
                     f"(0 chunks), provider={provider}"
                 )
                 yield {"event": "error", "data": json.dumps({
-                    "error": "LLM вернул пустой ответ. Попробуйте переформулировать вопрос или сменить провайдера.",
+                    "error": (
+                        "Нейросеть не смогла сформулировать ответ за отведённое "
+                        "время (вероятно, слишком длинный процесс размышления). "
+                        "Попробуйте переформулировать вопрос более конкретно "
+                        "или задать его снова через несколько секунд."
+                    ),
+                    "error_type": "EmptyResponseError",
+                    "retryable": True,
                 })}
             else:
                 yield {"event": "done", "data": ""}
@@ -519,12 +530,19 @@ async def llm_summary_stream(
                 chunks_emitted += 1
                 yield {"event": "delta", "data": delta}
             if chunks_emitted == 0:
+                # Sprint 5.1: empty response — reasoning-burnout или проблема с промптом.
                 logger.warning(
                     f"Task {task_id}: LLM summary stream — empty response "
                     f"(0 chunks), provider={provider}"
                 )
                 yield {"event": "error", "data": json.dumps({
-                    "error": "LLM вернул пустой ответ. Попробуйте ещё раз или смените провайдера.",
+                    "error": (
+                        "Нейросеть не смогла сформулировать резюме за отведённое "
+                        "время (вероятно, слишком длинный процесс размышления). "
+                        "Попробуйте ещё раз через несколько секунд."
+                    ),
+                    "error_type": "EmptyResponseError",
+                    "retryable": True,
                 })}
             else:
                 yield {"event": "done", "data": ""}
