@@ -210,7 +210,10 @@ SYSTEM_PROMPT = (
     "8. Пиши на русском языке, профессиональным но понятным стилем\n"
     "9. Структурируй ответ: выводы, причины, рекомендации\n"
     "10. Если данных недостаточно для вывода — так и скажи\n"
-    "11. Не используй эмодзи и markdown-форматирование\n"
+    "11. Используй markdown-форматирование для структуры: **жирным** выделяй ключевые "
+    "выводы и цифры, заголовки (## или ###) для разделов, маркированные списки (- ) "
+    "для перечислений. НЕ используй таблицы markdown (они плохо рендерятся в UI). "
+    "Эмодзи не используй.\n"
     "12. Объём ответа: 3-5 абзацев для резюме, 2-4 абзаца для ответа на вопрос\n"
     "13. При вопросах про «самые аварийные дороги» / «топ дорог» / "
     "«наиболее опасные районы» / «где больше всего ДТП» — используй таблицы "
@@ -2124,8 +2127,19 @@ async def _do_llm_request(
         )
         raise ValueError("LLM вернул пустой ответ (content='')")
 
-    tokens_used = data.get("usage", {}).get("total_tokens", "?")
-    logger.info(f"LLM ответ: {len(content)} символов, токенов: {tokens_used}")
+    # Sprint 5: cost logging и для не-streaming режима.
+    # Используем ту же функцию _log_llm_cost — она умеет работать с usage dict.
+    usage_data = data.get("usage")
+    model_for_log = LLM_MODEL  # не-streaming используется только для free-провайдера
+    if usage_data:
+        _log_llm_cost(
+            model_name=model_for_log,
+            usage=usage_data,
+            chunks_emitted=1,  # не-streaming = один "чанк"
+            total_chars=len(content),
+        )
+    else:
+        logger.info(f"LLM ответ: {len(content)} символов, usage=N/A")
 
     return content
 
@@ -2227,6 +2241,9 @@ async def _ask_llm_stream_free(
         "temperature": temperature,
         "max_tokens": 8192,
         "stream": True,
+        # Sprint 5: запрашиваем usage (prompt_tokens, completion_tokens, total_tokens)
+        # в финальном chunk'е стрима. Без этого ZhipuAI не возвращает usage в streaming mode.
+        "stream_options": {"include_usage": True},
     }
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
@@ -2267,6 +2284,7 @@ async def _ask_llm_stream_paid(
         "temperature": temperature,
         "max_tokens": 8192,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     headers = {
         "Authorization": f"Bearer {LLM_PAID_API_KEY}",
@@ -2283,6 +2301,74 @@ async def _ask_llm_stream_paid(
         client_getter=_get_paid_llm_client,
     ):
         yield delta
+
+
+# ============================================================
+# Sprint 5: LLM cost logging
+# ============================================================
+# Прайс-лист моделей (USD за 1M токенов). Источники:
+#   - GLM-4-Flash: бесплатно (ZhipuAI промо), ставим $0 для cost-логов
+#   - GLM-4.7-Flash: ~$0.07/1M input, $0.07/1M output (промо)
+#   - DeepSeek (AItunnel): зависит от модели, по умолчанию $0.14/$0.28
+# При изменении модели — обновить таблицу. При неизвестной модели —
+# логируем usage без cost.
+_LLM_PRICING_USD_PER_1M_TOKENS = {
+    # ZhipuAI
+    "glm-4-flash":         {"input": 0.0,   "output": 0.0},
+    "glm-4.7-flash":       {"input": 0.07,  "output": 0.07},
+    "glm-4-air":           {"input": 0.14,  "output": 0.14},
+    "glm-4-plus":          {"input": 2.8,   "output": 2.8},
+    # DeepSeek
+    "deepseek-chat":       {"input": 0.14,  "output": 0.28},
+    "deepseek-reasoner":   {"input": 0.55,  "output": 2.19},
+}
+
+
+def _log_llm_cost(
+    model_name: str,
+    usage: dict | None,
+    chunks_emitted: int,
+    total_chars: int,
+) -> None:
+    """
+    Sprint 5: логирует cost LLM-запроса.
+
+    Format: "LLM stream done: chunks=N, chars=M, prompt=P, completion=C, total=T, cost=$X.XXXX"
+
+    Если usage отсутствует (провайдер не поддерживает stream_options) —
+    логируем только chunks/chars, без cost.
+    """
+    if not usage:
+        logger.info(
+            f"LLM stream done: chunks={chunks_emitted}, chars={total_chars}, "
+            f"usage=N/A (provider did not return usage)"
+        )
+        return
+
+    prompt_tokens = usage.get("prompt_tokens", 0) or 0
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+
+    pricing = _LLM_PRICING_USD_PER_1M_TOKENS.get(model_name.lower())
+    if pricing:
+        cost_usd = (
+            prompt_tokens * pricing["input"] / 1_000_000
+            + completion_tokens * pricing["output"] / 1_000_000
+        )
+        logger.info(
+            f"LLM stream done: chunks={chunks_emitted}, chars={total_chars}, "
+            f"prompt={prompt_tokens}, completion={completion_tokens}, "
+            f"total={total_tokens}, model={model_name}, "
+            f"cost=${cost_usd:.6f}"
+        )
+    else:
+        # Модель не в таблице — логируем usage без cost
+        logger.info(
+            f"LLM stream done: chunks={chunks_emitted}, chars={total_chars}, "
+            f"prompt={prompt_tokens}, completion={completion_tokens}, "
+            f"total={total_tokens}, model={model_name}, "
+            f"cost=N/A (model not in pricing table)"
+        )
 
 
 async def _do_llm_stream_request(
@@ -2349,6 +2435,8 @@ async def _do_llm_stream_request(
             _last_llm_call_time = time.monotonic()
             chunks_emitted = 0
             total_chars = 0
+            # Sprint 5: usage из финального chunk'а (если stream_options.include_usage=true)
+            usage_data: dict | None = None
 
             async for line in response.aiter_lines():
                 # SSE-формат: строки вида "data: {...}" разделены пустой строкой.
@@ -2360,10 +2448,8 @@ async def _do_llm_stream_request(
                     continue
                 data_str = line[len("data:"):].strip()
                 if data_str == "[DONE]":
-                    logger.info(
-                        f"LLM stream done: chunks={chunks_emitted}, "
-                        f"chars={total_chars}"
-                    )
+                    # Sprint 5: логируем cost перед выходом
+                    _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
                     return
                 # Парсим JSON-чанк
                 try:
@@ -2374,6 +2460,11 @@ async def _do_llm_stream_request(
                         f"{data_str[:120]}"
                     )
                     continue
+                # Sprint 5: ZhipuAI/OpenAI возвращает usage в финальном chunk'е
+                # (при stream_options.include_usage=true). choices при этом
+                # пустой [] или отсутствует — поэтому проверяем usage ПЕРЕД choices.
+                if chunk_json.get("usage"):
+                    usage_data = chunk_json["usage"]
                 choices = chunk_json.get("choices") or []
                 if not choices:
                     continue
@@ -2384,10 +2475,23 @@ async def _do_llm_stream_request(
                     total_chars += len(content_piece)
                     yield content_piece
 
+            # Stream закончился без явного [DONE] (некоторые провайдеры так делают).
+            # Sprint 5: всё равно логируем cost, если есть usage.
+            _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
+
     except httpx.HTTPStatusError:
         raise
     except httpx.TimeoutException as e:
         logger.error(f"LLM stream: timeout ({e})")
+        raise
+    except (asyncio.CancelledError, GeneratorExit):
+        # Sprint 5: клиент отменил стрим (AbortController / http.disconnect).
+        # httpx.AsyncClient.stream() через async with сам закроет соединение
+        # при выходе из блока, но логируем для видимости.
+        logger.info(
+            f"LLM stream: cancelled by consumer "
+            f"(chunks={chunks_emitted}, chars={total_chars})"
+        )
         raise
     except Exception:
         # Обрыв соединения посреди потока — логируем и завершаем.

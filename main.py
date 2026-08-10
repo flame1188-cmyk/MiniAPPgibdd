@@ -257,6 +257,22 @@ async def lifespan(app: FastAPI):
             f"PostgreSQL init failed: {exc} — продолжаем с in-memory fallback"
         )
 
+    # === Sprint 5: Task recovery на startup ===
+    # После рестарта сервера in-flight задачи (status='fetching'/'parsing'/
+    # 'analytics'/'generating'/'running') остаются в этом статусе вечно —
+    # рабочий процесс, который их обрабатывал, умер. Помечаем их как failed,
+    # чтобы пользователь увидел ошибку и мог пересоздать задачу.
+    try:
+        from miniapp.backend.db.repository import recover_incomplete_tasks
+        recovered = await recover_incomplete_tasks()
+        if recovered > 0:
+            logger.info(
+                f"Sprint 5 recovery: {recovered} незавершённых задач "
+                f"помечено как failed (прервано рестартом сервера)"
+            )
+    except Exception as exc:
+        logger.warning(f"Sprint 5 recovery failed: {exc}")
+
     # === Фоновая задача: периодическая очистка старых задач ===
     # In-memory хранилище _tasks растёт без ограничений — каждая задача
     # держит мегабайты карточек ДТП, prev_cards, raw_clusters и т.д.
