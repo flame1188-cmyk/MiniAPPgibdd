@@ -1878,7 +1878,7 @@ async def _ask_free_llm(
         "model": LLM_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 16384,
+        "max_tokens": 8192,
     }
 
     headers = {
@@ -1933,7 +1933,7 @@ async def _ask_paid_llm(
         "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 16384,
+        "max_tokens": 8192,
     }
 
     headers = {
@@ -2373,7 +2373,7 @@ async def _ask_llm_stream_paid(
         "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": 16384,
+        "max_tokens": 8192,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
@@ -2798,25 +2798,51 @@ async def get_ai_answer(
 
     Returns:
         Текст ответа от нейросети
-    """
-    prompt = build_question_prompt(
-        question, comparison, reg_name, current_label, prev_label,
-        raw_supplement=raw_supplement,
-        news_context=news_context,
-        clusters_context=clusters_context,
-        cross_tables_context=cross_tables_context,
-    )
 
-    # Если есть история — добавляем явный маркер в начало промпта,
-    # чтобы модель обратила внимание на контекст диалога
-    # (иначе follow-up-вопрос «тонет» в ~10к символов аналитики).
+    Sprint 6 hotfix2: реорганизована структура user_message.
+    См. get_ai_answer_stream — там же логика.
+    """
+    # Шаг 1: собираем "контекст аналитики"
+    metrics_text = format_metrics_for_prompt(
+        comparison, reg_name, current_label, prev_label,
+    )
+    analytics_context = metrics_text
+    if cross_tables_context:
+        analytics_context += f"\n\n{cross_tables_context}"
+    if clusters_context:
+        analytics_context += f"\n\n{clusters_context}"
+    if raw_supplement:
+        analytics_context += f"\n\n{raw_supplement}"
+    if news_context:
+        analytics_context += f"\n\n{news_context}"
+
+    # Шаг 2: финальный prompt
     if history:
         prompt = (
-            "[ПРОДОЛЖЕНИЕ ДИАЛОГА]\n"
-            "Выше приведены предыдущие вопросы пользователя и твои ответы. "
-            "Учитывай их при ответе на текущий вопрос — не противоречь, "
-            "опирайся на уже сказанное, для follow-up раскрывай новые аспекты.\n\n"
-            + prompt
+            f"{analytics_context}\n\n"
+            f"=== КОНЕЦ КОНТЕКСТА АНАЛИТИКИ ===\n\n"
+            f"[ПРОДОЛЖЕНИЕ ДИАЛОГА]\n"
+            f"В предыдущих сообщениях этого диалога (role=user/assistant "
+            f"в массиве messages) приведены предыдущие вопросы пользователя "
+            f"и твои ответы. Учитывай их при ответе на текущий вопрос: "
+            f"не противоречь, опирайся на уже сказанное, для follow-up "
+            f"раскрывай новые аспекты.\n\n"
+            f"ВАЖНО: текущий вопрос ниже — это НОВЫЙ вопрос пользователя. "
+            f"Не путай его с продолжением последнего ответа. Если это "
+            f"мета-вопрос про контекст диалога (например «ты помнишь "
+            f"контекст?», «о чём мы говорили?») — кратко подтверди, "
+            f"перечислив темы предыдущих вопросов (1-2 предложения), "
+            f"и предложи продолжить. НЕ отвечай на последний вопрос "
+            f"из истории заново.\n\n"
+            f"=== НОВЫЙ ВОПРОС ПОЛЬЗОВАТЕЛЯ ===\n"
+            f"{question}\n"
+        )
+    else:
+        prompt = (
+            f"{analytics_context}\n\n"
+            f"=== КОНЕЦ КОНТЕКСТА АНАЛИТИКИ ===\n\n"
+            f"=== ВОПРОС ПОЛЬЗОВАТЕЛЯ ===\n"
+            f"{question}\n"
         )
 
     # Q&A — более низкая температура, чем для summary:
@@ -2916,22 +2942,63 @@ async def get_ai_answer_stream(
     """
     Streaming-версия get_ai_answer: yields дельты ответа по мере
     поступления от LLM. Используется для Q&A в реальном времени.
-    """
-    prompt = build_question_prompt(
-        question, comparison, reg_name, current_label, prev_label,
-        raw_supplement=raw_supplement,
-        news_context=news_context,
-        clusters_context=clusters_context,
-        cross_tables_context=cross_tables_context,
-    )
 
+    Sprint 6 hotfix2: реорганизована структура user_message.
+    Раньше маркер "[ПРОДОЛЖЕНИЕ ДИАЛОГА]" шёл в начале message, а
+    40к символов аналитики (cross_tables) — в конце, что заставляло
+    LLM путать новый вопрос с продолжением последнего Q&A из history.
+
+    Теперь: аналитика в начале (как контекст), явный разделитель и
+    новый вопрос — в самом конце. LLM чётко видит границу между
+    контекстом и текущим вопросом.
+    """
+    # Шаг 1: собираем "контекст аналитики" — metrics + cross_tables + clusters
+    metrics_text = format_metrics_for_prompt(
+        comparison, reg_name, current_label, prev_label,
+    )
+    analytics_context = metrics_text
+    if cross_tables_context:
+        analytics_context += f"\n\n{cross_tables_context}"
+    if clusters_context:
+        analytics_context += f"\n\n{clusters_context}"
+    if raw_supplement:
+        analytics_context += f"\n\n{raw_supplement}"
+    if news_context:
+        analytics_context += f"\n\n{news_context}"
+
+    # Шаг 2: финальный prompt — аналитика, потом явный marquer и вопрос
     if history:
+        # Sprint 6 hotfix2: чёткая структура с вопросом в конце.
+        # - Сначала контекст аналитики (LLM видит цифры)
+        # - Потом явный marquer с инструкцией учитывать OpenAI history
+        # - В самом конце — НОВЫЙ вопрос, чтобы LLM не спутала его
+        #   с продолжением последнего Q&A из history
         prompt = (
-            "[ПРОДОЛЖЕНИЕ ДИАЛОГА]\n"
-            "Выше приведены предыдущие вопросы пользователя и твои ответы. "
-            "Учитывай их при ответе на текущий вопрос — не противоречь, "
-            "опирайся на уже сказанное, для follow-up раскрывай новые аспекты.\n\n"
-            + prompt
+            f"{analytics_context}\n\n"
+            f"=== КОНЕЦ КОНТЕКСТА АНАЛИТИКИ ===\n\n"
+            f"[ПРОДОЛЖЕНИЕ ДИАЛОГА]\n"
+            f"В предыдущих сообщениях этого диалога (role=user/assistant "
+            f"в массиве messages) приведены предыдущие вопросы пользователя "
+            f"и твои ответы. Учитывай их при ответе на текущий вопрос: "
+            f"не противоречь, опирайся на уже сказанное, для follow-up "
+            f"раскрывай новые аспекты.\n\n"
+            f"ВАЖНО: текущий вопрос ниже — это НОВЫЙ вопрос пользователя. "
+            f"Не путай его с продолжением последнего ответа. Если это "
+            f"мета-вопрос про контекст диалога (например «ты помнишь "
+            f"контекст?», «о чём мы говорили?») — кратко подтверди, "
+            f"перечислив темы предыдущих вопросов (1-2 предложения), "
+            f"и предложи продолжить. НЕ отвечай на последний вопрос "
+            f"из истории заново.\n\n"
+            f"=== НОВЫЙ ВОПРОС ПОЛЬЗОВАТЕЛЯ ===\n"
+            f"{question}\n"
+        )
+    else:
+        # Без истории — простая структура (как раньше)
+        prompt = (
+            f"{analytics_context}\n\n"
+            f"=== КОНЕЦ КОНТЕКСТА АНАЛИТИКИ ===\n\n"
+            f"=== ВОПРОС ПОЛЬЗОВАТЕЛЯ ===\n"
+            f"{question}\n"
         )
 
     async for delta in ask_llm_stream(
