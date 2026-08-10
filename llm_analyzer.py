@@ -144,6 +144,72 @@ _last_llm_call_time: float = 0.0
 _MIN_LLM_INTERVAL: float = 5.0  # секунды между запросами (для glm-4.7-flash достаточно)
 
 # ============================================================
+# Sprint 5: Глобальный 429-cooldown — защита от каскада 429 от ZhipuAI
+# ============================================================
+# После получения 429 от ZhipuAI (код 1305: "该模型当前访问量过大")
+# устанавливаем «чёрный период» длительностью _LLM_429_COOLDOWN_SEC,
+# в течение которого любые новые запросы ждут его истечения.
+# Это решает проблему: пользователь читает ответ 20-30 сек, потом
+# задаёт новый вопрос — а ZhipuAI всё ещё throttling (его rate window
+# может быть 60+ сек). Без этого cooldown'а каждый новый запрос
+# мгновенно возвращает 429.
+#
+# Атомарность: обновление через asyncio.Lock, чтобы 2 параллельных
+# coroutine не перетёрли значение.
+_LLM_429_COOLDOWN_SEC: float = 60.0  # длительность чёрного периода после 429
+_llm_429_until: float = 0.0  # monotonic-время до которого действуют ограничения
+_llm_429_lock: asyncio.Lock | None = None  # lazy-init (нужен running loop)
+
+
+def _get_429_lock() -> asyncio.Lock:
+    """Lazy-init asyncio.Lock — создаётся при первом обращении."""
+    global _llm_429_lock
+    if _llm_429_lock is None:
+        _llm_429_lock = asyncio.Lock()
+    return _llm_429_lock
+
+
+async def mark_429(retry_after: float | None = None) -> None:
+    """
+    Помечает, что получен 429 от LLM-провайдера.
+    Устанавливает cooldown на _LLM_429_COOLDOWN_SEC секунд
+    (или на retry_after, если провайдер прислал больше).
+
+    Вызывается из _do_llm_request и _do_llm_stream_request при 429.
+    """
+    global _llm_429_until
+    cooldown = max(_LLM_429_COOLDOWN_SEC, retry_after or 0.0)
+    async with _get_429_lock():
+        new_until = time.monotonic() + cooldown
+        # Берём максимум — если уже есть активный cooldown, продлеваем
+        _llm_429_until = max(_llm_429_until, new_until)
+    logger.warning(
+        f"LLM 429 cooldown activated for {cooldown:.0f}s "
+        f"(retry_after={retry_after})"
+    )
+
+
+async def wait_429_cooldown() -> float:
+    """
+    Если действует 429-cooldown — ждёт до его истечения.
+    Возвращает количество секунд, которое пришлось ждать (0 если не ждали).
+
+    Атомарно читает и не сбрасывает значение — cooldown продолжает действовать,
+    пока не истечёт по времени.
+    """
+    global _llm_429_until
+    async with _get_429_lock():
+        remaining = _llm_429_until - time.monotonic()
+    if remaining <= 0:
+        return 0.0
+    logger.info(
+        f"LLM 429 cooldown active — waiting {remaining:.1f}s before request..."
+    )
+    # Ждём вне блокировки — иначе другие coroutines повиснут
+    await asyncio.sleep(remaining)
+    return remaining
+
+# ============================================================
 # Системный промпт — определяет роль нейросети
 # ============================================================
 
@@ -1899,6 +1965,13 @@ async def _do_llm_request(
     Универсная функция выполнения HTTP-запроса к LLM API.
     Обрабатывает ретраи при 429, 5xx и таймаутах, парсит ответ.
     """
+    # --- Sprint 5: Глобальный 429-cooldown (если был 429 ранее) ---
+    waited_cooldown = await wait_429_cooldown()
+    if waited_cooldown > 0:
+        logger.info(
+            f"LLM: после 429-cooldown ({waited_cooldown:.0f}s) — продолжаем запрос"
+        )
+
     # --- Глобальный rate limiter ---
     global _last_llm_call_time
     now = time.monotonic()
@@ -1971,6 +2044,19 @@ async def _do_llm_request(
             )
 
             if response.status_code == 429:
+                # Sprint 5: помечаем глобальный 429-cooldown, чтобы
+                # другие coroutine (включая streaming-запросы) тоже ждали.
+                retry_after_val: float | None = None
+                if retry_after_raw := (
+                    response.headers.get("Retry-After")
+                    or response.headers.get("retry-after")
+                ):
+                    try:
+                        retry_after_val = float(retry_after_raw)
+                    except (ValueError, TypeError):
+                        retry_after_val = None
+                await mark_429(retry_after=retry_after_val)
+
                 if attempt < max_retries:
                     retry_after = (
                         response.headers.get("Retry-After")
@@ -2383,9 +2469,32 @@ async def _do_llm_stream_request(
     Универсальный streaming-вызов LLM API.
     Парсит SSE-ответ OpenAI-совместимого формата.
 
-    НЕ делает ретраев. Если первый байт получен и потом поток оборвался —
-    логируем и завершаемся (caller сохранит partial-результат).
+    Sprint 5: ДЕЛАЕТ retry на 429 — в отличие от предыдущей версии,
+    которая сразу бросала httpx.HTTPStatusError. Логика:
+      1. Перед запросом ждём 429-cooldown (если активен).
+      2. Делаем запрос. Если 429 — mark_429() (cooldown 60 сек),
+         ждём, повторяем (до _STREAM_429_MAX_RETRIES раз).
+      3. На 200 — стримим чанки. Retry после начала стрима невозможен
+         (commit к этому ответу).
+
+    Если первый байт получен и потом поток оборвался — логируем и
+    завершаемся (caller сохранит partial-результат).
     """
+    # Sprint 5: retry-config для streaming 429.
+    # Дольше, чем для sync — но streaming-вызовы дорогие (summary ~53 сек,
+    # QA ~45 сек), и пользователь готов ждать, лишь бы получить ответ.
+    _STREAM_429_RETRIES = 2  # итого до 3 попыток (1 + 2 retry)
+    _STREAM_429_BASE_WAIT = 30.0  # первая пауза перед retry
+    _STREAM_429_BACKOFF = 1.5  # множитель для последующих пауз
+
+    # --- Sprint 5: Глобальный 429-cooldown (если был 429 ранее) ---
+    waited_cooldown = await wait_429_cooldown()
+    if waited_cooldown > 0:
+        logger.info(
+            f"LLM stream: после 429-cooldown ({waited_cooldown:.0f}s) "
+            f"— продолжаем запрос"
+        )
+
     # --- Глобальный rate limiter (один раз до запроса) ---
     global _last_llm_call_time
     now = time.monotonic()
@@ -2402,103 +2511,144 @@ async def _do_llm_stream_request(
     )
 
     client = client_getter()
-    # stream=True → httpx не скачивает тело сразу, отдаёт по chunk'ам
-    # через async with client.stream(...). timeout у клиента уже 300/600 сек.
-    try:
-        async with client.stream(
-            "POST", api_url, headers=headers, json=payload,
-        ) as response:
-            # Проверяем статус ДО чтения потока.
-            # 4xx/5xx — тело может содержать JSON с ошибкой, читаем его целиком.
-            if response.status_code != 200:
-                body_text = ""
-                try:
-                    async for chunk in response.aiter_bytes():
-                        body_text += chunk.decode("utf-8", errors="replace")
-                        if len(body_text) > 2000:
-                            break
-                except Exception:
-                    pass
-                _last_llm_call_time = time.monotonic()
-                err_preview = body_text[:300] if body_text else response.reason_phrase
-                logger.error(
-                    f"LLM stream: HTTP {response.status_code} "
-                    f"({response.reason_phrase}): {err_preview}"
-                )
-                raise httpx.HTTPStatusError(
-                    f"LLM stream API вернул {response.status_code}: {err_preview}",
-                    request=response.request,
-                    response=response,
-                )
-
-            # 200 OK — стримим SSE-чанки
-            _last_llm_call_time = time.monotonic()
-            chunks_emitted = 0
-            total_chars = 0
-            # Sprint 5: usage из финального chunk'а (если stream_options.include_usage=true)
-            usage_data: dict | None = None
-
-            async for line in response.aiter_lines():
-                # SSE-формат: строки вида "data: {...}" разделены пустой строкой.
-                # aiter_lines уже убирает \n, но пустые строки остаются как "".
-                if not line:
-                    continue
-                if not line.startswith("data:"):
-                    # Комментарий (":keep-alive") или что-то странное — игнорируем
-                    continue
-                data_str = line[len("data:"):].strip()
-                if data_str == "[DONE]":
-                    # Sprint 5: логируем cost перед выходом
-                    _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
-                    return
-                # Парсим JSON-чанк
-                try:
-                    chunk_json = json.loads(data_str)
-                except json.JSONDecodeError as e:
-                    logger.warning(
-                        f"LLM stream: невалидный JSON chunk ({e}): "
-                        f"{data_str[:120]}"
+    # Sprint 5: retry-loop для 429. Важно — обернуть только фазу получения
+    # HTTP-ответа (до aiter_lines). После получения 200 — уже не ретраим.
+    attempt = 0
+    while True:
+        try:
+            async with client.stream(
+                "POST", api_url, headers=headers, json=payload,
+            ) as response:
+                # Проверяем статус ДО чтения потока.
+                # 4xx/5xx — тело может содержать JSON с ошибкой, читаем его целиком.
+                if response.status_code != 200:
+                    body_text = ""
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            body_text += chunk.decode("utf-8", errors="replace")
+                            if len(body_text) > 2000:
+                                break
+                    except Exception:
+                        pass
+                    _last_llm_call_time = time.monotonic()
+                    err_preview = body_text[:300] if body_text else response.reason_phrase
+                    logger.error(
+                        f"LLM stream: HTTP {response.status_code} "
+                        f"({response.reason_phrase}): {err_preview}"
                     )
-                    continue
-                # Sprint 5: ZhipuAI/OpenAI возвращает usage в финальном chunk'е
-                # (при stream_options.include_usage=true). choices при этом
-                # пустой [] или отсутствует — поэтому проверяем usage ПЕРЕД choices.
-                if chunk_json.get("usage"):
-                    usage_data = chunk_json["usage"]
-                choices = chunk_json.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {}) or {}
-                content_piece = delta.get("content") or ""
-                if content_piece:
-                    chunks_emitted += 1
-                    total_chars += len(content_piece)
-                    yield content_piece
 
-            # Stream закончился без явного [DONE] (некоторые провайдеры так делают).
-            # Sprint 5: всё равно логируем cost, если есть usage.
-            _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
+                    # Sprint 5: если 429 — retry с backoff
+                    if response.status_code == 429 and attempt < _STREAM_429_RETRIES:
+                        # Парсим Retry-After (если есть)
+                        retry_after_str = (
+                            response.headers.get("Retry-After")
+                            or response.headers.get("retry-after")
+                        )
+                        retry_after: float | None = None
+                        if retry_after_str:
+                            try:
+                                retry_after = float(retry_after_str)
+                            except (ValueError, TypeError):
+                                retry_after = None
+                        # Устанавливаем глобальный cooldown (60 сек)
+                        await mark_429(retry_after=retry_after)
+                        # Локальная пауза перед retry: используем max(retry_after, base_wait)
+                        wait_sec = _STREAM_429_BASE_WAIT * (_STREAM_429_BACKOFF ** attempt)
+                        if retry_after and retry_after > wait_sec:
+                            wait_sec = retry_after
+                        attempt += 1
+                        logger.warning(
+                            f"LLM stream: 429 Too Many Requests. "
+                            f"Retry {attempt}/{_STREAM_429_RETRIES} через {wait_sec:.0f}с..."
+                        )
+                        await asyncio.sleep(wait_sec)
+                        # На следующий retry — снова проверим cooldown
+                        await wait_429_cooldown()
+                        continue  # повторяем цикл
 
-    except httpx.HTTPStatusError:
-        raise
-    except httpx.TimeoutException as e:
-        logger.error(f"LLM stream: timeout ({e})")
-        raise
-    except (asyncio.CancelledError, GeneratorExit):
-        # Sprint 5: клиент отменил стрим (AbortController / http.disconnect).
-        # httpx.AsyncClient.stream() через async with сам закроет соединение
-        # при выходе из блока, но логируем для видимости.
-        logger.info(
-            f"LLM stream: cancelled by consumer "
-            f"(chunks={chunks_emitted}, chars={total_chars})"
-        )
-        raise
-    except Exception:
-        # Обрыв соединения посреди потока — логируем и завершаем.
-        # Если уже что-то yielded — caller сохранит partial. Если ничего —
-        # caller увидит пустой результат.
-        logger.exception("LLM stream: обрыв соединения посреди потока")
-        return
+                    # Не 429 или retries закончились — бросаем ошибку
+                    raise httpx.HTTPStatusError(
+                        f"LLM stream API вернул {response.status_code}: {err_preview}",
+                        request=response.request,
+                        response=response,
+                    )
+
+                # 200 OK — стримим SSE-чанки
+                _last_llm_call_time = time.monotonic()
+                chunks_emitted = 0
+                total_chars = 0
+                # Sprint 5: usage из финального chunk'а (если stream_options.include_usage=true)
+                usage_data: dict | None = None
+
+                async for line in response.aiter_lines():
+                    # SSE-формат: строки вида "data: {...}" разделены пустой строкой.
+                    # aiter_lines уже убирает \n, но пустые строки остаются как "".
+                    if not line:
+                        continue
+                    if not line.startswith("data:"):
+                        # Комментарий (":keep-alive") или что-то странное — игнорируем
+                        continue
+                    data_str = line[len("data:"):].strip()
+                    if data_str == "[DONE]":
+                        # Sprint 5: логируем cost перед выходом
+                        _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
+                        return
+                    # Парсим JSON-чанк
+                    try:
+                        chunk_json = json.loads(data_str)
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            f"LLM stream: невалидный JSON chunk ({e}): "
+                            f"{data_str[:120]}"
+                        )
+                        continue
+                    # Sprint 5: ZhipuAI/OpenAI возвращает usage в финальном chunk'е
+                    # (при stream_options.include_usage=true). choices при этом
+                    # пустой [] или отсутствует — поэтому проверяем usage ПЕРЕД choices.
+                    if chunk_json.get("usage"):
+                        usage_data = chunk_json["usage"]
+                    choices = chunk_json.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {}) or {}
+                    content_piece = delta.get("content") or ""
+                    if content_piece:
+                        chunks_emitted += 1
+                        total_chars += len(content_piece)
+                        yield content_piece
+
+                # Stream закончился без явного [DONE] (некоторые провайдеры так делают).
+                # Sprint 5: всё равно логируем cost, если есть usage.
+                _log_llm_cost(model_name, usage_data, chunks_emitted, total_chars)
+                # Успешно завершилось — выходим из retry-loop
+                return
+
+        except httpx.HTTPStatusError:
+            # Если это 429 и мы попытались сделать retry — цикл уже продолжился.
+            # Сюда попадаем только если retries закончились или это не 429.
+            raise
+        except httpx.TimeoutException as e:
+            logger.error(f"LLM stream: timeout ({e})")
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            # Sprint 5: клиент отменил стрим (AbortController / http.disconnect).
+            # httpx.AsyncClient.stream() через async with сам закроет соединение
+            # при выходе из блока, но логируем для видимости.
+            # chunks_emitted/total_chars могут быть не определены, если cancel
+            # случился до входа в 200-OK ветку — используем .get() через locals().
+            _locals = locals()
+            logger.info(
+                f"LLM stream: cancelled by consumer "
+                f"(chunks={_locals.get('chunks_emitted', 0)}, "
+                f"chars={_locals.get('total_chars', 0)})"
+            )
+            raise
+        except Exception:
+            # Обрыв соединения посреди потока — логируем и завершаем.
+            # Если уже что-то yielded — caller сохранит partial. Если ничего —
+            # caller увидит пустой результат.
+            logger.exception("LLM stream: обрыв соединения посреди потока")
+            return
 
 
 async def get_ai_summary(
