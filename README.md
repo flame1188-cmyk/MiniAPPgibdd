@@ -3,7 +3,7 @@
 Telegram-бот и веб-Mini App для выгрузки и анализа данных ДТП из открытых данных ГИБДД ([stat.gibdd.ru](http://stat.gibdd.ru)).
 
 Проект объединяет:
-- **Telegram-бот** (`bot.py`) — команды, inline-кнопки, выгрузка файлов в чат, нативные HTML-карты в attachment.
+- **Telegram-бот** (`bot.py` + пакет `bot/`) — команды, inline-кнопки, выгрузка файлов в чат, нативные HTML-карты в attachment.
 - **Mini App** (`miniapp/`) — FastAPI backend + React/TypeScript frontend, открывается в нативном WebView Telegram (решает проблему iOS Quick Look, не выполняющего JS).
 - **Единая точка входа** (`main.py`) — поднимает FastAPI и Telegram-бота (webhook) в одном процессе, раздаёт Mini App на `/app/`.
 
@@ -216,6 +216,51 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
 2. Линейный очаг без камеры на участке → гео-поиск от крайних точек (1 км НП / 500 м вне НП)
 3. Очаг без пикетажа (НП) → гео-поиск 200 м (закрытый) и 500 м (ближайшие)
 
+### Архитектура Telegram-бота (пакет `bot/`)
+
+После Phase 3-2 рефакторинга (август 2026) монолитный `bot.py` (4138 строк)
+разбит на модульный пакет `bot/` с thin shim `bot.py` для обратной совместимости.
+Принцип: 100% pure refactoring — никакая логика не изменена, только перемещена.
+
+```
+bot.py (13 строк)                ← thin shim: from bot.app import main; main()
+└── bot/
+    ├── _state.py      (214)     ← shared state: imports, logger, globals, constants
+    ├── infra.py       (178)     ← утилиты TG API: _tg_retry, _safe_edit, _send_long_message
+    ├── access.py      (187)     ← доступ + загрузка регионов: is_user_allowed, _fetch_cards_for_period
+    ├── keyboards.py   (109)     ← inline-клавиатуры: build_region_keyboard, build_period_keyboard
+    ├── analysis.py   (1335)     ← конвейер аналитики и очагов (самый большой модуль)
+    ├── output.py      (258)     ← HTML-карты: _generate_and_send_dtp_map, _send_analytics_html
+    ├── point_stats.py (422)     ← статистика по геоточке: _start_point_stats, _process_point_stats
+    ├── qa.py          (150)     ← Q&A с LLM: _handle_analytics_question
+    ├── app.py         (204)     ← точка входа: main, _build_app, error_handler
+    └── handlers/
+        ├── commands.py   (391)  ← /start /help /dtp /regions /miniapp /precache
+        ├── callbacks.py  (512)  ← on_callback_query (488 строк, перенесён as-is)
+        └── messages.py   (365)  ← handle_message + _handle_document
+```
+
+**Граф зависимостей** (без циклов):
+```
+app → handlers/* → analysis, point_stats, qa, output
+                 → keyboards, access, infra
+analysis → access, infra, keyboards, output
+output → infra
+point_stats → access, infra
+qa → infra
+infra / access / keyboards → _state
+```
+
+Все глобальные переменные (`_api_down`, `_user_locks`, `_precache_lock`, `logger`,
+константы `TG_MSG_LIMIT`, `MONTH_*`, etc.) объявлены в `bot/_state.py` и
+импортируются через `from bot._state import *`. Это гарантирует, что состояние
+едино во всех модулях (проверено smoke-тестом `test_shared_state_is_single_instance`).
+
+**Тестирование**: 19 smoke-тестов в `tests/smoke/test_bot_package.py` проверяют
+импорт всех 14 модулей, thin shim, публичный API, единственность shared state,
+отсутствие циклических импортов и структуру директории. PTB-зависимые тесты
+корректно skip'аются, если `python-telegram-bot` не установлен.
+
 ### LLM-контекст для AI-анализа
 
 Промпт для GLM формируется из нескольких секций:
@@ -235,7 +280,7 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
                исчезнувшие)   Z-score, χ²)
                   │
                   ▼
-         Q&A history (последние 6 пар)
+         Q&A history (последние 10 пар)
 ```
 
 **Разделение очагов по категориям для LLM** (метод `format_clusters_for_prompt`):
@@ -244,6 +289,44 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
 - **ИСЧЕЗНУВШИЕ** — очаги прошлого периода, которых больше нет
 
 В Top-10 по тяжести для UI передаются только текущие очаги (исключая `is_lost` и `is_prev_matched`).
+
+#### Sprint 5 — Streaming SSE
+
+Резюме и Q&A стримятся через Server-Sent Events:
+- POST `/api/dtp/tasks/{task_id}/llm/summary/stream` — токены резюме по мере поступления
+- POST `/api/dtp/tasks/{task_id}/llm/ask/stream` — токены ответа на вопрос
+- Backend: `stream_llm_summary()` / `ask_llm_question_stream()` в `services/llm_ops.py`
+- Frontend: `EventSource`-подобный fetch-stream в `LLMAnalysisView.tsx`
+- При `finish_reason=length` — WARNING в логах с подсказкой поднять `LLM_MAX_TOKENS`
+- При 429 (rate limit) — до 3 ретраев с экспоненциальной задержкой (1с → 2с → 4с)
+
+#### Sprint 6 — Персистентные LLM-сессии
+
+После рестарта приложения резюме и история Q&A больше не теряются:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  llm_sessions (PostgreSQL)                              │
+│  ─────────────────────────────                          │
+│  task_id           VARCHAR(32)  PRIMARY KEY             │
+│  user_id           BIGINT                               │
+│  summary_text      TEXT          ← финальный текст      │
+│  summary_provider  VARCHAR(16)                          │
+│  summary_generated_at TIMESTAMPTZ                       │
+│  qa_history        JSONB         ← массив {question,    │
+│                                       answer, provider, │
+│                                       timestamp}        │
+│                       trim до 10 последних              │
+│  updated_at        TIMESTAMPTZ   ← auto-trigger         │
+└─────────────────────────────────────────────────────────┘
+```
+
+- `save_llm_session(task_id, ...)` — upsert после стрима резюме (fire-and-forget)
+- `append_qa_entry(task_id, question, answer, provider)` — atomic jsonb-обновление после каждого Q&A с trim до 10
+- `load_llm_session(task_id)` — fast path при `get_task_async()`: восстанавливает `llm_summary_state` и `llm_qa_history`, если in-memory LRU их уже вытеснил
+- Логи восстановления: `Sprint 6: restored LLM summary...` / `Sprint 6: restored Q&A history... (N entries)`
+- UI: кнопки «⧉ Копировать» (финальный ответ + partial во время стрима + резюме) и «↻ Повторить» (новый стрим с тем же вопросом)
+- `CopyButton` с fallback на `execCommand` для не-secure context (Telegram WebView на iOS)
 
 ---
 
@@ -297,6 +380,15 @@ cp .env.example .env
 | `LLM_API_KEY` | API-ключ [ZhipuAI](https://open.bigmodel.cn) для AI-анализа | Нет |
 | `LLM_MODEL` | Модель GLM (по умолчанию `glm-4.7-flash`) | Нет |
 | `ENABLE_NEWS_SEARCH` | Поиск новостей для контекста LLM (`true`/`false`, по умолчанию `true`) | Нет |
+| `LLM_PAID_API_KEY` | API-ключ платного провайдера (AItunnel, OpenRouter) для расширенного AI-анализа | Нет |
+| `LLM_PAID_API_URL` | URL платного провайдера без `/chat/completions` (по умолчанию `https://api.aitunnel.ru/v1`) | Нет |
+| `LLM_PAID_MODEL` | Модель платного LLM (по умолчанию `deepseek-v4-flash`) | Нет |
+| `LLM_MAX_TOKENS` | Лимит длины ответа LLM в токенах (по умолчанию `16384`). При `finish_reason=length` в логах WARNING — поднимите значение | Нет |
+| `ADMIN_TELEGRAM_IDS` | ID администраторов через запятую — для системных алертов (cache TTL, мониторинг) | Нет |
+| `MAX_CONCURRENT_TASKS` | Лимит одновременных задач выгрузки (по умолчанию `5`, `asyncio.Semaphore`) | Нет |
+| `RATE_LIMIT_PER_MINUTE` | Лимит запросов API на пользователя в минуту (slowapi, по умолчанию `60`) | Нет |
+| `MAX_INMEMORY_TASKS` | Размер LRU-кэша задач в памяти (по умолчанию `50`) | Нет |
+| `LOG_FORMAT` | Формат логов: `text` (по умолчанию) или `json` (структурированные логи для ELK/Loki) | Нет |
 | `REGIONS_API_ENABLED` | Запрос справочника регионов через API ГИБДД (`1`/`0`, по умолчанию `0` — сразу файловый кэш) | Нет |
 | `TARGET_API_TIMEOUT` | Таймаут запросов к API ГИБДД в секундах (по умолчанию `120`) | Нет |
 | `LOG_LEVEL` | Уровень логирования (по умолчанию `INFO`) | Нет |
@@ -370,8 +462,22 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<B
 ```
 gibdd-bot/
 ├── main.py                 ← Единая точка входа: FastAPI + bot (webhook)
-├── bot.py                  ← Telegram-бот (polling): команды, inline-кнопки,
-│                              пайплайн выгрузки, отправка файлов
+├── bot.py                  ← Thin shim (13 строк): from bot.app import main; main()
+├── bot/                    ← Пакет Telegram-бота (Phase 3-2 рефакторинг)
+│   ├── __init__.py         ←   документация пакета
+│   ├── _state.py           ←   shared state (imports, logger, globals, constants)
+│   ├── infra.py            ←   утилиты TG API (_tg_retry, _safe_edit, _send_long_message)
+│   ├── access.py           ←   доступ + загрузка регионов (_fetch_cards_for_period)
+│   ├── keyboards.py        ←   inline-клавиатуры (region, period)
+│   ├── analysis.py         ←   конвейер аналитики и очагов (~1300 строк)
+│   ├── output.py           ←   HTML-карты (_generate_and_send_dtp_map)
+│   ├── point_stats.py      ←   статистика по геоточке
+│   ├── qa.py               ←   Q&A с LLM (_handle_analytics_question)
+│   ├── app.py              ←   точка входа (main, _build_app, error_handler)
+│   └── handlers/           ←   обработчики PTB
+│       ├── commands.py     ←     /start /help /dtp /regions /miniapp /precache
+│       ├── callbacks.py    ←     on_callback_query (диспетчер кнопок)
+│       └── messages.py     ←     handle_message + _handle_document
 ├── api_client.py           ← HTTP-клиент для Open Data API stat.gibdd.ru
 │                              (connection pooling, ретраи с backoff, throttle)
 ├── web_fallback.py         ← Fallback-выгрузка через сайт (POST→GET→XML parse)
@@ -403,21 +509,35 @@ gibdd-bot/
 │   └── schemas/            ← JSON Schema для валидации
 ├── miniapp/                ← Telegram Mini App
 │   ├── backend/            ← FastAPI sub-app (монтируется на /api)
-│   │   ├── main.py         ← Точка входа FastAPI
+│   │   ├── main.py         ← Точка входа FastAPI (Prometheus, slowapi, middleware)
 │   │   ├── config.py       ← Pydantic-settings
 │   │   ├── telegram_auth.py← Проверка подписи initData (HMAC-SHA256)
-│   │   ├── routers/        ← regions, parse, dtp, point, cameras, analyze, np_bdd
+│   │   ├── middleware/     ← request_id, CORS, логирование
+│   │   ├── routers/        ← regions, parse, dtp, point, cameras, analyze, np_bdd, llm
+│   │   │   └── analyze.py  ←   агрегирующий router с prefix="/dtp",
+│   │   │                       включает в себя clusters, point, llm
 │   │   ├── services/
-│   │   │   ├── gibdd_service.py  ← Мост к модулям gibdd-bot
+│   │   │   ├── gibdd_service.py  ← Мост к модулям gibdd-bot (Task, pipeline, recovery)
+│   │   │   ├── llm_ops.py        ← LLM-операции: summary/Q&A, SSE-стрим, кэш, retry 429
+│   │   │   ├── task_registry.py  ← In-memory LRU _tasks + восстановление LLM-сессий
+│   │   │   ├── pipeline.py       ← Анализатор конвейера (cards→analytics→clusters)
+│   │   │   ├── analytics_ops.py  ← Аналитические операции (comparison, cross-tables)
+│   │   │   ├── clusters_ops.py   ← Расчёт очагов (concentration_points v2)
+│   │   │   ├── point_stats_ops.py← Статистика по геоточке
+│   │   │   ├── query_ops.py      ← Парсинг запросов пользователя
+│   │   │   ├── cleanup.py        ← Background cleanup (cards/clusters/excel cache TTL)
 │   │   │   └── np_bdd_service.py ← Сервис НП БДД
-│   │   └── db/             ← Слой PostgreSQL (Этап 2-5)
+│   │   └── db/             ← Слой PostgreSQL (Этап 2-6)
 │   │       ├── connection.py     ← Async-пул (psycopg), init_pool/close_pool/health_check
 │   │       ├── schema.sql        ← CREATE TABLE IF NOT EXISTS: tasks, access_log,
-│   │       │                       dtp_cards_cache, clusters_cache, excel_cache
-│   │       ├── repository.py     ← TaskRepository: save/load/list/delete, log_access
+│   │       │                       dtp_cards_cache, clusters_cache, excel_cache,
+│   │       │                       llm_cache, llm_sessions
+│   │       ├── repository.py     ← TaskRepository: save/load/list/delete, log_access,
+│   │       │                       save_llm_session/append_qa_entry/load_llm_session
 │   │       ├── cards_cache.py    ← L2-кэш карточек ДТП (Этап 3)
 │   │       ├── clusters_cache.py ← L2-кэш кластеров + raw_clusters (Этап 4)
-│   │       └── excel_cache.py    ← L2-кэш Excel-файлов (BYTEA, Этап 5)
+│   │       ├── excel_cache.py    ← L2-кэш Excel-файлов (BYTEA, Этап 5)
+│   │       └── llm_cache.py      ← L2-кэш LLM-резюме (Sprint 2, по cache_key SHA-256)
 │   └── frontend/           ← Vite + React + TypeScript + Tailwind
 │       ├── src/
 │       │   ├── App.tsx     ← Главный layout с табами
@@ -426,6 +546,11 @@ gibdd-bot/
 │       │   └── components/ ← ClustersView, LLMAnalysisView, AnalyticsView,
 │       │                     NpBddView, PointStatsView, StructuredForm, ...
 │       └── dist/           ← Собранная ститика (после npm run build)
+├── tests/                  ← Полный набор тестов (464 теста, 77% coverage)
+│   ├── unit/               ← Wave 1-2: чистые функции + LLM/service mocks
+│   ├── integration/        ← Wave 3: end-to-end pipeline + stubs
+│   ├── smoke/              ← Wave 4 + Phase 3-2: импорт, app init, структура пакета
+│   └── golden/             ← Wave 4: эталонные выходы (11 файлов)
 ├── data/                   ← Рабочая директория (кэш камер, регионов, OSM)
 ├── Dockerfile              ← Multi-stage: build frontend + Python runtime
 ├── requirements.txt        ← Зависимости Python
@@ -465,10 +590,12 @@ gibdd-bot/
 | GET | `/api/dtp/tasks/{id}/point/map` | HTML-карта точки |
 | GET | `/api/dtp/tasks/{id}/point/excel` | Excel по точке (2 листа) |
 | GET | `/api/dtp/tasks/{id}/llm/providers` | Доступные LLM-провайдеры (free/paid) |
-| POST | `/api/dtp/tasks/{id}/llm/summary` | Запустить генерацию резюме |
-| GET | `/api/dtp/tasks/{id}/llm/summary?wait=N` | Статус резюме (long polling) |
-| POST | `/api/dtp/tasks/{id}/llm/ask` | Задать вопрос нейросети |
-| GET | `/api/dtp/tasks/{id}/llm/qa-history` | История Q&A |
+| POST | `/api/dtp/tasks/{id}/llm/summary` | Запустить генерацию резюме (async) |
+| GET | `/api/dtp/tasks/{id}/llm/summary?wait=N` | Статус резюме (long polling, legacy) |
+| POST | `/api/dtp/tasks/{id}/llm/summary/stream` | **SSE-стрим** резюме (токены по мере поступления) |
+| POST | `/api/dtp/tasks/{id}/llm/ask` | Задать вопрос нейросети (async) |
+| POST | `/api/dtp/tasks/{id}/llm/ask/stream` | **SSE-стрим** ответа на вопрос |
+| GET | `/api/dtp/tasks/{id}/llm/qa-history` | История Q&A (in-memory + восстановление из БД) |
 | GET | `/api/cameras` | Список регионов с камерами |
 | POST | `/api/cameras/{reg_code}` | Загрузить реестр камер региона |
 | DELETE | `/api/cameras/{reg_code}` | Удалить реестр камер |
@@ -665,6 +792,203 @@ Vite добавляет хэш к именам файлов (`index-AbCd1234.js`
 1. Проверьте `DB_POOL_MAX` (по умолчанию 5) — при высоком RPS увеличьте
 2. Проверьте `DB_CONNECT_TIMEOUT` (по умолчанию 10с)
 3. На bothost.ru PostgreSQL иногда уходит на обслуживание — приложение автоматически переключится на in-memory fallback, но кэш будет менее эффективным
+
+---
+
+## Журнал изменений
+
+### Sprint 6 — Персистентные LLM-сессии + UX-правки (`2026-08-10`)
+
+**6.0 — LLM-сессии в PostgreSQL + Q&A UX-кнопки** (`sprint6-llm-sessions-and-qa-buttons.zip`)
+- Таблица `llm_sessions` (task_id PK, user_id, summary_text, qa_history JSONB, updated_at)
+- `save_llm_session(task_id, summary, provider)` — upsert после стрима резюме (fire-and-forget)
+- `append_qa_entry(task_id, question, answer, provider)` — atomic jsonb-обновление после Q&A с trim до 10
+- `load_llm_session(task_id)` — fast path в `get_task_async()`: восстанавливает `llm_summary_state` и `llm_qa_history` после рестарта или LRU eviction
+- `_try_restore_llm_session(task)` в `task_registry.py` — логирует `Sprint 6: restored LLM summary...` / `Sprint 6: restored Q&A history... (N entries)`
+- UI: кнопки «⧉ Копировать» (финальный ответ + partial во время стрима + резюме) и «↻ Повторить» (новый стрим с тем же вопросом)
+- `CopyButton` с fallback на `document.execCommand('copy')` для не-secure context (Telegram WebView на iOS)
+- SUGGESTED_QUESTIONS расширены с 6 до 12 (добавлены БДД-экспертиза + профиль ТС)
+- Файлы: `db/repository.py` (+250 строк: 3 новые функции), `db/schema.sql` (+50 строк: таблица llm_sessions), `services/task_registry.py` (+80 строк), `routers/llm.py` (+40 строк), `LLMAnalysisView.tsx` (+200 строк)
+
+**6.hotfix1 — SQL: `operator does not exist: jsonb || json`** (`sprint6-llm-sessions-and-qa-buttons-hotfix1.zip`)
+- В `append_qa_entry` использовался `Json()` (без `b`) — PostgreSQL неявно кастит к `json`, а не `jsonb`, и оператор `||` для `(jsonb, json)` не существует
+- **Fix:** `Json() → Jsonb()` + `::jsonb` каст на существующий `qa_history` перед `||`
+- Дополнительно: `save_llm_session` тоже defensively использует `Jsonb()` для `qa_history`
+- Интеграционный тест `scripts/test_append_qa_fix.py` против боевой БД — 4 шага проходят без ошибок
+- Логи после деплоя подтверждают: `Sprint 6: appended Q&A to session task=... (answer XXXX chars)` без WARNING
+
+**6.hotfix2 — Финальная стабилизация** (`sprint6-llm-sessions-and-qa-buttons-hotfix2.zip`)
+- Проверена вся цепочка: генерация резюме → 3 Q&A → рестарт → восстановление → новый Q&A с контекстом
+- Подтверждено пользователем: «При открытии предыдущей задачи и отправки вопроса, в части контекста разговора, LLM пересказывает весь контекст, с учетом всех сообщений из предыдущей сессии»
+- История Q&A корректно передаётся в LLM как `history_for_llm` (user+assistant на каждый Q&A, последние 10 пар = 20 сообщений)
+- Системный промпт объясняет модели, что история — это контекст, а новый вопрос — отдельное обращение
+
+---
+
+### Sprint 5 — Streaming SSE + retry при 429 (`2026-08-10`)
+
+**5.0 — Финализация streaming** (`sprint5-finalize-streaming.zip`)
+- Polling fallback (`?wait=25`) для summary/Q&A полностью удалён
+- Резюме — единственный источник правды: `streamingSummary` + `finalSummary` в React state
+- При монтировании: one-shot GET `/llm/summary` (без wait) для cache-hit
+- После `onDone` стрима: `finalSummary = streamingSummary`
+- Q&A: `onDone` использует `streamingQA.answer`, не дёргает `qa-history`
+- Markdown-рендер: bold/italic/headings/lists/code через `MarkdownText.tsx`
+
+**5.1 — Fix: пустые ответы LLM** (`sprint5-1-empty-response-fix.zip`)
+- При `finish_reason=length` и пустом `content` LLM возвращал пустой ответ без ошибки
+- Добавлен guard: если `content` пустой после стрима — fall back на non-streaming запрос
+- Логирование `prompt_tokens` / `completion_tokens` / `total_tokens` / `finish_reason` для диагностики
+
+**5.2 — Retry при 429 (rate limit)** (`sprint5-429-retry-fix.zip`)
+- При HTTP 429 от ZhipuAI — до 3 ретраев с экспоненциальной задержкой (1с → 2с → 4с)
+- Заголовок `Retry-After` уважается, если присутствует
+- На 3-й неудаче — пользовательский fallback-промпт без расширенного контекста (только comparison)
+- Логи: `LLM 429 retry 1/3 after 1.0s` / `LLM 429 retry 2/3 after 2.0s` / `LLM 429 exhausted retries`
+
+---
+
+### Sprint 4 — Streaming LLM через SSE (`2026-08-08`)
+
+**4.0 — Streaming SSE для резюме и Q&A** (`sprint4-streaming-llm-sse.zip`)
+- `stream_llm_summary()` / `ask_llm_question_stream()` в `services/llm_ops.py` — генераторы SSE-событий
+- POST `/api/dtp/tasks/{task_id}/llm/summary/stream` и `/api/dtp/tasks/{task_id}/llm/ask/stream`
+- SSE-формат: `data: {"type": "token", "content": "..."}\n\n` + `data: {"type": "done", "answer": "..."}\n\n`
+- Frontend: `fetch` + `ReadableStream` + `TextDecoder` для парсинга SSE (вместо `EventSource`, т.к. нужен POST)
+- Прогресс-бар и elapsed-time тикер во время стрима
+
+**4.1 — Fix: SSE separator + proxy buffering** (`sprint4-fix-sse-separator.zip` + `sprint4-streaming-fix-proxy-buffering.zip`)
+- Nginx на bothost буферизовал SSE-ответы — стрим не шёл до полного завершения LLM
+- Fix: заголовки `X-Accel-Buffering: no`, `Cache-Control: no-cache`, `Connection: keep-alive`
+- Fix: `\n\n` разделитель между SSE-событиями (раньше был `\n` — браузер не парсил)
+- `nginx.conf` обновлён: `proxy_buffering off` для `/api/dtp/tasks/*/llm/*/stream`
+- Включён `gzip off` для SSE-эндпоинтов (иначе токены склеивались)
+
+---
+
+### Sprint 1-3 — Mini App backend рефакторинг (`2026-08-07`)
+
+**3.0 — Роутеры разделены** (`sprint3-routers-split.zip`)
+- `routers/analyze.py` — агрегирующий router с `prefix="/dtp"`, включает в себя `clusters`, `point`, `llm`
+- `routers/llm.py` вынесен отдельно (раньше был внутри `analyze.py`)
+- `routers/_common.py` — общие зависимости (`_require_done_task`, `_require_user_task`)
+
+**3.1-3.2 — Recovery cards/clusters после рестарта** (`sprint3.1-cards-recovery-fix.zip` + `sprint3.2-clusters-recovery-fix.zip`)
+- После рестарта `task.cards` / `task.raw_clusters` (heavy fields, не в БД) терялись
+- `_ensure_cards_loaded(task)` — восстановление из `cards_cache` (PostgreSQL, TTL 24ч)
+- `_ensure_raw_clusters_loaded(task)` — восстановление из `clusters_cache.raw_clusters`
+- При cache miss: понятное сообщение «Создайте новую выгрузку для этого региона и периода»
+
+**2.0 — LLM semaphore + cache** (`sprint2-llm-semaphore-cache.zip`)
+- `asyncio.Semaphore(MAX_CONCURRENT_LLM=3)` — не больше 3 одновременных LLM-запросов
+- `llm_cache` таблица: `cache_key = SHA-256(reg_code | dat_hash | provider | prompt_hash | llm_version)`
+- Cache hit: <100 мс вместо ~53 сек
+- При 3+ одновременных запросах на free-тарифе — 429 Too Many Requests, теперь их не будет
+
+**1.0 — Разделение gibdd_service.py** (`sprint1-gibdd-service-split.zip`)
+- Монолитный `gibdd_service.py` (~1800 строк) разбит на 8 модулей в `services/`:
+  `pipeline.py`, `analytics_ops.py`, `clusters_ops.py`, `point_stats_ops.py`,
+  `query_ops.py`, `cleanup.py`, `models.py`, `_imports.py`
+- `gibdd_service.py` остаётся тонким фасадом для обратной совместимости
+
+---
+
+### Phase 3 (завершена)
+
+**3.2 — Рефакторинг bot.py → модульный пакет bot/** (`2026-08-06`)
+- Монолитный `bot.py` (4138 строк, 180 KB) разбит на 14-модульный пакет `bot/`
+- Принцип: 100% pure refactoring — никакая логика не изменена, только перемещена
+- `bot.py` сохранён как thin shim (13 строк): `from bot.app import main; main()`
+- Структура: `_state.py` (shared state) + `infra.py` + `access.py` + `keyboards.py` +
+  `analysis.py` (1335 строк, самый большой) + `output.py` + `point_stats.py` +
+  `qa.py` + `app.py` + `handlers/{commands,callbacks,messages}.py`
+- Все глобальные переменные в `bot/_state.py`, импортируются через `from bot._state import *`
+- Граф зависимостей без циклов: `app → handlers/* → analysis, point_stats, qa, output → ...
+  → keyboards, access, infra → _state`
+- Добавлено 19 smoke-тестов в `tests/smoke/test_bot_package.py`: импорт всех 14 модулей,
+  thin shim работает, публичный API доступен, shared state единственный, нет циклов,
+  структура директории соответствует плану. PTB-зависимые тесты skip'аются если
+  `python-telegram-bot` не установлен.
+- Скрипт-экстрактор `scripts/extract_bot.py` сохранён для воспроизводимости
+- Тестов всего: 464 (438 Phase 3-1 + 19 Phase 3-2 + 7 skip), покрытие 77.04%
+- Проверено на Linux (Python 3.12.13) и Windows (Python 3.11.9) — 0 failed
+- Файлы: `bot.py` (4138 → 13 строк), новый пакет `bot/` (14 файлов, ~4400 строк),
+  `tests/smoke/test_bot_package.py` (268 строк), `scripts/extract_bot.py` (470 строк)
+
+**3.1 — Оптимизация analytics-фазы** (`2026-08-06`)
+- Профилирование `analytics.py` через `scripts/profile_analytics.py` на синтетике 500/2000/5000 ДТП
+- Главная находка: CPU-расчёт быстрый (~100 ms на 2629 ДТП), основное время «analytics 36%» — это сеть + clusters
+- `calculate_cross_tables` пересчитывался при каждом LLM-запросе и Q&A — теперь in-memory кэш в `Task` (8 полей с инвалидацией по `id(cards)`)
+- `ensure_comparison`: `asyncio.gather(calculate_metrics(current), ensure_prev_cards())` — CPU работает пока идёт сеть
+- Timing-логирование: каждая операция пишет ms (`calculate_metrics — 2629 ДТП, 9.1 ms` и т.д.)
+- Cache hit при повторных Q&A: ~0 ms вместо ~38 ms
+- Файл: `miniapp/backend/services/gibdd_service.py` (+98 строк)
+
+**3.0 — LLM max_tokens + транкация-детект** (`2026-08-06`)
+- Лимит `max_tokens` поднят с `8192` → `16384`, вынесен в env `LLM_MAX_TOKENS`
+- Логирование `prompt_tokens`, `completion_tokens`, `total_tokens`, `finish_reason`
+- WARNING при `finish_reason=length` с подсказкой «поднимите LLM_MAX_TOKENS в .env»
+- Применяется одинаково к бесплатному (GLM-4.7-flash) и платному (deepseek-v4-flash) провайдерам
+- Файлы: `config.py` (+17 строк), `llm_analyzer.py` (+18/-1 строк)
+
+### Phase 2 — observability + устойчивость
+
+**2.8 — Fix: восстановление cards после рестарта** (`2026-08-06`)
+- После рестарта контейнера `task.cards` (heavy field, не персистится в БД) терялся
+- Добавлен `_ensure_cards_loaded(task)` — восстанавливает из `cards_cache` (PostgreSQL, TTL 24ч)
+- Интегрирован в 4 функции: `ensure_comparison`, `compute_point_stats`, `start_clusters_calculation`, `generate_point_stats_map_html`
+- При cache miss (старая задача): понятное сообщение «Создайте новую выгрузку для этого региона и периода»
+- Файл: `miniapp/backend/services/gibdd_service.py` (+105 строк)
+
+**2.7 — Fix: observability метрики** (`2026-08-05`)
+- Background `_metrics_updater_loop()` каждые 30 сек обновляет Prometheus gauges
+- До этого `gibdd_process_rss_bytes=0` и `gibdd_db_pool_size` были пустые — обновлялись только при запросе к `/health/detailed`
+- Корректная формула: `active = pool_size - pool_available`, `idle = pool_available`
+- Файл: `miniapp/backend/main.py` (+60 строк)
+
+**2.1–2.6 — Observability + тюнинг**
+- `2.1` Prometheus-метрики: `gibdd_tasks_total`, `gibdd_task_duration_seconds`, `gibdd_db_pool_size`, `gibdd_process_rss_bytes`, `gibdd_cards_cache_hits_total`
+- `2.2` `/health/detailed` эндпоинт с pool stats, cache stats, version
+- `2.3` slowapi rate limiting (60 req/min на пользователя)
+- `2.4` `MAX_CONCURRENT_TASKS=5` через `asyncio.Semaphore`
+- `2.5` LRU `_tasks` (maxlen=50) с eviction тяжёлых полей в БД
+- `2.6` request_id middleware — каждый лог содержит `request_id` для трассировки
+- `2.7` JSON-логи опционально через `LOG_FORMAT=json` (для ELK/Loki)
+
+### Phase 1 — Mini App + PostgreSQL кэши
+
+**1.5 — Excel-кэш в PostgreSQL** (`Stage 5`)
+- Готовые Excel-файлы (Файл 1 ДТП + Файл 2 участники) кэшируются в БД (TTL 24ч)
+- Экономия ~5-8 сек на повторных запросах того же региона+периода
+
+**1.4 — Clusters-кэш в PostgreSQL** (`Stage 4`)
+- Результат расчёта очагов (payload + raw_clusters + raw_preclusters) кэшируется в БД (TTL 6ч)
+- Второй пользователь с тем же регионом+периодом — мгновенный cache hit вместо 15-30 сек расчёта
+
+**1.3 — TTL-мониторинг кэшей** (`Stage 3`)
+- `cleanup_old_cards()`, `cleanup_old_clusters()`, `cleanup_old_excel()` — фоновые задачи
+- Метрика `gibdd_cards_cache_entries` для наблюдения за размером
+
+**1.2 — PostgreSQL миграция** (`Stage 1-2`)
+- `psycopg_pool.AsyncConnectionPool` (min=2, max=30)
+- Таблицы: `dtp_cards_cache`, `dtp_clusters_cache`, `dtp_excel_cache`, `tasks`, `audit_log`
+- Fallback: при недоступности БД — in-memory режим (функциональность сохраняется)
+
+**1.1 — Mini App интеграция** (`v0.2-v0.6`)
+- FastAPI backend + React/TypeScript frontend, единый процесс с Telegram-ботом
+- 6 вкладок: Запрос / Аналитика / Очаги / Точка / ИИ-анализ / НП БДД
+- Long polling (25 сек) для статуса длительных операций
+- Telegram theme (light/dark), haptic feedback, fullscreen mode
+
+### Phase 0 — Базовый функционал
+
+- Telegram-бот с командами `/start`, `/dtp`, `/regions`, `/help`
+- Выгрузка карточек ДТП и участников через GIBDD API + web fallback
+- Excel-генерация (2 файла: ДТП + участники)
+- HTML-карты (Leaflet, инлайн-библиотеки, работа офлайн)
+- AI-анализ через ZhipuAI GLM-4.7-Flash
+- 4-уровневый fallback справочника регионов
+- Web-fallback при ошибке API (5xx, ConnectionError)
 
 ---
 
