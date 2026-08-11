@@ -149,6 +149,59 @@ LLM_CACHE_VERSION: str = os.getenv("LLM_CACHE_VERSION", "1")
 
 
 # ========================
+# Sprint 7 (вариант C): Redis + Celery
+# ========================
+# Redis URL — используется для:
+#   - Celery broker (очередь задач)
+#   - Celery result backend (хранение результатов)
+#   - Pub/sub для streaming LLM токенов от worker к FastAPI
+#   - In-memory task state (заменяет OrderedDict _tasks)
+#
+# Если REDIS_URL пустой — приложение работает в in-memory режиме
+# (fallback для dev/тестов/малых деплоев без Redis).
+REDIS_URL: str = os.getenv("REDIS_URL", "")
+
+# Celery broker URL — отдельная БД Redis (db=1), чтобы не смешивать
+# с pub/sub (db=0) и result backend (db=2).
+# Если не задан — используется REDIS_URL с /1.
+CELERY_BROKER_URL: str = os.getenv("CELERY_BROKER_URL", REDIS_URL + "/1" if REDIS_URL else "")
+
+# Celery result backend — отдельная БД Redis (db=2).
+# Если не задан — используется REDIS_URL с /2.
+CELERY_RESULT_BACKEND: str = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL + "/2" if REDIS_URL else "")
+
+# USE_CELERY — явно включить/выключить Celery-режим.
+# Если "false" — даже при заданном REDIS_URL работаем in-memory.
+# Если "true" — REDIS_URL обязателен, при отсутствии fallback на in-memory с WARNING.
+USE_CELERY: bool = os.getenv("USE_CELERY", "true").lower() == "true" if REDIS_URL else False
+
+# Celery worker concurrency — сколько задач одновременно выполняется
+# в одном worker-процессе. По умолчанию 4 (как и текущие Semaphore(3) + запас).
+# Для каждой очереди можно задать свой лимит через `celery worker -Q ... --concurrency=N`.
+CELERY_WORKER_CONCURRENCY: int = int(os.getenv("CELERY_WORKER_CONCURRENCY", "4"))
+
+# Лимиты по времени для Celery задач (в секундах):
+# - soft_time_limit — задача получает SoftTimeLimitExceeded, может завершиться gracefully
+# - time_limit (hard) — задача принудительно убивается
+CELERY_TASK_SOFT_TIME_LIMIT: int = int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT", "540"))  # 9 мин
+CELERY_TASK_TIME_LIMIT: int = int(os.getenv("CELERY_TASK_TIME_LIMIT", "600"))  # 10 мин
+
+# Max tasks per child — воркер перезапускается после N задач,
+# чтобы освободить память (защита от утечек в long-running процессах).
+CELERY_MAX_TASKS_PER_CHILD: int = int(os.getenv("CELERY_MAX_TASKS_PER_CHILD", "50"))
+
+# Redis pub/sub channel prefix — для streaming LLM токенов.
+# Канал: f"{REDIS_PUBSUB_PREFIX}:llm:{task_id}"
+# Worker публикует токены, FastAPI подписывается и пробрасывает в SSE.
+REDIS_PUBSUB_PREFIX: str = os.getenv("REDIS_PUBSUB_PREFIX", "gibdd")
+
+# TTL для task state в Redis (в секундах). task state — это замена OrderedDict _tasks.
+# По умолчанию 24 часа (86400 сек) — совпадает с TTL cards_cache.
+# Старые task state удаляются автоматически при flushall или по TTL.
+REDIS_TASK_STATE_TTL: int = int(os.getenv("REDIS_TASK_STATE_TTL", "86400"))
+
+
+# ========================
 # Валидация
 # ========================
 def validate_config() -> list[str]:
@@ -157,5 +210,12 @@ def validate_config() -> list[str]:
 
     if not TELEGRAM_BOT_TOKEN:
         errors.append("TELEGRAM_BOT_TOKEN не задан. Получите его у @BotFather в Telegram.")
+
+    if USE_CELERY and not REDIS_URL:
+        errors.append(
+            "USE_CELERY=true, но REDIS_URL не задан. "
+            "Либо задайте REDIS_URL (redis://host:port/db), "
+            "либо установите USE_CELERY=false для in-memory режима."
+        )
 
     return errors

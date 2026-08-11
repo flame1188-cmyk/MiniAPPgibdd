@@ -614,6 +614,142 @@ async def health_db_excel():
     return await get_cache_stats()
 
 
+@app.get("/health/redis")
+async def health_redis():
+    """
+    Health-check Redis (Sprint 7, вариант C).
+
+    Возвращает:
+    - configured — задан ли REDIS_URL
+    - use_celery — включён ли Celery-режим
+    - connected — удалось ли подключиться
+    - version — версия Redis сервера
+    - latency_ms — задержка PING/PONG
+    - db_size — количество ключей во всех БД
+    - memory_used_mb / memory_max_mb — использование памяти
+    - pubsub_channels — активные каналы (для LLM streaming)
+    - error — текст ошибки, если что-то не так
+    """
+    import time
+    import config
+
+    result = {
+        "configured": bool(config.REDIS_URL),
+        "use_celery": config.USE_CELERY,
+        "connected": False,
+        "version": None,
+        "latency_ms": None,
+        "db_size": None,
+        "memory_used_mb": None,
+        "memory_max_mb": None,
+        "pubsub_channels": [],
+        "error": None,
+    }
+
+    if not config.REDIS_URL:
+        result["error"] = "REDIS_URL not configured (in-memory mode)"
+        return result
+
+    try:
+        import redis
+        client = redis.from_url(config.REDIS_URL, socket_timeout=2.0, socket_connect_timeout=2.0)
+
+        # PING с замером задержки
+        start = time.perf_counter()
+        pong = client.ping()
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        if not pong:
+            result["error"] = "PING returned False"
+            return result
+
+        result["connected"] = True
+        result["latency_ms"] = round(elapsed_ms, 2)
+
+        # Информация о сервере
+        info = client.info()
+        result["version"] = info.get("redis_version")
+        result["db_size"] = client.dbsize()
+        result["memory_used_mb"] = round(info.get("used_memory", 0) / 1024 / 1024, 2)
+        result["memory_max_mb"] = round(info.get("maxmemory", 0) / 1024 / 1024, 2) if info.get("maxmemory") else None
+
+        # Активные pub/sub каналы (для LLM streaming)
+        channels = client.pubsub_channels(f"{config.REDIS_PUBSUB_PREFIX}:*")
+        result["pubsub_channels"] = [ch.decode() if isinstance(ch, bytes) else ch for ch in channels]
+
+    except ImportError:
+        result["error"] = "redis package not installed (pip install redis)"
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+
+    return result
+
+
+@app.get("/health/celery")
+async def health_celery():
+    """
+    Health-check Celery worker (Sprint 7, вариант C).
+
+    Возвращает:
+    - configured — задан ли CELERY_BROKER_URL
+    - use_celery — включён ли Celery-режим
+    - workers — список активных worker-инстансов
+    - ping_count — сколько workers ответило на ping
+    - active_tasks — количество активных задач
+    - queued_tasks — задачи в очередях (по каждой очереди)
+    - error — текст ошибки, если что-то не так
+    """
+    import config
+
+    result = {
+        "configured": bool(config.CELERY_BROKER_URL),
+        "use_celery": config.USE_CELERY,
+        "workers": [],
+        "ping_count": 0,
+        "active_tasks": 0,
+        "queued_tasks": {},
+        "error": None,
+    }
+
+    if not config.USE_CELERY:
+        result["error"] = "USE_CELERY=false (in-memory mode)"
+        return result
+
+    if not config.CELERY_BROKER_URL:
+        result["error"] = "CELERY_BROKER_URL not configured"
+        return result
+
+    try:
+        from worker.celery_app import ping_worker, app
+
+        # PING worker'ов
+        ping_result = ping_worker(timeout=2.0)
+        result["workers"] = ping_result["workers"]
+        result["ping_count"] = ping_result["ping_count"]
+        if not ping_result["ok"]:
+            result["error"] = ping_result["error"]
+            return result
+
+        # Активные задачи
+        inspect = app.control.inspect(timeout=2.0)
+        active = inspect.active() or {}
+        result["active_tasks"] = sum(len(tasks) for tasks in active.values())
+
+        # Задачи в очередях
+        import redis as redis_lib
+        client = redis_lib.from_url(config.CELERY_BROKER_URL, socket_timeout=2.0)
+        for queue in ["gibdd", "llm", "clusters", "exports", "celery"]:
+            length = client.llen(queue)
+            result["queued_tasks"][queue] = length
+
+    except ImportError:
+        result["error"] = "celery package not installed (pip install celery)"
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+
+    return result
+
+
 @app.get("/")
 async def root():
     """Корневой endpoint с информацией о сервисе."""

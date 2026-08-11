@@ -1,0 +1,55 @@
+# ============================================================
+# Dockerfile для Celery worker
+#
+# Sprint 7 (вариант C): отдельный образ для worker процесса.
+# Не включает frontend (он не нужен worker'у).
+# Базируется на том же Python 3.11-slim + системные зависимости.
+#
+# Сборка:
+#   docker build -f Dockerfile.worker -t gibdd-worker .
+#
+# Запуск (в docker-compose):
+#   docker compose up worker -d
+#
+# В docker-compose.yml этот Dockerfile используется сервисом `worker`.
+# ============================================================
+
+# --- Stage 1: Runtime (без сборки frontend) ---
+FROM python:3.11-slim AS runtime
+
+# Системные зависимости для Shapely + httpx (как в основном Dockerfile)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libgeos-dev \
+    libxml2 \
+    libxslt1.1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Устанавливаем Python-зависимости (тот же requirements.txt, что и для api)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем весь код проекта (gibdd-bot + miniapp + worker/)
+# worker/ — новый пакет с celery_app и tasks
+COPY . .
+
+# Создаём директорию для данных (shared volume с api)
+RUN mkdir -p /app/data /app/data/osm_cache /app/data/cameras /tmp/gibdd_tasks
+
+# Переменные окружения по умолчанию
+ENV PYTHONPATH=/app
+ENV CAMERA_DATA_DIR=/app/data
+
+# Worker не открывает порты — он только потребляет из очереди
+EXPOSE 0
+
+# Healthcheck: celery inspect ping (через app в worker/)
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD celery -A worker.celery_app inspect ping -d "celery@$(hostname)" || exit 1
+
+# Запуск: celery worker (переопределяется в docker-compose через command)
+# По умолчанию — все очереди, concurrency=4
+CMD ["celery", "-A", "worker.celery_app", "worker", "--loglevel=info", "--concurrency=4", "-Q", "gibdd,llm,clusters,exports,celery"]

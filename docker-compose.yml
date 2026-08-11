@@ -1,0 +1,167 @@
+# ============================================================
+# docker-compose для GIBDD Bot + Mini App + Celery worker + Redis
+#
+# Sprint 7 (вариант C): multi-process архитектура.
+#
+# Запуск (локальная разработка):
+#   1. Скопируйте env.example в .env и заполните TELEGRAM_BOT_TOKEN
+#   2. docker compose up -d --build
+#   3. Откройте http://localhost:8080/health для проверки
+#   4. /health/redis — статус Redis
+#   5. /health/celery — статус Celery worker (через inspect)
+#
+# Production (bothost):
+#   - bothost использует Dockerfile напрямую, не docker-compose
+#   - Для multi-process на bothost см. README_DEPLOY_BOTHOST.md
+#   - Этот docker-compose — для локальной разработки и тестирования
+#
+# Сервисы:
+#   api     — FastAPI + Telegram webhook (порт 8080)
+#   worker  — Celery worker (4 очереди: gibdd, llm, clusters, exports)
+#   beat    — Celery beat (периодические задачи: cleanup, metrics)
+#   redis   — Redis 7 (broker + result backend + pub/sub для SSE)
+# ============================================================
+
+services:
+  # ---------- FastAPI + Telegram webhook ----------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gibdd-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - USE_CELERY=true
+      - PYTHONPATH=/app
+    ports:
+      - "8080:8080"
+    volumes:
+      # Кэш камер, регионов, OSM (персистентный)
+      - gibdd_data:/app/data
+      # Временные файлы задач (shared с worker)
+      - tasks_data:/tmp/gibdd_tasks
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - gibdd-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ---------- Celery worker (4 очереди) ----------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: gibdd-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - USE_CELERY=true
+      - PYTHONPATH=/app
+      # Worker concurrency: сколько задач выполняется одновременно
+      # В каждой очереди свой лимит через -Q и --concurrency
+    command: >
+      celery -A worker.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      -Q gibdd,llm,clusters,exports,celery
+      --max-tasks-per-child=50
+      --time-limit=600
+      --soft-time-limit=540
+    volumes:
+      - gibdd_data:/app/data
+      - tasks_data:/tmp/gibdd_tasks
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - gibdd-net
+    healthcheck:
+      test: ["CMD", "celery", "-A", "worker.celery_app", "inspect", "ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------- Celery beat (периодические задачи) ----------
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: gibdd-beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - USE_CELERY=true
+      - PYTHONPATH=/app
+    command: >
+      celery -A worker.celery_app beat
+      --loglevel=info
+      --schedule=/tmp/celerybeat-schedule
+    volumes:
+      - gibdd_data:/app/data
+      - beat_schedule:/tmp
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - gibdd-net
+
+  # ---------- Redis 7 (broker + result backend + pub/sub) ----------
+  redis:
+    image: redis:7-alpine
+    container_name: gibdd-redis
+    restart: unless-stopped
+    # maxmemory 256MB — достаточно для:
+    #   - broker queue: ~50KB на задачу × 100 задач = 5MB
+    #   - result backend: ~10KB на результат × 100 = 1MB
+    #   - pub/sub channels (LLM streaming): ~1MB на активный стрим × 5 = 5MB
+    #   - task state (вместо in-memory _tasks): ~5KB на задачу × 100 = 0.5MB
+    # Оставляем запас ~240MB
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --save 60 1000
+    volumes:
+      - redis_data:/data
+    networks:
+      - gibdd-net
+    ports:
+      # Раскомментируйте для отладки извне
+      # - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  gibdd_data:
+  tasks_data:
+  redis_data:
+  beat_schedule:
+
+networks:
+  gibdd-net:
+    driver: bridge
