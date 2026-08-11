@@ -65,6 +65,17 @@ loguru==0.7.3
 # Позволяет стримить LLM-ответ token-by-token вместо 30-60 сек блокирующего запроса.
 sse-starlette>=2.0,<4
 
+# celery — distributed task queue. Запускает async-задачи в отдельном worker процессе.
+# 4 очереди: gibdd, llm, clusters, exports.
+# При USE_CELERY=false или REDIS_URL пустом — работаем в in-memory режиме (fallback).
+celery>=5.4,<6
+
+# redis — Python клиент для Redis. Используется как:
+#   - Celery broker (очередь задач)
+#   - Celery result backend (хранение результатов)
+#   - Pub/sub для streaming LLM токенов от worker к FastAPI
+redis>=5.2,<7
+
 # ====================================
 # GIBDD Stat Bot — dev dependencies
 # ====================================
