@@ -1,5 +1,5 @@
 """
-Smoke-тесты для Sprint 7 / Фаза C.2 — core/ пакет (sync-обёртки для Celery).
+Smoke-тесты для Sprint 7 / Фаза C.2 + C.2.4 — core/ пакет и подключение к pipeline.
 
 Проверяет:
 1. miniapp/backend/core/ — структура пакета, все 7 модулей на месте
@@ -11,6 +11,10 @@ Smoke-тесты для Sprint 7 / Фаза C.2 — core/ пакет (sync-об�
 7. fetch_cards_for_period_sync падает с понятной ошибкой если вызвать из event loop
 8. core/ не импортирует task_registry (pure functions)
 9. core/ функции не мутируют глобальное состояние
+10. C.2.4: pipeline.execute_task подключён к core/ через feature flag
+    GIBDD_USE_CORE_PIPELINE (default OFF, backward compatible)
+11. C.2.4: feature flag _should_use_core_path() / _core_path_status()
+    тестируются на все варианты значений env
 
 Не делает реальных HTTP-запросов к API ГИБДД и не вызывает LLM —
 только структурные проверки и проверка контракта.
@@ -468,10 +472,17 @@ class TestFetchCardsEventLoopProtection(unittest.TestCase):
 
 
 # ============================================================
-# 9. Backward compatibility — pipeline.py не изменён
+# 9. Sprint 7 / Фаза C.2.4 — pipeline.py подключается к core/ через feature flag
 # ============================================================
-class TestPipelineUnchanged(unittest.TestCase):
-    """pipeline.execute_task остаётся без изменений (Фаза C.2 НЕ заменяет его)."""
+class TestPipelineC24Wiring(unittest.TestCase):
+    """pipeline.execute_task подключён к core/ через env-флаг (Фаза C.2.4).
+
+    Контракт C.2.4:
+    - Feature flag GIBDD_USE_CORE_PIPELINE (default "0" — legacy)
+    - Когда flag=1: PARSING/ANALYTICS/GENERATING идут через core/ via asyncio.to_thread
+    - Когда flag=0: legacy path (прямые вызовы gibdd_parser / analytics / ...)
+    - FETCHING всегда остаётся async-native (не идёт через core/)
+    """
 
     def setUp(self):
         self.pipeline_path = (
@@ -484,23 +495,155 @@ class TestPipelineUnchanged(unittest.TestCase):
         """execute_task должен остаться async (backward compat)."""
         self.assertIn("async def execute_task", self.content)
 
-    def test_pipeline_does_not_import_core(self):
-        """pipeline.py НЕ должен импортировать core/ (C.2 не меняет его)."""
-        # core/ будет подключён в C.2.4 после проверки пользователем
+    def test_pipeline_has_feature_flag_helper(self):
+        """pipeline.py должен содержать _should_use_core_path() helper."""
+        self.assertIn("def _should_use_core_path()", self.content)
+        self.assertIn("GIBDD_USE_CORE_PIPELINE", self.content)
+
+    def test_pipeline_imports_core_when_flag_on(self):
+        """pipeline.py должен импортировать core/ функции (C.2.4 подключён)."""
+        # В отличие от C.2 (где pipeline НЕ импортировал core/),
+        # в C.2.4 pipeline импортирует 4 core-функции через `from ..core import ...`
+        self.assertIn("from ..core import build_excel_data_sync", self.content)
+        self.assertIn("from ..core import build_analytics_sync", self.content)
+        self.assertIn("from ..core import generate_excel_bytes_sync", self.content)
+        self.assertIn("from ..core import generate_map_html_sync", self.content)
+
+    def test_pipeline_still_uses_imports_module_for_legacy(self):
+        """pipeline.py всё ещё использует _imports._import_module для legacy path.
+
+        FETCHING и fallback-ветки C.2.4 остаются на прямых вызовах
+        _imports._import_module — это backward compatibility.
+        """
+        self.assertIn("_imports._import_module", self.content)
+        # Проверяем что все 4 legacy-модуля всё ещё импортируются
+        self.assertIn('"gibdd_parser"', self.content)
+        self.assertIn('"analytics"', self.content)
+        self.assertIn('"excel_generator"', self.content)
+        self.assertIn('"report_generator"', self.content)
+
+    def test_pipeline_uses_to_thread_for_core_calls(self):
+        """Core-функции вызываются через asyncio.to_thread (не блокируя event loop)."""
+        # Должно быть минимум 4 вызова asyncio.to_thread с core-функциями:
+        # build_excel_data_sync, build_analytics_sync, generate_excel_bytes_sync,
+        # generate_map_html_sync
+        # Проверяем что каждая core-функция встречается в блоке asyncio.to_thread
+        for func_name in [
+            "build_excel_data_sync",
+            "build_analytics_sync",
+            "generate_excel_bytes_sync",
+            "generate_map_html_sync",
+        ]:
+            with self.subTest(func=func_name):
+                # Находим строку с `asyncio.to_thread(` и рядом — имя core-функции
+                self.assertTrue(
+                    f"asyncio.to_thread(\n                    {func_name}" in self.content
+                    or f"asyncio.to_thread(\n                {func_name}" in self.content
+                    or f"asyncio.to_thread(\n        {func_name}" in self.content,
+                    f"core/{func_name} должен вызываться через asyncio.to_thread",
+                )
+
+    def test_pipeline_has_core_path_status_logger(self):
+        """pipeline.py должен логировать активный path (core vs legacy)."""
+        self.assertIn("_core_path_status", self.content)
+        self.assertIn("path=", self.content)
+
+    def test_fetching_step_still_uses_async_bot(self):
+        """FETCHING шаг остаётся на async bot._fetch_cards_for_period (не через core/).
+
+        Причина: fetch_cards_for_period_sync использует asyncio.run() внутри,
+        что конфликтует с running FastAPI event loop. Celery path (C.3) будет
+        использовать sync-обёртку, FastAPI path — прямой await.
+        """
+        # bot_module._fetch_cards_for_period должен остаться
+        self.assertIn("bot_module._fetch_cards_for_period", self.content)
+        # И НЕ должно быть import fetch_cards_for_period_sync из core
+        # (docstring упоминает функцию для объяснения, но импорта и вызова быть не должно)
         self.assertNotIn(
-            "from ..core",
+            "from ..core import fetch_cards_for_period_sync",
             self.content,
-            "pipeline.py не должен импортировать core/ в Фазе C.2",
+            "pipeline.py не должен импортировать fetch_cards_for_period_sync из core/ "
+            "(она использует asyncio.run, конфликтующий с FastAPI event loop)",
         )
         self.assertNotIn(
-            "from miniapp.backend.core",
+            "from miniapp.backend.core import fetch_cards_for_period_sync",
             self.content,
-            "pipeline.py не должен импортировать core/ в Фазе C.2",
+            "pipeline.py не должен импортировать fetch_cards_for_period_sync из core/",
+        )
+        # Вызов fetch_cards_for_period_sync(...) в коде тоже не должно быть
+        # (проверяем через наличие скобки после имени функции)
+        self.assertNotIn(
+            "fetch_cards_for_period_sync(",
+            self.content,
+            "pipeline.py не должен вызывать fetch_cards_for_period_sync() "
+            "(она использует asyncio.run, конфликтующий с FastAPI event loop)",
         )
 
-    def test_pipeline_still_uses_imports_module(self):
-        """pipeline.py всё ещё использует _imports._import_module (старый путь)."""
-        self.assertIn("_imports._import_module", self.content)
+
+# ============================================================
+# 9b. Sprint 7 / Фаза C.2.4 — feature flag _should_use_core_path()
+# ============================================================
+class TestCorePathFeatureFlag(unittest.TestCase):
+    """Тесты для feature flag GIBDD_USE_CORE_PIPELINE."""
+
+    def setUp(self):
+        # Сохраняем оригинальное значение env, восстанавливаем в tearDown
+        self._orig = __import__("os").environ.pop("GIBDD_USE_CORE_PIPELINE", None)
+
+    def tearDown(self):
+        import os
+        if self._orig is not None:
+            os.environ["GIBDD_USE_CORE_PIPELINE"] = self._orig
+        else:
+            os.environ.pop("GIBDD_USE_CORE_PIPELINE", None)
+
+    def test_default_is_legacy_off(self):
+        """Без env-переменной — flag OFF (legacy path)."""
+        import os
+        os.environ.pop("GIBDD_USE_CORE_PIPELINE", None)
+        from miniapp.backend.services.pipeline import _should_use_core_path
+        self.assertFalse(_should_use_core_path())
+
+    def test_explicit_zero_is_off(self):
+        """GIBDD_USE_CORE_PIPELINE=0 — flag OFF."""
+        import os
+        os.environ["GIBDD_USE_CORE_PIPELINE"] = "0"
+        from miniapp.backend.services.pipeline import _should_use_core_path
+        self.assertFalse(_should_use_core_path())
+
+    def test_explicit_one_is_on(self):
+        """GIBDD_USE_CORE_PIPELINE=1 — flag ON (core path)."""
+        import os
+        os.environ["GIBDD_USE_CORE_PIPELINE"] = "1"
+        from miniapp.backend.services.pipeline import _should_use_core_path
+        self.assertTrue(_should_use_core_path())
+
+    def test_other_values_are_off(self):
+        """Любое значение кроме "1" — flag OFF (strict comparison)."""
+        import os
+        for val in ["true", "yes", "on", "True", "TRUE", "2", " ", "1.0"]:
+            with self.subTest(val=val):
+                os.environ["GIBDD_USE_CORE_PIPELINE"] = val
+                from miniapp.backend.services.pipeline import _should_use_core_path
+                # Только "1" точно = ON; всё остальное = OFF (security: strict)
+                if val == "1":
+                    self.assertTrue(_should_use_core_path())
+                else:
+                    self.assertFalse(_should_use_core_path())
+
+    def test_core_path_status_returns_legacy_by_default(self):
+        """_core_path_status() возвращает 'legacy' по умолчанию."""
+        import os
+        os.environ.pop("GIBDD_USE_CORE_PIPELINE", None)
+        from miniapp.backend.services.pipeline import _core_path_status
+        self.assertEqual(_core_path_status(), "legacy")
+
+    def test_core_path_status_returns_core_when_on(self):
+        """_core_path_status() возвращает 'core' когда flag=1."""
+        import os
+        os.environ["GIBDD_USE_CORE_PIPELINE"] = "1"
+        from miniapp.backend.services.pipeline import _core_path_status
+        self.assertEqual(_core_path_status(), "core")
 
 
 # ============================================================

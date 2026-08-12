@@ -9,11 +9,33 @@
 - _parse_files_sync() / _task_dir() — хелперы
 
 Использует Semaphore(3) для ограничения одновременных выгрузок к API ГИБДД.
+
+=== Sprint 7 / Фаза C.2.4: опциональное подключение к core/ ===
+Когда env-переменная GIBDD_USE_CORE_PIPELINE=1 — синхронные CPU-bound шаги
+(PARSING, ANALYTICS, GENERATING) идут через miniapp.backend.core.* sync-функции
+через asyncio.to_thread(). Это позволяет:
+
+1. Унифицировать бизнес-логику между FastAPI async-path (этот файл) и
+   будущим Celery sync-path (worker/tasks/*, Фаза C.3).
+2. Единое тестирование — core-функции тестируются изолированно (C.2).
+3. Единый мониторинг/логирование — все метрики собираются в core-функциях.
+4. Лёгкий rollback — GIBDD_USE_CORE_PIPELINE=0 возвращает legacy-путь.
+
+FETCHING остаётся async-native в обоих путях:
+- FastAPI path: прямой await bot._fetch_cards_for_period(...)
+- Celery path (C.3): fetch_cards_for_period_sync через asyncio.run()
+Причина: fetch_cards_for_period_sync использует asyncio.run() внутри,
+что конфликтует с running FastAPI event loop. Celery worker не имеет
+event loop — там это работает.
+
+По умолчанию GIBDD_USE_CORE_PIPELINE=0 (legacy, backward compatible).
+После проверки в staging можно переключить на 1 для A/B-тестирования.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +50,32 @@ from .task_registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Sprint 7 / Фаза C.2.4: feature flag для core/ path
+# ============================================================
+def _should_use_core_path() -> bool:
+    """Возвращает True если GIBDD_USE_CORE_PIPELINE=1 (pipeline routing через core/).
+
+    По умолчанию False — backward compatibility с production-деплоями,
+    не знающими про C.2.4.
+
+    Когда True, синхронные CPU-bound шаги (PARSING, ANALYTICS, GENERATING)
+    в _execute_task_impl идут через miniapp.backend.core.* sync-функции
+    через asyncio.to_thread(), вместо прямых вызовов gibdd_parser / analytics /
+    excel_generator / report_generator.
+
+    Это позволяет унифицировать бизнес-логику между FastAPI path (этот файл)
+    и будущим Celery path (Фаза C.3) — оба будут вызывать одни и те же
+    core-функции.
+    """
+    return os.environ.get("GIBDD_USE_CORE_PIPELINE", "0") == "1"
+
+
+def _core_path_status() -> str:
+    """Возвращает 'core' или 'legacy' — для логирования в начале execute_task."""
+    return "core" if _should_use_core_path() else "legacy"
 
 
 # === Фаза 1.1: Semaphore на одновременные выгрузки ===
@@ -125,6 +173,11 @@ async def execute_task(task_id: str) -> None:
             # === Фаза 1.6: Prometheus metrics ===
             from ..middleware.metrics import task_started, task_finished
             task_started()
+            # Sprint 7 / Фаза C.2.4: логируем какой путь активен
+            # (для мониторинга и дебага routing-решений).
+            logger.info(
+                f"Task {task_id}: execute_task started (path={_core_path_status()})"
+            )
             try:
                 await _execute_task_impl(task_id)
             finally:
@@ -210,13 +263,25 @@ async def _execute_task_impl(task_id: str) -> None:
         task.updated_at = _now_utc()
         await _persist()
 
-        gibdd_parser = _imports._import_module("gibdd_parser")
-        # gibdd_parser.build_file1/2_data — синхронный CPU-bound парсинг
-        # 1500-3000 карточек. Выносим в thread pool, чтобы не блокировать
-        # event loop (Фаза 1.2).
-        file1_data, file2_data = await asyncio.to_thread(
-            _parse_files_sync, gibdd_parser, cards
-        )
+        # Sprint 7 / Фаза C.2.4: опциональный routing через core/
+        # build_excel_data_sync — pure sync функция, вызывается через
+        # asyncio.to_thread (как и legacy _parse_files_sync). Разница —
+        # только в точке входа: core/ vs прямой вызов gibdd_parser.
+        if _should_use_core_path():
+            from ..core import build_excel_data_sync
+
+            file1_data, file2_data = await asyncio.to_thread(
+                build_excel_data_sync, cards
+            )
+            logger.info(f"Task {task_id}: PARSING via core/build_excel_data_sync")
+        else:
+            gibdd_parser = _imports._import_module("gibdd_parser")
+            # gibdd_parser.build_file1/2_data — синхронный CPU-bound парсинг
+            # 1500-3000 карточек. Выносим в thread pool, чтобы не блокировать
+            # event loop (Фаза 1.2).
+            file1_data, file2_data = await asyncio.to_thread(
+                _parse_files_sync, gibdd_parser, cards
+            )
 
         # === 3. ANALYTICS ===
         task.status = TaskStatus.ANALYTICS
@@ -225,8 +290,6 @@ async def _execute_task_impl(task_id: str) -> None:
         await _persist()
 
         try:
-            analytics_module = _imports._import_module("analytics")
-
             # Лучше-эффort загрузка карточек прошлого года для сравнения АППГ.
             # Если prev_cards не загрузились — analytics всё равно валиден,
             # но без блока comparison/previous.
@@ -243,11 +306,29 @@ async def _execute_task_impl(task_id: str) -> None:
                 prev_cards = []
                 prev_label = None
 
-            task.analytics = analytics_module.build_full_analytics(
-                cards,
-                prev_cards if prev_cards else None,
-                prev_label,
-            )
+            # Sprint 7 / Фаза C.2.4: опциональный routing через core/
+            # build_analytics_sync — pure sync функция, вызывается через
+            # asyncio.to_thread чтобы не блокировать event loop.
+            # В legacy path analytics_module.build_full_analytics вызывается
+            # синхронно (CPU-bound но быстро — 200-500ms для 3000 cards).
+            if _should_use_core_path():
+                from ..core import build_analytics_sync
+
+                task.analytics = await asyncio.to_thread(
+                    build_analytics_sync,
+                    cards,
+                    prev_cards if prev_cards else None,
+                    prev_label,
+                )
+                logger.info(f"Task {task_id}: ANALYTICS via core/build_analytics_sync")
+            else:
+                analytics_module = _imports._import_module("analytics")
+                task.analytics = analytics_module.build_full_analytics(
+                    cards,
+                    prev_cards if prev_cards else None,
+                    prev_label,
+                )
+
             # Добавляем current_label для UI
             if isinstance(task.analytics, dict):
                 task.analytics["current_label"] = task.period_label
@@ -317,12 +398,26 @@ async def _execute_task_impl(task_id: str) -> None:
         # asyncio.to_thread() выносит генерацию в thread pool — event loop
         # остаётся свободным для других запросов.
         if file1_bytes is None or file2_bytes is None:
-            excel_gen = _imports._import_module("excel_generator")
-            file1_bytes, file2_bytes = await asyncio.to_thread(
-                excel_gen.generate_both_files,
-                file1_data,
-                file2_data,
-            )
+            # Sprint 7 / Фаза C.2.4: опциональный routing через core/
+            # generate_excel_bytes_sync — pure sync обёртка над тем же
+            # excel_generator.generate_both_files. Разница — только в точке
+            # входа: core/ (для unified Celery path) vs прямой вызов.
+            if _should_use_core_path():
+                from ..core import generate_excel_bytes_sync
+
+                file1_bytes, file2_bytes = await asyncio.to_thread(
+                    generate_excel_bytes_sync,
+                    file1_data,
+                    file2_data,
+                )
+                logger.info(f"Task {task_id}: GENERATING Excel via core/generate_excel_bytes_sync")
+            else:
+                excel_gen = _imports._import_module("excel_generator")
+                file1_bytes, file2_bytes = await asyncio.to_thread(
+                    excel_gen.generate_both_files,
+                    file1_data,
+                    file2_data,
+                )
 
             # === Этап 5: сохраняем в кэш для следующих пользователей ===
             try:
@@ -403,12 +498,31 @@ async def _execute_task_impl(task_id: str) -> None:
             # Передаём карточки прошлого года, чтобы на карте появилась
             # динамика АППГ в верхней сводке (ДТП / Погибшие / Раненые).
             prev_cards_for_map = task.prev_cards or None
-            html_content = generator.generate_dtp_map(
-                cards,
-                cameras=cameras,
-                prev_cards=prev_cards_for_map,
-                prev_label=task.prev_label,
-            )
+
+            # Sprint 7 / Фаза C.2.4: опциональный routing через core/
+            # generate_map_html_sync — pure sync обёртка над тем же
+            # ReportGenerator.generate_dtp_map. В core-path выносим в
+            # asyncio.to_thread (генерация HTML 1-2с, не блокирует event loop).
+            if _should_use_core_path():
+                from ..core import generate_map_html_sync
+
+                html_content = await asyncio.to_thread(
+                    generate_map_html_sync,
+                    cards,
+                    task.region_name,
+                    task.period_label,
+                    cameras,
+                    prev_cards_for_map,
+                    task.prev_label,
+                )
+                logger.info(f"Task {task_id}: GENERATING map via core/generate_map_html_sync")
+            else:
+                html_content = generator.generate_dtp_map(
+                    cards,
+                    cameras=cameras,
+                    prev_cards=prev_cards_for_map,
+                    prev_label=task.prev_label,
+                )
 
             map_path = out_dir / f"dtp_map_{region_safe}_{period_safe}.html"
             map_path.write_text(html_content, encoding="utf-8")

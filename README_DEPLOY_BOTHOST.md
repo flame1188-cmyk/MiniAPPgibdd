@@ -396,6 +396,43 @@ Worker не отвечает на ping. Возможные причины:
 - **152-ФЗ**: bothost — российский хостинг, дата-центр в РФ. Данные
   пользователей не покидают юрисдикцию.
 
+## Sprint 7 / Фаза C.2.4 — feature flag `GIBDD_USE_CORE_PIPELINE`
+
+В **single**-режиме (текущий bothost) pipeline.execute_task работает через
+прямые вызовы `gibdd_parser` / `analytics` / `excel_generator` / `report_generator`.
+Это **legacy path**, по умолчанию включён.
+
+Чтобы переключить FastAPI-путь на использование тех же `miniapp.backend.core.*`
+sync-функций, которые будет вызывать будущий Celery-worker (Фаза C.3):
+
+```bash
+# В Variables bothost:
+GIBDD_USE_CORE_PIPELINE=1
+```
+
+После рестарта контейнера в логах появится строка:
+```
+Task <id>: execute_task started (path=core)
+Task <id>: PARSING via core/build_excel_data_sync
+Task <id>: ANALYTICS via core/build_analytics_sync
+Task <id>: GENERATING Excel via core/generate_excel_bytes_sync
+Task <id>: GENERATING map via core/generate_map_html_sync
+```
+
+**Поведение идентично** legacy path — те же модули вызываются под капотом
+(`core/build_excel_data_sync` → `gibdd_parser.build_file1/2_data`,
+`core/generate_excel_bytes_sync` → `excel_generator.generate_both_files`, ...).
+
+Разница — только в точке входа: `core/` даёт unified API для будущего Celery-path.
+
+**FETCHING** остаётся async-native в обоих путях (`bot._fetch_cards_for_period`).
+Причина: `core/fetch_cards_for_period_sync` использует `asyncio.run()` внутри,
+что конфликтует с running FastAPI event loop. Celery worker (sync context)
+будет использовать sync-обёртку нормально.
+
+**Rollback**: `GIBDD_USE_CORE_PIPELINE=0` (или удалите переменную) — мгновенный
+возврат на legacy path без передеплоя кода, только рестарт контейнера.
+
 ## Откат к polling-режиму
 
 Если нужно вернуться к старому режиму (только Telegram-бот без Mini App):

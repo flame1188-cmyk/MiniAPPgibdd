@@ -29,8 +29,26 @@ miniapp.backend.core — чистая бизнес-логика, callable из C
 Backward compatibility:
 - pipeline.execute_task, llm_ops.start_llm_summary, clusters_ops.start_clusters_calculation
   остаются без изменений (Фаза C.2 НЕ заменяет их, только добавляет core/ параллельно).
-- В Фазе C.2.4 (опционально, после проверки пользователем) pipeline.execute_task
-  будет переключён на использование core/ через asyncio.to_thread().
+
+=== Sprint 7 / Фаза C.2.4 (РЕАЛИЗОВАНА) ===
+pipeline.execute_task теперь подключён к core/ через feature flag
+GIBDD_USE_CORE_PIPELINE (default "0" = OFF, backward compatible).
+
+Когда GIBDD_USE_CORE_PIPELINE=1:
+- PARSING → asyncio.to_thread(build_excel_data_sync, cards)
+- ANALYTICS → asyncio.to_thread(build_analytics_sync, cards, prev_cards, prev_label)
+- GENERATING (Excel) → asyncio.to_thread(generate_excel_bytes_sync, f1, f2)
+- GENERATING (HTML map) → asyncio.to_thread(generate_map_html_sync, ...)
+
+FETCHING остаётся на прямом async-вызове bot._fetch_cards_for_period
+(не через core/) — fetch_cards_for_period_sync использует asyncio.run()
+внутри, что конфликтует с running FastAPI event loop. Celery path (C.3)
+будет использовать sync-обёртку нормально (worker не имеет event loop).
+
+Когда GIBDD_USE_CORE_PIPELINE=0 (default): legacy path, прямые вызовы
+gibdd_parser / analytics / excel_generator / report_generator.
+
+См. miniapp/backend/services/pipeline.py — функция _should_use_core_path().
 """
 from __future__ import annotations
 
