@@ -1,26 +1,23 @@
 """
 Проверка подлинности Telegram WebApp initData.
 
-ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ — добавлено логирование каждого 401 случая.
-После определения причины вернуть оригинальный файл (telegram_auth.py.original).
+Sprint 7 fix:
+- TTL увеличен с 24ч до 48ч (через TG_INITDATA_TTL_HOURS env, default=48).
+  Это даёт дополнительный буфер поверх фронтенд-проверки (которая триггерит
+  reload при 23ч). Telegram рекомендует 24ч, но на практике initData
+  остаётся валидным дольше, и 48ч — безопасный компромисс между
+  security и UX (пользователь не получает 401 при длительной сессии).
+- Логирование 401 — только WARNING с причиной (без [AUTH_DIAG] INFO-шума).
 
 Документация:
 https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
-
-Алгоритм:
-1. Получаем строку initData из query-параметра или заголовка.
-2. Парсим её как URL-encoded form data.
-3. Извлекаем hash, остальные параметры сортируем по ключу.
-4. Строим data_check_string = "key1=value1\nkey2=value2\n...".
-5. secret_key = HMAC-SHA256("WebAppData", bot_token).
-6. expected_hash = HMAC-SHA256(secret_key, data_check_string) в hex.
-7. Сравниваем с переданным hash.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -31,6 +28,11 @@ from fastapi import HTTPException, Header, Query, status
 from .config import settings
 
 logger = logging.getLogger(__name__)
+
+# TTL для initData. По умолчанию 48 часов (с запасом поверх 24ч Telegram-лимита).
+# Можно переопределить через env TG_INITDATA_TTL_HOURS.
+_TTL_HOURS = int(os.getenv("TG_INITDATA_TTL_HOURS", "48"))
+_TTL_SECONDS = _TTL_HOURS * 3600
 
 
 @dataclass(slots=True)
@@ -63,12 +65,11 @@ def _verify_init_data(init_data: str, bot_token: str) -> Optional[dict]:
     if not hash_value:
         return None
 
-    # Проверяем срок действия (не старше 24 часов)
+    # Проверяем срок действия (TG_INITDATA_TTL_HOURS, по умолчанию 48ч)
     auth_date_str = parsed.get("auth_date")
     if auth_date_str and auth_date_str.isdigit():
         auth_date = int(auth_date_str)
-        # 24 часа = 86400 сек
-        if time.time() - auth_date > 86400:
+        if time.time() - auth_date > _TTL_SECONDS:
             return None
 
     # Строим data_check_string
@@ -146,34 +147,18 @@ async def get_current_user(
     """
     FastAPI dependency: извлекает и проверяет пользователя Telegram.
 
-    ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ — логирует каждый вызов и каждый 401.
-
     initData может прийти:
     - query-параметром ?tg_init_data=... (удобно для ссылок)
     - заголовком X-Tg-Init-Data: ... (удобно для fetch из JS)
     """
-    # --- Диагностика: что пришло ---
-    has_query_param = bool(tg_init_data)
-    has_header = bool(x_tg_init_data)
     init_data = tg_init_data or x_tg_init_data
-
-    logger.info(
-        f"[AUTH_DIAG] tg_init_data(query)="
-        f"{ 'present(len=' + str(len(tg_init_data)) + ')' if has_query_param else 'absent' }, "
-        f"X-Tg-Init-Data(header)="
-        f"{ 'present(len=' + str(len(x_tg_init_data)) + ')' if has_header else 'absent' }, "
-        f"bot_token_set={ bool(settings.telegram_bot_token) }, "
-        f"bot_token_len={ len(settings.telegram_bot_token) }"
-    )
 
     if not init_data:
         logger.warning(
-            "[AUTH_DIAG] 401 -> ничего не передано. Возможные причины:\n"
-            "  (a) Mini App открыт вне Telegram (window.Telegram.WebApp undefined) -> "
-            "getInitData() возвращает пустую строку\n"
-            "  (b) bothost-прокси стрипает X-Tg-Init-Data (проверить nginx config)\n"
-            "  (c) фронтенд не успел инициализировать Telegram SDK до первого запроса\n"
-            "  (d) браузер блокирует custom header (CORS preflight fail)"
+            "401 — tg_init_data не передан. "
+            "Возможные причины: Mini App открыт вне Telegram, "
+            "bothost-прокси стрипает X-Tg-Init-Data, "
+            "или фронтенд не успел инициализировать Telegram SDK."
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -182,40 +167,31 @@ async def get_current_user(
 
     parsed = _verify_init_data(init_data, settings.telegram_bot_token)
     if parsed is None:
-        # Детализируем причину
+        # Логируем причину (для диагностики, но без PII)
         try:
             parsed_raw = dict(parse_qsl(init_data, keep_blank_values=True))
             has_hash = "hash" in parsed_raw
             auth_date_str = parsed_raw.get("auth_date", "")
             auth_date_int = int(auth_date_str) if auth_date_str.isdigit() else None
-            age_seconds = (
-                time.time() - auth_date_int if auth_date_int else None
-            )
+            age_hours = round((time.time() - auth_date_int) / 3600, 2) if auth_date_int else None
         except Exception:
-            parsed_raw = {}
             has_hash = False
-            auth_date_str = ""
-            age_seconds = None
+            age_hours = None
 
-        if age_seconds is not None and age_seconds > 86400:
-            reason = f"expired (age={ round(age_seconds / 3600, 2) }h > 24h)"
+        if age_hours is not None and age_hours * 3600 > _TTL_SECONDS:
+            reason = f"expired (age={age_hours}h, ttl={_TTL_HOURS}h)"
         elif not has_hash:
             reason = "no_hash_in_init_data"
         elif not settings.telegram_bot_token:
             reason = "bot_token_empty_in_backend"
         else:
-            reason = (
-                "bad_signature (bot_token mismatch OR initData corrupted in transit)"
-            )
+            reason = "bad_signature (bot_token mismatch OR initData corrupted)"
 
         logger.warning(
-            f"[AUTH_DIAG] 401 -> подпись невалидна. "
-            f"has_hash={ has_hash }, "
-            f"auth_date={ auth_date_str or 'N/A' }, "
-            f"age_hours={ round(age_seconds / 3600, 2) if age_seconds else 'N/A' }, "
-            f"bot_token_prefix="
-            f"{ settings.telegram_bot_token[:10] + '...' if settings.telegram_bot_token else 'EMPTY' }, "
-            f"reason={ reason }"
+            f"401 — подпись initData невалидна. "
+            f"has_hash={has_hash}, age_hours={age_hours}, "
+            f"bot_token_set={bool(settings.telegram_bot_token)}, "
+            f"reason={reason}"
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -224,8 +200,4 @@ async def get_current_user(
 
     user = _extract_user(parsed)
     _check_whitelist(user)
-    logger.info(
-        f"[AUTH_DIAG] OK -> user_id={ user.id }, "
-        f"username={ user.username or 'N/A' }"
-    )
     return user
