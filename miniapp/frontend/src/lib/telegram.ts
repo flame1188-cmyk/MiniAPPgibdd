@@ -1,10 +1,17 @@
 /**
- * Обёртка над Telegram WebApp SDK.
+ * Обёртка над Telegram WebApp SDK (с фиксом устаревшего initData).
+ *
+ * Что нового:
+ * - isInitDataStale() — проверяет возраст initDataUnsafe.auth_date
+ *   и возвращает true, если он старше 23 часов (с запасом 1ч от
+ *   24-часового лимита Telegram).
+ * - ensureFreshInitData() — если initData устарел, принудительно
+ *   перезагружает страницу, чтобы Telegram выдал свежий initData.
+ *   Если вне Telegram — возвращает пустую строку без reload.
+ * - getInitDataFresh() — безопасный геттер: если initData устарел,
+ *   возвращает '' (не отправляем протухший токен на сервер).
  *
  * Документация: https://core.telegram.org/bots/webapps
- *
- * В dev-режиме (вне Telegram) window.Telegram.WebApp недоступен —
- * возвращаем mock, чтобы UI не падал.
  */
 
 declare global {
@@ -41,10 +48,6 @@ export interface TelegramWebApp {
   viewportStableHeight: number
   headerColor: string
   backgroundColor: string
-  /**
-   * true, если Mini App сейчас в полноэкранном режиме.
-   * Доступно с версии WebApp SDK 8.0+.
-   */
   isFullscreen?: boolean
 
   ready: () => void
@@ -54,13 +57,6 @@ export interface TelegramWebApp {
   setBackgroundColor: (color: string) => void
   enableClosingConfirmation: () => void
   disableVerticalSwipes?: () => void
-  /**
-   * Запросить переход в полноэкранный режим. Доступно с SDK 8.0+.
-   * На некоторых платформах требует user gesture — вызывающая сторона
-   * должна быть готова сделать fallback на обработчик клика.
-   * Возвращает Promise, который резолвится при успехе и реджектится
-   * при ошибке/отмене.
-   */
   requestFullscreen?: () => Promise<void>
   exitFullscreen?: () => Promise<void>
   isVersionAtLeast?: (version: string) => boolean
@@ -114,42 +110,44 @@ export function initTelegram(): void {
     return
   }
 
-  // Сигналим Telegram, что приложение готово к отображению
   wa.ready()
-  // Разворачиваем Mini App на максимальную высоту внутри окна Telegram.
-  // На мобильных — раскрывает MiniApp на весь экран (поведение по умолчанию).
-  // На десктопе — раскрывает по высоте внутри текущего окна Telegram,
-  // но НЕ меняет размер самого окна (для этого есть кнопка «Полный экран»).
   wa.expand()
-  // Запрашиваем подтверждение перед закрытием (если есть активная задача)
-  // wa.enableClosingConfirmation()
-
-  // Применяем цветовую схему Telegram
   applyTheme(wa)
 
-  // Блокируем вертикальные свайпы (iOS) — чтобы не закрывали Mini App
   try {
     wa.disableVerticalSwipes?.()
   } catch {
     // Метод доступен не на всех версиях SDK
   }
 
-  // ВАЖНО: настоящий fullscreen (requestFullscreen) НЕ вызываем автоматически
-  // при загрузке — он прячет панель задач и системные элементы управления,
-  // что неудобно для десктопа. Пользователь может включить его кнопкой
-  // «⤢ Полный экран» в шапке приложения.
+  // === Sprint 7 fix: проверяем свежесть initData при старте ===
+  // Если initData старше 23 часов (близко к 24-часовому лимиту Telegram),
+  // принудительно перезагружаем страницу — Telegram выдаст свежий.
+  // Это решает проблему 401 Unauthorized после длительного простоя Mini App.
+  if (isInitDataStale()) {
+    console.warn(
+      `[telegram] initData устарел (auth_date=${wa.initDataUnsafe.auth_date}, ` +
+      `age=${ Math.floor((Date.now() / 1000 - (wa.initDataUnsafe.auth_date ?? 0)) / 3600) }h). ` +
+      `Перезагружаем страницу для получения свежего токена.`
+    )
+    // Небольшая задержка, чтобы успели отработать ready/expand
+    setTimeout(() => {
+      window.location.reload()
+    }, 100)
+    return  // Не продолжаем инициализацию — страница сейчас перезагрузится
+  }
 
   initialized = true
   console.info(
     `[telegram] WebApp initialized. Platform: ${wa.platform}, ` +
-    `version: ${wa.version}, scheme: ${wa.colorScheme}`
+    `version: ${wa.version}, scheme: ${wa.colorScheme}, ` +
+    `initData_age_min=${ wa.initDataUnsafe.auth_date ? Math.floor((Date.now() / 1000 - wa.initDataUnsafe.auth_date) / 60) : 'N/A' }`
   )
 }
 
 function applyTheme(wa: TelegramWebApp): void {
   const root = document.documentElement
 
-  // Маппим themeParams в CSS-переменные
   const tp = wa.themeParams || {}
   const map: Record<string, string> = {
     bg_color: '--tg-color-bg',
@@ -170,14 +168,12 @@ function applyTheme(wa: TelegramWebApp): void {
     }
   }
 
-  // Dark mode
   if (wa.colorScheme === 'dark') {
     root.classList.add('dark')
   } else {
     root.classList.remove('dark')
   }
 
-  // Фон страницы = фону Telegram
   if (tp.bg_color) {
     document.body.style.backgroundColor = tp.bg_color
   }
@@ -190,6 +186,60 @@ export function getWebAppSafe(): TelegramWebApp | null {
   return getWebApp()
 }
 
+/**
+ * Проверяет, устарел ли initData (близок к 24-часовому лимиту Telegram).
+ * Порог — 23 часа (1 час запаса, чтобы успеть сделать запрос до истечения).
+ *
+ * Возвращает false, если:
+ * - WebApp SDK недоступен (вне Telegram)
+ * - auth_date отсутствует или некорректен
+ * - возраст initData меньше 23 часов
+ *
+ * Возвращает true, если возраст initData >= 23 часов.
+ */
+export function isInitDataStale(): boolean {
+  const wa = getWebApp()
+  if (!wa) return false
+  const authDate = wa.initDataUnsafe?.auth_date
+  if (!authDate || typeof authDate !== 'number' || authDate <= 0) {
+    return false
+  }
+  const ageSeconds = Date.now() / 1000 - authDate
+  // 23 часа = 82800 сек (запас 1ч от 24-часового лимита Telegram)
+  return ageSeconds > 82800
+}
+
+/**
+ * Возвращает initData, только если он свежий.
+ * Если устарел — возвращает пустую строку (сервер всё равно вернёт 401).
+ *
+ * Используется в api.ts вместо getInitData(), чтобы не отправлять
+ * заведомо протухший токен.
+ */
+export function getInitDataFresh(): string {
+  if (isInitDataStale()) {
+    return ''
+  }
+  return getWebApp()?.initData ?? ''
+}
+
+/**
+ * Если initData устарел — принудительно перезагружает страницу.
+ * Используется в api.ts при получении 401, чтобы восстановить сессию
+ * без ручного закрытия/открытия Mini App.
+ */
+export function ensureFreshInitData(): void {
+  if (isInitDataStale()) {
+    console.warn('[telegram] initData устарел — перезагружаем страницу для восстановления сессии')
+    window.location.reload()
+  }
+}
+
+/**
+ * Оригинальный геттер initData — возвращает как есть, без проверки свежести.
+ * Используется только в крайних случаях (например, для логирования).
+ * Для API-запросов используйте getInitDataFresh().
+ */
 export function getInitData(): string {
   return getWebApp()?.initData ?? ''
 }
@@ -204,24 +254,15 @@ export function isInsideTelegram(): boolean {
 
 /**
  * Детектит Telegram Desktop (Windows/Mac/Linux).
- * На desktop Mini App открывается в вертикальном окне, которое
- * пользователь может растянуть мышью. Возвращаем true, чтобы UI
- * мог переключиться в широкую раскладку (max-w-5xl вместо max-w-xl).
  */
 export function isTelegramDesktop(): boolean {
   const wa = getWebApp()
   if (!wa) {
-    // Вне Telegram (dev-режим в браузере) — считаем десктопом по ширине окна
     return typeof window !== 'undefined' && window.innerWidth >= 900
   }
   return wa.platform === 'tdesktop'
 }
 
-/**
- * Возвращает рекомендуемый max-width для контейнера приложения.
- * На мобильных (ios/android) — узкая вертикальная раскладка.
- * На десктопе (tdesktop или широкий браузер) — широкая.
- */
 export function getContainerMaxWidth(): string {
   return isTelegramDesktop() ? 'max-w-5xl' : 'max-w-xl'
 }
@@ -286,34 +327,20 @@ export function hideMainButton(): void {
   getWebApp()?.MainButton?.hide()
 }
 
-/**
- * Доступен ли полноэкранный режим в текущем клиенте Telegram.
- * Проверяет и наличие метода requestFullscreen, и версию SDK >= 8.0.
- */
 export function isFullscreenSupported(): boolean {
   const wa = getWebApp()
   if (!wa) return false
   if (typeof wa.requestFullscreen !== 'function') return false
-  // На очень старых клиентах метод может быть определён, но не работать —
-  // страхуемся проверкой версии SDK.
   if (typeof wa.isVersionAtLeast === 'function') {
     return wa.isVersionAtLeast('8.0')
   }
-  // Если isVersionAtLeast нет — доверяем наличию requestFullscreen.
   return true
 }
 
-/**
- * Mini App сейчас в полноэкранном режиме?
- */
 export function isFullscreenActive(): boolean {
   return !!getWebApp()?.isFullscreen
 }
 
-/**
- * Запросить полноэкранный режим. Возвращает Promise (ресолвится при успехе).
- * Если метод недоступен — Promise сразу реджектится.
- */
 export function requestAppFullscreen(): Promise<void> {
   const wa = getWebApp()
   if (!wa || typeof wa.requestFullscreen !== 'function') {
@@ -322,9 +349,6 @@ export function requestAppFullscreen(): Promise<void> {
   return wa.requestFullscreen()
 }
 
-/**
- * Выйти из полноэкранного режима.
- */
 export function exitAppFullscreen(): Promise<void> {
   const wa = getWebApp()
   if (!wa || typeof wa.exitFullscreen !== 'function') {
@@ -333,10 +357,6 @@ export function exitAppFullscreen(): Promise<void> {
   return wa.exitFullscreen()
 }
 
-/**
- * Подписка на изменение полноэкранного режима.
- * Возвращает функцию отписки.
- */
 export function onFullscreenChange(cb: (isFullscreen: boolean) => void): () => void {
   const wa = getWebApp()
   if (!wa) return () => {}
@@ -348,30 +368,14 @@ export function onFullscreenChange(cb: (isFullscreen: boolean) => void): () => v
   }
 }
 
-/**
- * Развернуть Mini App на максимальную высоту внутри окна Telegram.
- *
- * На мобильных — раскрывает MiniApp на весь экран (поведение по умолчанию).
- *
- * На десктопе — раскрывает по высоте внутри текущего окна Telegram,
- * но НЕ меняет размер самого окна. Для полноэкранного режима используйте
- * requestAppFullscreen().
- */
 export function expandApp(): void {
   getWebApp()?.expand()
 }
 
-/**
- * Текущее состояние expand (MiniApp развёрнут по высоте).
- */
 export function isExpandedActive(): boolean {
   return !!getWebApp()?.isExpanded
 }
 
-/**
- * Подписка на изменение expand-режима.
- * Возвращает функцию отписки.
- */
 export function onExpandedChange(cb: (isExpanded: boolean) => void): () => void {
   const wa = getWebApp()
   if (!wa) return () => {}
