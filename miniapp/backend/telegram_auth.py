@@ -1,6 +1,9 @@
 """
 Проверка подлинности Telegram WebApp initData.
 
+ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ — добавлено логирование каждого 401 случая.
+После определения причины вернуть оригинальный файл (telegram_auth.py.original).
+
 Документация:
 https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -25,6 +29,8 @@ from urllib.parse import parse_qsl
 from fastapi import HTTPException, Header, Query, status
 
 from .config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -140,12 +146,35 @@ async def get_current_user(
     """
     FastAPI dependency: извлекает и проверяет пользователя Telegram.
 
+    ДИАГНОСТИЧЕСКАЯ ВЕРСИЯ — логирует каждый вызов и каждый 401.
+
     initData может прийти:
     - query-параметром ?tg_init_data=... (удобно для ссылок)
     - заголовком X-Tg-Init-Data: ... (удобно для fetch из JS)
     """
+    # --- Диагностика: что пришло ---
+    has_query_param = bool(tg_init_data)
+    has_header = bool(x_tg_init_data)
     init_data = tg_init_data or x_tg_init_data
+
+    logger.info(
+        f"[AUTH_DIAG] tg_init_data(query)="
+        f"{ 'present(len=' + str(len(tg_init_data)) + ')' if has_query_param else 'absent' }, "
+        f"X-Tg-Init-Data(header)="
+        f"{ 'present(len=' + str(len(x_tg_init_data)) + ')' if has_header else 'absent' }, "
+        f"bot_token_set={ bool(settings.telegram_bot_token) }, "
+        f"bot_token_len={ len(settings.telegram_bot_token) }"
+    )
+
     if not init_data:
+        logger.warning(
+            "[AUTH_DIAG] 401 -> ничего не передано. Возможные причины:\n"
+            "  (a) Mini App открыт вне Telegram (window.Telegram.WebApp undefined) -> "
+            "getInitData() возвращает пустую строку\n"
+            "  (b) bothost-прокси стрипает X-Tg-Init-Data (проверить nginx config)\n"
+            "  (c) фронтенд не успел инициализировать Telegram SDK до первого запроса\n"
+            "  (d) браузер блокирует custom header (CORS preflight fail)"
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="tg_init_data query parameter or X-Tg-Init-Data header required",
@@ -153,6 +182,41 @@ async def get_current_user(
 
     parsed = _verify_init_data(init_data, settings.telegram_bot_token)
     if parsed is None:
+        # Детализируем причину
+        try:
+            parsed_raw = dict(parse_qsl(init_data, keep_blank_values=True))
+            has_hash = "hash" in parsed_raw
+            auth_date_str = parsed_raw.get("auth_date", "")
+            auth_date_int = int(auth_date_str) if auth_date_str.isdigit() else None
+            age_seconds = (
+                time.time() - auth_date_int if auth_date_int else None
+            )
+        except Exception:
+            parsed_raw = {}
+            has_hash = False
+            auth_date_str = ""
+            age_seconds = None
+
+        if age_seconds is not None and age_seconds > 86400:
+            reason = f"expired (age={ round(age_seconds / 3600, 2) }h > 24h)"
+        elif not has_hash:
+            reason = "no_hash_in_init_data"
+        elif not settings.telegram_bot_token:
+            reason = "bot_token_empty_in_backend"
+        else:
+            reason = (
+                "bad_signature (bot_token mismatch OR initData corrupted in transit)"
+            )
+
+        logger.warning(
+            f"[AUTH_DIAG] 401 -> подпись невалидна. "
+            f"has_hash={ has_hash }, "
+            f"auth_date={ auth_date_str or 'N/A' }, "
+            f"age_hours={ round(age_seconds / 3600, 2) if age_seconds else 'N/A' }, "
+            f"bot_token_prefix="
+            f"{ settings.telegram_bot_token[:10] + '...' if settings.telegram_bot_token else 'EMPTY' }, "
+            f"reason={ reason }"
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Telegram initData signature",
@@ -160,4 +224,8 @@ async def get_current_user(
 
     user = _extract_user(parsed)
     _check_whitelist(user)
+    logger.info(
+        f"[AUTH_DIAG] OK -> user_id={ user.id }, "
+        f"username={ user.username or 'N/A' }"
+    )
     return user
