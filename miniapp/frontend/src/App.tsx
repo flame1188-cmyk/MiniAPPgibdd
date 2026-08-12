@@ -39,7 +39,20 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('dtp')
   const [fullscreen, setFullscreen] = useState<boolean>(isFullscreenActive())
 
-  const { data: task, isError } = useTaskPolling(activeTaskId)
+  const { data: task, isError, isNotFound } = useTaskPolling(activeTaskId)
+
+  // Sprint 7 fix: при 404 (задача не найдена) сбрасываем activeTaskId,
+  // чтобы пользователь мог создать новую. Это происходит после сбоя БД
+  // (bothost-инциденты, перезапуск контейнера с потерей данных и т.д.)
+  useEffect(() => {
+    if (isNotFound && activeTaskId) {
+      console.warn(
+        `[App] Task ${activeTaskId} not found (404). ` +
+        'Resetting activeTaskId — возможно, БД была сброшена.'
+      )
+      setActiveTaskId(null)
+    }
+  }, [isNotFound, activeTaskId])
 
   const user = getCurrentUser()
   const showDevWarning = !isInsideTelegram()
@@ -204,9 +217,31 @@ export default function App() {
                   </div>
                 )}
 
-                {isError && (
+                {isError && !isNotFound && (
                   <div className="tg-card text-center text-sm opacity-60">
                     Не удалось получить статус задачи. Попробуйте обновить.
+                  </div>
+                )}
+
+                {/* Sprint 7 fix: 404 — задача не найдена (БД сброшена
+                    или task_id устарел). Показываем понятное сообщение
+                    вместо бесконечного поллинга. activeTaskId уже
+                    сбросится через useEffect выше. */}
+                {isNotFound && (
+                  <div
+                    className="tg-card"
+                    style={{
+                      color: 'var(--tg-color-destructive, #ff3b30)',
+                    }}
+                  >
+                    <div className="font-medium mb-1">
+                      Задача не найдена
+                    </div>
+                    <div className="text-xs opacity-80">
+                      Возможно, данные были сброшены при техническом
+                      обслуживании сервера. Создайте новую задачу — форма
+                      выше.
+                    </div>
                   </div>
                 )}
               </>
