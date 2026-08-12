@@ -3,7 +3,11 @@
 Этот документ описывает деплой единого приложения (Telegram-бот + Mini App)
 на хостинг [bothost.ru](https://bothost.ru).
 
-## Архитектура
+## Режимы деплоя
+
+Проект поддерживает 2 режима, управляемых переменной `DEPLOYMENT_MODE`:
+
+### Режим `single` (по умолчанию, текущий)
 
 ```
                     ┌─────────────────────────────────┐
@@ -25,6 +29,47 @@
 **Единый процесс**: `main.py` поднимает FastAPI и в lifespan инициализирует
 Telegram-бота в webhook-режиме. Mini App frontend (собранный React) раздаётся
 как статика из `miniapp/frontend/dist`.
+
+- Потребление RAM: ~300-500 MB
+- Достаточно для текущей нагрузки (async/await через asyncio.Semaphore)
+- Не требует Redis/Celery
+
+### Режим `multi` (после Фазы C.3, Celery-режим)
+
+```
+                    ┌─────────────────────────────────┐
+                    │   bothost.ru (TLS-терминация)    │
+                    │   bot1234.bothost.tech           │
+                    └────────────┬────────────────────┘
+                                 │  HTTPS
+                    ┌────────────▼────────────────────┐
+                    │   supervisord (PID 1)            │
+                    ├─────────────────────────────────┤
+                    │  ┌──────────────────────────┐   │
+                    │  │ redis-server             │   │  maxmemory 128mb
+                    │  │ (брокер + result backend)│   │  без AOF
+                    │  └────────────┬─────────────┘   │
+                    │               │                 │
+                    │  ┌────────────▼─────────────┐   │
+                    │  │ uvicorn main:app         │   │  /health, /health/redis,
+                    │  │ (FastAPI + webhook)      │◄──┤  /health/celery
+                    │  └────────────┬─────────────┘   │
+                    │               │                 │
+                    │  ┌────────────▼─────────────┐   │
+                    │  │ celery worker            │   │  4 очереди,
+                    │  │ (concurrency=4)          │   │  --max-tasks-per-child=10
+                    │  └──────────────────────────┘   │
+                    │  ┌──────────────────────────┐   │
+                    │  │ celery beat              │   │  cleanup, scheduled tasks
+                    │  └──────────────────────────┘   │
+                    └─────────────────────────────────┘
+```
+
+**Multi-process**: supervisord запускает 4 процесса в одном контейнере.
+- Потребление RAM: ~700 MB базовое, ~1.3 GB пиковое
+- Полноценный async-пайплайн: LLM, Excel, clusters не блокируют API
+- Retry, persistence, scheduled cleanup из коробки (Celery)
+- Оптимизировано под bothost 4 vCPU / 2 GB RAM / 15 GB NVMe
 
 ## Что изменилось по сравнению с pure-Telegram-ботом
 
@@ -105,18 +150,42 @@ npm run build
 
 ## Деплой на bothost.ru
 
-### Вариант A: Через Dockerfile (рекомендуется)
+### Вариант A: Через Dockerfile, режим `single` (по умолчанию)
 
 1. Загрузите репозиторий на bothost (через git или архивом).
 2. В настройках проекта укажите **Dockerfile** как источник.
 3. В переменных окружения bothost задайте `TELEGRAM_BOT_TOKEN`,
    `BOTHOST_DOMAIN`, `CORS_ORIGINS`.
-4. bothost автоматически:
+4. `DEPLOYMENT_MODE` не задавайте (или задайте `single`).
+5. bothost автоматически:
    - Соберёт frontend (Stage 1: `node:20-alpine`)
    - Установит Python-зависимости (Stage 2: `python:3.11-slim`)
-   - Запустит `python main.py` на `$PORT`
+   - Запустит `python main.py` на `$PORT` (через entrypoint.sh)
 
-### Вариант B: Через главный файл main.py
+### Вариант B: Через Dockerfile, режим `multi` (Celery + Redis)
+
+1. Загрузите репозиторий на bothost (через git или архивом).
+2. В настройках проекта укажите **Dockerfile** как источник.
+3. В переменных окружения bothost задайте:
+   - `TELEGRAM_BOT_TOKEN`
+   - `BOTHOST_DOMAIN`
+   - `CORS_ORIGINS`
+   - **`DEPLOYMENT_MODE=multi`** (ключевая переменная)
+   - `USE_CELERY=true` (по умолчанию уже true, но лучше явно)
+4. bothost соберёт образ и запустит `entrypoint.sh`, который:
+   - Видит `DEPLOYMENT_MODE=multi` → запускает `supervisord -n -c /etc/supervisord.conf`
+   - supervisord поднимает 4 процесса: redis, api, worker, beat
+5. Проверка:
+   - `https://<DOMAIN>/health` → статус API
+   - `https://<DOMAIN>/health/redis` → `connected: true`, `latency_ms < 5`
+   - `https://<DOMAIN>/health/celery` → `ping_count >= 1`, `workers: ["celery@<hostname>"]`
+
+**Важно для multi-режима:**
+- RAM сервера должен быть ≥ 2 ГБ (пиковое потребление ~1.3 ГБ + запас на OS)
+- CPU ≥ 4 vCPU (worker concurrency=4)
+- /data должен быть persistent volume (для Redis RDB, если включён)
+
+### Вариант C: Через главный файл main.py (fallback, только single-режим)
 
 Если bothost не поддерживает Dockerfile:
 
@@ -250,14 +319,78 @@ Telegram отверг токен. Проверьте:
 2. Токен не отозван в @BotFather (`/revoke` + новый токен).
 3. Нет лишних пробелов/переводов строк в `.env`.
 
+### Multi-режим: `/health/redis` возвращает `connected: false`
+
+Если вы переключились в `DEPLOYMENT_MODE=multi`, но Redis не отвечает:
+
+1. Проверьте, что контейнер запущен и supervisord работает:
+   ```
+   docker exec <container> supervisorctl status
+   ```
+   Ожидаемый вывод (все `RUNNING`):
+   ```
+   api       RUNNING   pid 123, uptime 0:05:30
+   beat      RUNNING   pid 124, uptime 0:05:30
+   redis     RUNNING   pid 125, uptime 0:05:30
+   worker    RUNNING   pid 126, uptime 0:05:30
+   ```
+
+2. Если `redis` в статусе `FATAL` или `STOPPED`:
+   ```
+   docker exec <container> supervisorctl tail redis stderr
+   ```
+   Частая причина — отсутствие директории `/data/redis` (создаётся в entrypoint,
+   но если volume подключен позже — может быть пустой).
+
+3. Если `redis` RUNNING, но `/health/redis` всё равно `connected: false`:
+   - Проверьте `REDIS_URL` в env: должен быть `redis://127.0.0.1:6379/0`
+     (внутри контейнера, не `redis://redis:6379` — это для docker-compose)
+   - supervisord.conf уже передаёт правильный `REDIS_URL` в [program:api],
+     но если он переопределён в bothost env — приоритет у bothost.
+
+### Multi-режим: `/health/celery` возвращает `ping_count: 0`
+
+Worker не отвечает на ping. Возможные причины:
+
+1. Worker ещё стартует (повторите через 30 сек).
+2. Worker упал — проверьте:
+   ```
+   docker exec <container> supervisorctl tail worker stderr
+   ```
+3. Если в логах `ModuleNotFoundError: No module named 'worker'`:
+   - Код `worker/` не попал в образ.
+   - Проверьте, что `.dockerignore` не исключает `worker/`.
+
+### Multi-режим: OOM kill (контейнер падает по памяти)
+
+Признаки: контейнер рестартуется, в логах host'а `OOM killed`.
+
+Причины и решения:
+- Уменьшите `CELERY_WORKER_CONCURRENCY` до 2 (в bothost env):
+  ```
+  CELERY_WORKER_CONCURRENCY=2
+  ```
+  Но учтите: это переменная Celery app, для supervisor-деплоя нужно
+  отредактировать `docker/supervisord.conf` → секция `[program:worker]` →
+  `--concurrency=2`.
+- Уменьшите `CELERY_MAX_TASKS_PER_CHILD` до 5 (перезапуск чаще).
+- Перейдите на `DEPLOYMENT_MODE=single` — если Celery пока не нужен.
+
 ## Ограничения bothost.ru
 
-- **1 процесс**: `main.py` запускает один uvicorn worker. Webhook требует
-  единственного процесса (иначе Telegram будет слать updates случайному).
-- **RAM ~2 ГБ**: gibdd-bot уже оптимизирован под это (см. комментарии в
-  `bot.py` про tracemalloc). Mini App добавляет ~50 МБ.
-- **Диск**: кэш регионов/камер хранится в `data/`. На bothost обычно
-  `/data` — задайте `CAMERA_DATA_DIR=/data` если доступно.
+- **1 контейнер**: bothost запускает один Docker-контейнер.
+  - В режиме `single`: 1 процесс (`python main.py`)
+  - В режиме `multi`: supervisord с 4 процессами (redis, api, worker, beat)
+- **RAM ~2 ГБ**: gibdd-bot уже оптимизирован под это.
+  - `single` режим: ~300-500 MB (запас ~1.5 ГБ)
+  - `multi` режим: ~700 MB базовое, ~1.3 GB пиковое (запас ~700 MB)
+  - См. комментарии в `bot.py` про tracemalloc.
+- **CPU 4 vCPU**: достаточно для multi-режима (worker concurrency=4)
+- **Диск 15 ГБ NVMe**:
+  - Кэш регионов/камер хранится в `data/`. На bothost обычно
+    `/data` — задайте `CAMERA_DATA_DIR=/data` если доступно.
+  - В multi-режиме Redis хранит данные в `/data/redis/` (если включены RDB snapshots;
+    по умолчанию отключено для экономии диска и RAM).
 - **Таймауты**: API ГИБДД может отвечать до 120 сек. `TARGET_API_TIMEOUT=120`
   уже настроен. bothost обычно даёт 300 сек на HTTP-запрос.
 - **152-ФЗ**: bothost — российский хостинг, дата-центр в РФ. Данные
