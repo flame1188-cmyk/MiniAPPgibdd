@@ -281,7 +281,11 @@ def snapshot_to_task_updates(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 # Сохранение / загрузка / удаление
 # ============================================================
 def save_task_state(task: Any) -> bool:
-    """Сохраняет snapshot Task в Redis.
+    """Сохраняет snapshot Task (dataclass) в Redis.
+
+    Принимает ПОЛНЫЙ Task-объект (с атрибутами id, user_id, region_code,
+    region_name, period_label, dat_list, raw_query, status, progress, ...).
+    Используется на FastAPI-стороне, где есть реальный Task.
 
     Returns:
         True если сохранено в Redis, False если fallback на in-memory
@@ -292,14 +296,53 @@ def save_task_state(task: Any) -> bool:
         return False
 
     try:
+        task_id = task.id
         snapshot = task_to_snapshot(task)
         # Обновляем updated_at — snapshot всегда свежий
         snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
-        key = _task_state_key(task.id)
+        key = _task_state_key(task_id)
         client.setex(key, _get_ttl(), json.dumps(snapshot, ensure_ascii=False, default=str))
         return True
     except Exception as exc:
-        logger.warning(f"[task_state] save_task_state({task.id}) failed: {exc}")
+        task_id_for_log = getattr(task, "id", "<unknown>")
+        logger.warning(f"[task_state] save_task_state({task_id_for_log}) failed: {exc}")
+        return False
+
+
+def save_task_state_dict(task_id: str, snapshot: Dict[str, Any]) -> bool:
+    """Сохраняет snapshot task_state (dict) напрямую в Redis.
+
+    В отличие от save_task_state(), принимает уже готовый snapshot dict —
+    НЕ вызывает task_to_snapshot(). Это канонический путь для Celery worker'а:
+    worker загружает snapshot из Redis (load_task_state), мутирует поля,
+    сохраняет обратно через save_task_state_dict().
+
+    Args:
+        task_id: ID задачи (для логов и ключа).
+        snapshot: Snapshot dict (JSON-сериализуемый). Поле "id" должно
+                  совпадать с task_id (или будет перезаписано).
+
+    Returns:
+        True если сохранено в Redis, False если Redis недоступен.
+    """
+    client = _get_redis_client()
+    if client is None:
+        return False
+
+    try:
+        # Гарантируем, что id в snapshot соответствует task_id
+        snapshot["id"] = task_id
+        # Обновляем updated_at — snapshot всегда свежий
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
+        key = _task_state_key(task_id)
+        client.setex(
+            key,
+            _get_ttl(),
+            json.dumps(snapshot, ensure_ascii=False, default=str),
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"[task_state] save_task_state_dict({task_id}) failed: {exc}")
         return False
 
 
