@@ -215,12 +215,57 @@ async def create_dtp_task(
 
 def asyncio_create_task(task_id: str) -> None:
     """
-    Запускает async execute_task в текущем event loop.
-    Не блокирует HTTP-ответ.
+    Запускает pipeline через dispatcher.
+
+    Dispatcher (worker.dispatcher) сам решает, куда отправить задачу:
+    - USE_CELERY=true И REDIS_URL задан → Celery queue "gibdd"
+      (execute_pipeline_task в worker-процессе)
+    - иначе → asyncio.create_task(execute_task(task_id)) в текущем event loop
+      (legacy in-memory path, Sprint 6 behavior)
+
+    В Celery-режиме:
+      - .delay() синхронный — отправляет в broker и возвращается
+      - FastAPI сразу отдаёт HTTP 200, фронтенд polling'ом читает статус
+        из Redis (worker.task_state) через GET /tasks/{id}
+    В in-memory:
+      - _schedule_async(execute_task(task_id)) — fire-and-forget
     """
+    # Достаём Task для извлечения параметров (dat_list, reg_code, ...)
+    from ..services.gibdd_service import get_task_async
+    from worker.dispatcher import dispatch_execute_pipeline
     import asyncio
-    loop = asyncio.get_running_loop()
-    loop.create_task(execute_task(task_id))
+
+    async def _dispatch():
+        task = await get_task_async(task_id)
+        if task is None:
+            # Task уже удалён из памяти (LRU eviction или restart) —
+            # fallback на старый in-memory path, который сам загрузит метаданные
+            # из БД через pipeline.execute_task.
+            from ..services.gibdd_service import execute_task
+            await execute_task(task_id)
+            return
+
+        dispatch_execute_pipeline(
+            task_id=task.id,
+            dat_list=task.dat_list,
+            reg_code=task.region_code,
+            region_name=task.region_name,
+            period_label=task.period_label,
+            prev_dat_list=None,  # gibdd_tasks вычислит из dat_list (год - 1)
+            prev_label=task.prev_label,  # может быть None — вычислится внутри
+            user_id=task.user_id,
+            raw_query=task.raw_query,
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Не в event loop (например, из теста в sync-контексте) — запускаем
+        # dispatcher синхронно. dispatch_execute_pipeline — sync-функция.
+        asyncio.run(_dispatch())
+        return
+
+    loop.create_task(_dispatch())
 
 
 @router.get("/tasks", response_model=List[TaskStatusResponse])

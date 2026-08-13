@@ -101,7 +101,22 @@ def _register_task(task: Task) -> None:
 
 
 async def get_task_async(task_id: str) -> Optional[Task]:
-    """Асинхронная версия get_task — проверяет и БД, и in-memory."""
+    """Асинхронная версия get_task — проверяет и БД, и in-memory.
+
+    Sprint 7 / Phase C.3: при USE_CELERY=true дополнительно мерджит snapshot
+    task_state из Redis (если есть свежее) в Task. Это нужно, потому что в
+    multi-режиме Celery worker пишет прогресс в Redis (через _update_snapshot
+    в gibdd_tasks.execute_pipeline_task), а FastAPI процесс ничего не знает
+    об этом прогрессе — у него своя копия Task в in-memory _tasks со старым
+    status=PENDING. Без мерджа фронтенд будет вечно видеть PENDING, хотя
+    Celery уже выполнил задачу.
+
+    Логика мерджа:
+      - Если Redis недоступен или snapshot'а нет → возвращаем Task как есть
+      - Если snapshot.updated_at новее task.updated_at → применяем поля
+        (status, progress, error, files, analytics, total_dtp/dead/injured)
+      - Иначе → Task актуальнее (in-memory путь уже выполнился), не трогаем
+    """
     # Сначала in-memory (быстро + есть тяжёлые поля)
     if task_id in _tasks:
         # LRU: обновляем позицию как "недавно использованную"
@@ -114,6 +129,8 @@ async def get_task_async(task_id: str) -> Optional[Task]:
         # llm_sessions в БД осталась). Пробуем восстановить, если
         # оба поля пустые — это no-op если уже заполнено.
         await _try_restore_llm_session(task)
+        # Sprint 7 / Phase C.3: мерджим Redis snapshot (если Celery работает)
+        _maybe_merge_redis_snapshot(task)
         return task
 
     # Потом БД (если есть)
@@ -130,10 +147,125 @@ async def get_task_async(task_id: str) -> Optional[Task]:
             # из llm_sessions (если они не были восстановлены через
             # attach_heavy_state из _TASKS_HEAVY_STATE).
             await _try_restore_llm_session(task)
+            # Sprint 7 / Phase C.3: мерджим Redis snapshot
+            _maybe_merge_redis_snapshot(task)
         return task
     except Exception as exc:
         logger.debug(f"get_task_async: DB load failed: {exc}")
         return _tasks.get(task_id)
+
+
+def _maybe_merge_redis_snapshot(task: Task) -> None:
+    """Sprint 7 / Phase C.3: мерджит Redis snapshot в Task (если Celery включён).
+
+    Если USE_CELERY=true И REDIS_URL задан И в Redis есть snapshot для task_id
+    новее, чем task.updated_at — применяет поля snapshot к task.
+
+    Side effects:
+        - Мутирует task (status, progress, error, files, analytics, total_*)
+        - НЕ трогает тяжёлые поля (cards, prev_cards, raw_clusters) — они
+          восстанавливаются через cards_cache/clusters_cache lazy.
+        - НЕ пишет обратно в _tasks (это и так тот же объект)
+    """
+    try:
+        from worker.task_state import load_task_state, snapshot_to_task_updates
+    except Exception:
+        # worker-модуль может быть не установлен в dev/тестах
+        return
+
+    try:
+        snapshot = load_task_state(task.id)
+    except Exception as exc:
+        logger.debug(f"_maybe_merge_redis_snapshot({task.id}): load failed: {exc}")
+        return
+
+    if not snapshot or not isinstance(snapshot, dict):
+        return
+
+    # Проверяем свежесть: snapshot.updated_at должен быть новее task.updated_at
+    snap_updated_str = snapshot.get("updated_at")
+    if not snap_updated_str:
+        return
+    try:
+        from datetime import datetime
+        snap_updated = datetime.fromisoformat(str(snap_updated_str).replace("Z", "+00:00"))
+    except Exception:
+        return
+
+    if task.updated_at and snap_updated <= task.updated_at:
+        # Task in-memory новее или равен — не трогаем (in-memory path уже
+        # выполнился, либо Celery snapshot устарел)
+        return
+
+    # Применяем поля snapshot к task
+    updates = snapshot_to_task_updates(snapshot)
+    if not updates:
+        return
+
+    # Status — преобразуем строку в TaskStatus Enum
+    new_status = updates.pop("status", None)
+    if new_status:
+        try:
+            from .models import TaskStatus
+            # Snapshot хранит строку ("pending", "fetching", "done", ...)
+            # TaskStatus Enum может использовать uppercase или lowercase —
+            # пробуем оба варианта.
+            status_str = str(new_status).lower()
+            for s in TaskStatus:
+                if s.value.lower() == status_str:
+                    task.status = s
+                    break
+        except Exception as exc:
+            logger.debug(f"_maybe_merge_redis_snapshot({task.id}): status convert failed: {exc}")
+
+    # Простые поля
+    for field in ("progress", "error", "files", "analytics",
+                  "total_dtp", "total_dead", "total_injured", "updated_at"):
+        if field in updates:
+            try:
+                setattr(task, field, updates[field])
+            except Exception:
+                pass
+
+    # AnalysisState поля (llm_summary_state, clusters_state)
+    for state_field in ("llm_summary_state", "clusters_state"):
+        if state_field in updates and updates[state_field]:
+            state_dict = updates[state_field]
+            try:
+                from .models import AnalysisState, AnalysisStatus
+                state = getattr(task, state_field, None)
+                if state is None:
+                    state = AnalysisState()
+                    setattr(task, state_field, state)
+                # Status
+                state_status = state_dict.get("status")
+                if state_status:
+                    try:
+                        state.status = AnalysisStatus(str(state_status).lower())
+                    except Exception:
+                        pass
+                if "progress" in state_dict:
+                    state.progress = state_dict["progress"]
+                if "stage" in state_dict:
+                    state.stage = state_dict["stage"]
+                if "result" in state_dict:
+                    state.result = state_dict["result"]
+                if "error" in state_dict:
+                    state.error = state_dict["error"]
+                if state_dict.get("started_at"):
+                    state.started_at = state_dict["started_at"]
+                if state_dict.get("finished_at"):
+                    state.finished_at = state_dict["finished_at"]
+            except Exception as exc:
+                logger.debug(
+                    f"_maybe_merge_redis_snapshot({task.id}): "
+                    f"{state_field} merge failed: {exc}"
+                )
+
+    logger.debug(
+        f"_maybe_merge_redis_snapshot({task.id}): merged "
+        f"status={task.status} progress={task.progress}"
+    )
 
 
 async def _try_restore_llm_session(task: Task) -> None:
