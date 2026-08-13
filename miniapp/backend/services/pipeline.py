@@ -102,6 +102,15 @@ def create_task(
     Задача сохраняется:
     - В in-memory _tasks (с LRU-eviction, см. _register_task)
     - В БД через repository.save_task (если DATABASE_URL задан)
+
+    Hotfix Sprint 7: раньше save_task запускался через fire-and-forget
+    asyncio.create_task(save_task(task)) без done-callback — если корутина
+    падала или не успевала выполниться до рестарта контейнера, задача
+    терялась навсегда. Теперь:
+    - Синхронно обновляем _TASKS_MEMORY[task.id] (in-memory fallback)
+    - Добавляем done-callback для логирования ошибок save_task
+    - Дублирующий await save_task(task) в router dtp.py:create_dtp_task
+      гарантирует persist ДО запуска execute_task.
     """
     task_id = _gen_task_id()
     task = Task(
@@ -115,15 +124,50 @@ def create_task(
     )
     _register_task(task)
 
+    # Синхронно обновляем in-memory fallback в repository._TASKS_MEMORY.
+    # Это гарантирует, что даже если asyncio.create_task ниже не успеет
+    # выполниться, get_task_async() найдёт задачу через _TASKS_MEMORY
+    # (хотя без БД она потеряется при рестарте процесса).
+    try:
+        from ..db.repository import _TASKS_MEMORY
+        _TASKS_MEMORY[task_id] = task
+    except Exception:
+        pass
+
     # Асинхронно сохраняем в БД (если доступна).
     # Fire-and-forget — задача уже в in-memory и доступна сразу.
+    # Hotfix: добавлен done-callback для логирования ошибок. Раньше
+    # asyncio.create_task молча глотал исключения.
     try:
         from ..db.repository import save_task
-        asyncio.create_task(save_task(task))
+        fut = asyncio.create_task(save_task(task))
+        fut.add_done_callback(_make_save_task_callback(task_id))
     except Exception as exc:
         logger.debug(f"create_task: DB save skipped: {exc}")
 
     return task
+
+
+def _make_save_task_callback(task_id: str):
+    """Возвращает done-callback для asyncio.create_task(save_task(...)).
+
+    Логирует ошибки save_task, которые раньше терялись без trace.
+    """
+    def _callback(fut):
+        try:
+            fut.result()  # re-raise если было исключение
+        except asyncio.CancelledError:
+            # Normal at shutdown — корутина отменена при закрытии event loop
+            logger.debug(
+                f"create_task: save_task({task_id}) cancelled at shutdown"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"create_task: save_task({task_id}) failed: {exc} — "
+                f"задача доступна in-memory, но может быть потеряна при "
+                f"рестарте (используйте shutdown-hook в main.py)"
+            )
+    return _callback
 
 
 def _task_dir(task_id: str) -> Path:
@@ -193,6 +237,18 @@ async def execute_task(task_id: str) -> None:
             # Метрика: задача упала
             from ..middleware.metrics import record_task_status
             record_task_status("failed")
+            # Hotfix Sprint 7: persist FAILED-статуса в БД. Раньше при
+            # исключении в самом начале execute_task (до входа в
+            # _execute_task_impl) задача оставалась в памяти со статусом
+            # FAILED, но не сохранялась в БД. При рестарте — потеря.
+            try:
+                from ..db.repository import save_task
+                await save_task(task)
+            except Exception as persist_exc:
+                logger.warning(
+                    f"Task {task_id}: persist FAILED status failed: "
+                    f"{persist_exc}"
+                )
 
 
 async def _execute_task_impl(task_id: str) -> None:

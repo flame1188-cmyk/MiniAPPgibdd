@@ -374,6 +374,46 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    # === Hotfix Sprint 7: persist всех in-memory задач в БД перед закрытием пула ===
+    # После получения SIGTERM/SIGINT в _tasks могут оставаться RUNNING/FETCHING/
+    # PARSING задачи (если контейнер убивают во время выполнения pipeline).
+    # Без этого блока они теряются навсегда — в БД остаётся последний persist'нутый
+    # статус (например FETCHING), а in-memory данные (cards, raw_clusters) теряются.
+    #
+    # Sprint 5 recovery на startup пометит такие задачи как failed, но только если
+    # они есть в БД. Если create_task не успел сделать первый persist — задача
+    # полностью потеряна, и frontend будет бесконечно опрашивать /clusters с 404.
+    try:
+        from miniapp.backend.services.task_registry import _tasks
+        from miniapp.backend.db.repository import save_task, is_db_ready
+
+        if is_db_ready():
+            # Snapshot списка task_id, чтобы не мутировать dict во время итерации
+            pending_task_ids = list(_tasks.keys())
+            if pending_task_ids:
+                logger.info(
+                    f"Shutdown: persist {len(pending_task_ids)} in-memory "
+                    f"задач в БД перед закрытием пула"
+                )
+                persisted = 0
+                for tid in pending_task_ids:
+                    t = _tasks.get(tid)
+                    if t is None:
+                        continue
+                    try:
+                        await save_task(t)
+                        persisted += 1
+                    except Exception as exc:
+                        logger.warning(
+                            f"Shutdown: persist task_id={tid} failed: {exc}"
+                        )
+                logger.info(
+                    f"Shutdown: persisted {persisted}/{len(pending_task_ids)} "
+                    f"задач в БД"
+                )
+    except Exception as exc:
+        logger.warning(f"Shutdown: in-memory tasks persist failed: {exc}")
+
     # Закрываем пул PostgreSQL
     try:
         await db_close_pool()

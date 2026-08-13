@@ -168,6 +168,25 @@ async def create_dtp_task(
         raw_query=raw_query,
     )
 
+    # Hotfix Sprint 7: гарантированно persist'им метаданные задачи в БД
+    # ДО запуска execute_task. Раньше create_task использовал fire-and-
+    # forget через asyncio.create_task(save_task(task)), что могло потерять
+    # задачу при рестарте контейнера до выполнения корутины. Теперь: даже
+    # если execute_task упадёт в самом начале (до первого _persist()), task
+    # уже есть в БД со статусом PENDING — пользователь увидит его в списке
+    # и сможет удалить/пересоздать.
+    try:
+        from ..db.repository import save_task
+        await save_task(task)
+    except Exception as exc:
+        # Не роняем endpoint — задача уже в in-memory _tasks и доступна.
+        # Но логируем на WARNING, чтобы было видно в мониторинге.
+        import logging
+        logging.getLogger(__name__).warning(
+            f"create_dtp_task: persist task_id={task.id} failed: {exc} "
+            f"(задача доступна in-memory, но может быть потеряна при рестарте)"
+        )
+
     # Аудит обращения к ПДн (152-ФЗ): пользователь создал задачу выгрузки.
     # Логируем регион/период — этого достаточно для журнала доступа.
     try:
