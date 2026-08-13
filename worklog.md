@@ -2168,3 +2168,621 @@ Stage Summary:
 - Все изменения основаны на реальных файлах проекта (проверено через grep и Read)
 - Документация теперь отражает актуальное состояние кодовой базы после Sprint 6 hotfix2
 - Скрипт scripts/append_worklog_sprint456.py сохранён для воспроизводимости
+
+---
+# Sprint 7 — bothost supervisor, core/ рефакторинг, hotfix'ы, version-check
+# Фазы C.1, C.2, C.2.4 + 4 hotfix'а + version-check-banner v1/v2/v3
+# Все записи синхронизированы с каноническим /home/z/my-project/worklog.md
+Task ID: sprint7-phase-c1-bothost-supervisor-packaging
+Agent: main (Super Z)
+Task: Упаковать файлы Phase C.1 bothost supervisor в архив с README для скачивания пользователем.
+
+Work Log:
+- Проверена директория /home/z/my-project/download/sprint7-phase-c1-bothost-supervisor/ (8 файлов, 1778 строк).
+- Сравнены файлы архива с источником в gibdd-bot/: все 6 файлов идентичны (ALL FILES SYNCED).
+- Проверен README.md: содержит полную инструкцию (установка, тестирование, деплой bothost, локальное тестирование multi-режима, backward compatibility, следующие шаги).
+- Создан tar.gz архив: /home/z/my-project/download/sprint7-phase-c1-bothost-supervisor.tar.gz (23 KB, sha256: dddc36f86556c99b6c09bf9744317b4b75c701310065849146dcad71897e182c).
+- Создан zip архив: /home/z/my-project/download/sprint7-phase-c1-bothost-supervisor.zip (31 KB, sha256: bd22de85f502df3c4479ed3caee0927e8bb5172f527029ac12d7017a81bd9551).
+- Проверены права entrypoint.sh в архиве: -rwxrwxr-x (исполняемый).
+- Получены логи от пользователя: DEPLOYMENT_MODE=single работает корректно, /health → 200, никаких ошибок 401/404.
+
+Stage Summary:
+- Архивы доступны для скачивания:
+  • /home/z/my-project/download/sprint7-phase-c1-bothost-supervisor.tar.gz
+  • /home/z/my-project/download/sprint7-phase-c1-bothost-supervisor.zip
+- Содержимое: Dockerfile, env.example, README_DEPLOY_BOTHOST.md, docker/supervisord.conf, docker/entrypoint.sh, tests/smoke/test_sprint7_bothost_supervisor.py, README.md (инструкция), RELEASE_NOTES.md.
+- Текущий деплой bothost работает в режиме single (backward compatible) — подтверждено логами.
+- Готов к переходу на Фазу C.2 (рефакторинг core/) по запросу пользователя.
+
+---
+Task ID: sprint7-phase-c2-core
+Agent: main (Super Z)
+Task: Фаза C.2 — рефакторинг бизнес-логики в синхронные pure functions (miniapp/backend/core/) для подготовки к Celery-таскам (Фаза C.3).
+
+Work Log:
+- Изучена текущая архитектура miniapp/backend/services/: pipeline.execute_task (640 строк async), llm_ops.start_llm_summary (async), clusters_ops.start_clusters_calculation (async). Все завязаны на asyncio + мутируют task_registry._tasks.
+- Сформулирован план C.2: создать параллельный пакет core/ с синхронными pure functions, callable из Celery worker. Не трогать production-код (pipeline/llm_ops/clusters_ops остаются как есть).
+- C.2.1: Создано 4 модуля core/:
+  * __init__.py — re-export всех 12 функций
+  * fetching.py — fetch_cards_for_period_sync (asyncio.run обёртка над bot._fetch_cards_for_period)
+  * parsing.py — build_excel_data_sync (sync обёртка над gibdd_parser.build_file1/2_data)
+  * analytics_core.py — build_analytics_sync (sync обёртка над analytics.build_full_analytics)
+  * exporting.py — generate_excel_bytes_sync + generate_map_html_sync (sync обёртки над excel_generator + report_generator)
+- C.2.2: Добавлено 3 модуля core/:
+  * llm_core.py — run_llm_summary_sync + ask_llm_question_sync (asyncio.run обёртки над llm_analyzer.get_ai_summary/get_ai_answer_stream)
+  * clusters_core.py — calculate_clusters_sync (asyncio.run обёртка над concentration_points.calculate_concentration_dynamics, переиспользует _serialize_cluster из clusters_ops)
+  * pipeline_steps.py — step_fetch/step_parse/step_analytics/step_export (compositional helpers для Celery-тасков в Фазе C.3, возвращают dict с ok/error/stats, Excel bytes как base64)
+- Все 12 функций:
+  * Синхронные (не async) — проверено inspect.iscoroutinefunction
+  * Принимают параметры (reg_code, dat_list, cards, ...), не Task
+  * Не импортируют task_registry, не обращаются к _tasks
+  * Имеют docstring с примером Celery task
+- Защита от event loop: fetch_cards_for_period_sync, run_llm_summary_sync, ask_llm_question_sync, calculate_clusters_sync — все падают с понятной RuntimeError если вызваны из running event loop ("используйте ... напрямую (await) или вызывайте из sync-контекста (Celery worker)").
+- C.2.3: Создан tests/smoke/test_sprint7_phase_c2_core.py — 37 тестов (41 subtests):
+  * Структура пакета (3)
+  * Все функции sync (1, 12 subtests)
+  * Сигнатуры не принимают Task (7)
+  * Нет task_registry зависимости (2)
+  * step_* возвращают правильный dict (4)
+  * step_export возвращает валидный base64 (2)
+  * ask_llm_question короткий вопрос (3)
+  * fetch_cards защита event loop (1)
+  * pipeline.py не изменён (3)
+  * Module docstrings (1, 7 subtests)
+  * Function docstrings mention Celery (6)
+  * pipeline_steps composition (3)
+  * Документация (1)
+- Все 37 тестов проходят за 0.14 сек.
+- Regression: существующие smoke-тесты — 94 passed, 29 skipped (skips из-за опциональных dev-deps: PTB, psycopg, slowapi). C.2 ничего не сломал.
+- C.2.5: Создан архив для скачивания:
+  * /home/z/my-project/download/sprint7-phase-c2-core.tar.gz (22 KB, sha256: e0e2c766dc4cf36127d31b8a86d786dbd502f1a5922ac3d6708114e133983f47)
+  * /home/z/my-project/download/sprint7-phase-c2-core.zip (33 KB, sha256: b0e492c9762d37d77a44f69693a6ecbc8b9c28f799f24b2497f5797293c9b9ce)
+  * Содержит: README.md (инструкция), RELEASE_NOTES.md (детальный список изменений), 8 файлов core/, 1 файл tests/smoke/test_sprint7_phase_c2_core.py
+- Все файлы архива синхронизированы с источником (ALL SYNCED).
+
+Stage Summary:
+- Создан новый пакет miniapp/backend/core/ с 12 синхронными pure functions для Celery.
+- Архитектура: FastAPI async-path (pipeline.execute_task, не изменён) и будущий Celery sync-path (worker/tasks/*, Фаза C.3) — оба используют одни и те же core-функции.
+- Backward compatibility: pipeline.execute_task, llm_ops, clusters_ops, gibdd_service, task_registry — НЕ тронуты. Production-деплой (single mode) работает как раньше.
+- Smoke-тесты: 37 новых + 94 существующих — все проходят.
+- Архивы готовы для скачивания: .tar.gz (22 KB) и .zip (33 KB).
+- Следующий шаг: пользователь проверяет core/ локально, после чего переходим к C.2.4 (опциональное подключение pipeline.execute_task к core/) или сразу к C.3 (Celery задачи).
+
+---
+Task ID: sprint7-phase-c2-4-core-pipeline-wiring
+Agent: main (Super Z)
+Task: Фаза C.2.4 — опциональное подключение pipeline.execute_task к core/ через feature flag GIBDD_USE_CORE_PIPELINE.
+
+Work Log:
+- Прочитан worklog.md, найдена предыдущая запись sprint7-phase-c2-core (С.2 завершена, ожидается C.2.4 или C.3).
+- Изучена текущая структура core/ (8 файлов: __init__.py, fetching.py, parsing.py, analytics_core.py, exporting.py, llm_core.py, clusters_core.py, pipeline_steps.py).
+- Изучен miniapp/backend/services/pipeline.py (640 строк, async execute_task, 4 шага: FETCHING/PARSING/ANALYTICS/GENERATING).
+- Сформулирован план C.2.4:
+  * Feature flag GIBDD_USE_CORE_PIPELINE (default "0" = OFF, backward compatible)
+  * При flag=1: PARSING/ANALYTICS/GENERATING идут через core/ via asyncio.to_thread
+  * FETCHING остаётся async-native (fetch_cards_for_period_sync использует asyncio.run, конфликтует с FastAPI event loop)
+  * 4 routing-блока if _should_use_core_path(): ... else: ... в _execute_task_impl
+
+- Реализованы изменения в pipeline.py:
+  * +import os
+  * +module docstring секция про C.2.4 (почему FETCHING не переключается)
+  * +функция _should_use_core_path() -> bool (читает GIBDD_USE_CORE_PIPELINE, default "0")
+  * +функция _core_path_status() -> str (возвращает "core" или "legacy" для логов)
+  * +log line в execute_task: "execute_task started (path=...)"
+  * +4 routing-блока в _execute_task_impl:
+    - PARSING (строка ~265): build_excel_data_sync vs _parse_files_sync
+    - ANALYTICS (строка ~314): build_analytics_sync vs analytics_module.build_full_analytics
+    - GENERATING Excel (строка ~405): generate_excel_bytes_sync vs excel_gen.generate_both_files
+    - GENERATING map (строка ~506): generate_map_html_sync vs generator.generate_dtp_map
+  * FETCHING (строка ~176) — без routing, всегда bot_module._fetch_cards_for_period
+  * Размер: 640 → 753 строк (+113)
+
+- Обновлён core/__init__.py:
+  * Module docstring обновлён: секция "Фаза C.2.4" переписана с будущего на прошедшее
+  * Добавлено описание контракта routing (какие шаги через core/, какие нет)
+  * Размер: 99 → 117 строк (+18)
+
+- Обновлён tests/smoke/test_sprint7_phase_c2_core.py:
+  * Module docstring обновлён (упомянуты C.2.4 тесты)
+  * Класс TestPipelineUnchanged (3 теста) ЗАМЕНЁН на TestPipelineC24Wiring (7 тестов):
+    - Старый test_pipeline_does_not_import_core удалён (C.2.4 его нарушает)
+    - Новый test_pipeline_imports_core_when_flag_on — противоположный
+    - +test_pipeline_has_feature_flag_helper
+    - +test_pipeline_uses_to_thread_for_core_calls (4 subtests)
+    - +test_pipeline_has_core_path_status_logger
+    - +test_fetching_step_still_uses_async_bot (проверяет что fetch_cards_for_period_sync НЕ импортируется)
+  * +Новый класс TestCorePathFeatureFlag (6 тестов, 8 subtests):
+    - test_default_is_legacy_off
+    - test_explicit_zero_is_off
+    - test_explicit_one_is_on
+    - test_other_values_are_off (8 subtests: "true", "yes", "on", "True", "TRUE", "2", " ", "1.0")
+    - test_core_path_status_returns_legacy_by_default
+    - test_core_path_status_returns_core_when_on
+  * Размер: 631 → 773 строк (+142)
+  * Всего тестов в файле: 37 → 47 (+10 tests, +12 subtests)
+
+- Обновлён env.example:
+  * +новая секция "Sprint 7 / Фаза C.2.4 — routing pipeline через core/"
+  * Описаны значения 0/1, причина по которой FETCHING не переключается, когда включать
+  * Размер: 176 → 203 строк (+27)
+
+- Обновлён README_DEPLOY_BOTHOST.md:
+  * +новая секция "Sprint 7 / Фаза C.2.4 — feature flag GIBDD_USE_CORE_PIPELINE"
+  * Описание legacy path (текущий bothost default), инструкция по включению core path
+  * Пример ожидаемых логов при core path
+  * Объяснение идентичности поведения (те же модули под капотом)
+  * Инструкция по rollback (GIBDD_USE_CORE_PIPELINE=0 + рестарт)
+  * Размер: 413 → 449 строк (+36)
+
+- Тестирование:
+  * python -m pytest tests/smoke/test_sprint7_phase_c2_core.py → 47 passed (37 C.2 + 10 C.2.4), 41 subtests
+  * Regression: tests/smoke/ --ignore=test_sprint7_celery_infra.py → 141 passed, 29 skipped (skips = PTB/psycopg/slowapi опциональные)
+  * test_sprint7_celery_infra.py: 8 fails (предсуществующие, celery не в dev env, только в Docker image) — НЕ связаны с C.2.4
+  * test_sprint7_bothost_supervisor.py: 48 passed (C.1 не тронут)
+
+- Создан архив:
+  * /home/z/my-project/scripts/build_c24_archive.py — скрипт сборки
+  * /home/z/my-project/download/sprint7-phase-c2-4-core-pipeline-wiring.tar.gz
+    (34 KB, sha256: 64cafaf1470acbf5c3bb5c5c370eef9f3e6ca0f6d42d1a4bf5bbffda961ca1ef)
+  * /home/z/my-project/download/sprint7-phase-c2-4-core-pipeline-wiring.zip
+    (42 KB, sha256: 697b745f0e4ea22324e865fd82283512c6262de5d3cd8a85f58b326d408e17da)
+  * Содержит 7 файлов (2861 строк):
+    - README.md (257) — инструкция по установке/тестированию/деплою
+    - RELEASE_NOTES.md (310) — детальный список изменений + архитектурные диаграммы
+    - miniapp/backend/services/pipeline.py (753) — ИЗМЕНЁН
+    - miniapp/backend/core/__init__.py (116) — ИЗМЕНЁН
+    - tests/smoke/test_sprint7_phase_c2_core.py (773) — ИЗМЕНЁН
+    - env.example (203) — ИЗМЕНЁН
+    - README_DEPLOY_BOTHOST.md (449) — ИЗМЕНЁН
+  * Все файлы синхронизированы с источником (ALL FILES SYNCED — sha256 match)
+
+Stage Summary:
+- Pipeline.execute_task подключён к core/ через feature flag GIBDD_USE_CORE_PIPELINE.
+- Default OFF (backward compatible) — production bothost работает как раньше.
+- При flag=1: 4 CPU-bound шага (PARSING, ANALYTICS, GENERATING Excel, GENERATING map)
+  идут через core/ sync-функции via asyncio.to_thread. FETCHING остаётся async-native.
+- Core path идентичен legacy по результату: core-функции вызывают те же gibdd_parser,
+  analytics, excel_generator, report_generator под капотом. Разница — только точка входа.
+- 13 новых тестов (TestPipelineC24Wiring + TestCorePathFeatureFlag) покрывают:
+  * Структуру routing (4 core-функции импортируются, вызываются через asyncio.to_thread)
+  * Все варианты env-значений флага (0, 1, default, другие)
+  * FETCHING не через core/ (защита от asyncio.run-конфликта)
+  * _core_path_status() возвращает "core"/"legacy" корректно
+- Regression: 141 passed, 29 skipped (без celery-infra pre-existing fails).
+- Архивы готовы для скачивания: .tar.gz (34 KB) и .zip (42 KB).
+- Следующий шаг: пользователь деплоит C.2.4 на bothost (сначала с флагом OFF для
+  backward compatibility, затем опционально включает flag=1 для A/B-тестирования).
+  После проверки можно переходить к C.3 (Celery tasks на основе pipeline_steps.step_*).
+
+---
+Task ID: sprint7-hotfix-clusters-404-polling
+Agent: main (Super Z)
+Task: Hotfix Sprint 7 — починить бесконечный long-polling /clusters?wait=25
+при 404 (Task not found), который засорял логи bothost сотнями запросов
+в секунду.
+
+Контекст: пользователь прислал логи bothost, в которых видна задача
+c0673b53f636 (работает через core path, GIBDD_USE_CORE_PIPELINE=1) и
+задача f5929f37ee01, для которой фронтенд бесконечно стучался на
+GET /api/dtp/tasks/f5929f37ee01/clusters?wait=25 и получал 404 Not Found
+(сотни запросов подряд, ~1 в секунду).
+
+Root cause:
+- useClustersPolling (react-query) в useAnalysisPolling.ts:
+  refetchInterval возвращал REFETCH_INITIAL_MS=1000 при !data, не различая
+  404 (Task not found, не восстановимо) и 5xx/network (transient, можно
+  ретраить). При 404 query.state.data=undefined (т.к. queryFn выбрасывает
+  ApiError), и polling шёл бесконечно.
+- ClustersView.tsx: при isError фронтенд не показывал пользователю
+  понятного сообщения — polling просто продолжался в фоне.
+- _common.py: _require_done_task выбрасывал HTTPException(404) без лога,
+  в access-log было видно только URL+404, без объяснения причины.
+
+Work Log:
+- Прочитан worklog.md, найдена последняя запись sprint7-phase-c2-4-core-pipeline-wiring.
+- Изучен код:
+  * miniapp/backend/routers/clusters.py — endpoint GET /tasks/{task_id}/clusters?wait=N,
+    вызывает _require_done_task (404 при task not found).
+  * miniapp/backend/routers/_common.py — _require_done_task без логирования.
+  * miniapp/backend/services/task_registry.py — get_task_async (in-memory LRU + БД).
+  * miniapp/frontend/src/hooks/useAnalysisPolling.ts — refetchInterval без проверки
+    error.status.
+  * miniapp/frontend/src/components/ClustersView.tsx — isError есть, но не используется
+    в render.
+  * miniapp/frontend/src/lib/api.ts — ApiError class с полем status.
+
+- Реализован фикс (3 файла):
+  1. useAnalysisPolling.ts (40 → 71 строк):
+     +import ApiError
+     +retry: (failureCount, error) => — false для 404/403, <3 для остальных
+     +refetchInterval: проверка error.status === 404 || 403 → return false
+     +REFETCH_AFTER_TRANSIENT_ERROR_MS=5000 для 5xx/network (вместо 1 сек)
+     +MAX_TRANSIENT_RETRIES=3
+  2. ClustersView.tsx (647 → 717 строк):
+     +import ApiError
+     +notFoundError = isError && error instanceof ApiError && (404 || 403)
+     +UI блок "📭 Задача не найдена" (404) / "🔒 Доступ запрещён" (403)
+     +кнопка "Понятно" — сбрасывает started/starting/startError
+  3. _common.py (89 → 113 строк):
+     +logger.warning при 404 (task_id, user_id, объяснение причин)
+     +logger.warning при 403 (task_id, requester_user_id, owner_user_id)
+
+- Тесты:
+  * Создан tests/smoke/test_sprint7_hotfix_clusters_404.py (244 строки, 14 тестов):
+    - TestBackendCommonRequireDoneTaskLogging (3) — проверка logger + caplog
+      для 404/403 с проверкой task_id+user_id в сообщении
+    - TestFrontendFixStructure (8) — проверка структуры файлов (импорты,
+      refetchInterval, retry, notFoundError UI, reset state)
+    - TestFrontendFixRegression (4) — LONG_POLL_WAIT_SEC=25 не изменился,
+      done/failed stops polling, running continues
+  * Все 14 тестов проходят за 0.69 сек.
+  * Regression: 155 passed, 29 skipped (без изменений).
+  * TypeScript: npx tsc --noEmit — без ошибок.
+
+- Создан архив:
+  * /home/z/my-project/download/sprint7-hotfix-clusters-404-polling.tar.gz
+    (17 KB, sha256: d8f7b8033a2969cec985ea0951274f41b295fb640128d30df6a77dd9abc644ed)
+  * /home/z/my-project/download/sprint7-hotfix-clusters-404-polling.zip
+    (22 KB, sha256: 2bb7c22df4aedf103545cf447729f43cbf558684ff10f66bd35193a5cd4839a9)
+  * Содержит 6 файлов:
+    - README.md (9.4 KB) — инструкция по деплою
+    - RELEASE_NOTES.md (5.9 KB) — детальный список изменений
+    - miniapp/frontend/src/hooks/useAnalysisPolling.ts (71)
+    - miniapp/frontend/src/components/ClustersView.tsx (717)
+    - miniapp/backend/routers/_common.py (113)
+    - tests/smoke/test_sprint7_hotfix_clusters_404.py (244)
+
+Stage Summary:
+- Бесконечный polling /clusters?wait=25 при 404 — ПОЧИНЕН.
+- Фронтенд теперь прекращает polling при 404/403, показывает пользователю
+  понятное сообщение «Задача не найдена» с кнопкой «Понятно».
+- Backend логирует 404/403 на WARNING с task_id+user_id для диагностики.
+- Нормальный polling-флоу (задача существует, статус running/done/failed)
+  НЕ ИЗМЕНЁН — backward compatible.
+- Архивы готовы для скачивания: .tar.gz (17 KB) и .zip (22 KB).
+- Следующий шаг: пользователь деплоит hotfix на bothost, проверяет по логам
+  (ожидается 1 WARNING + 1 HTTP 404 вместо сотен 404).
+- После деплоя можно вернуться к Фазе C.3 (Celery tasks) или A/B-тестированию
+  core path (GIBDD_USE_CORE_PIPELINE=1 уже активирован пользователем).
+
+---
+Task ID: sprint7-hotfix-task-persistence
+Agent: main (Super Z)
+Task: Hotfix Sprint 7 — гарантированное сохранение задачи в БД при создании
+и при shutdown. Пользователь сообщил: «Проверил базу данных, но в таблице
+tasks не нашел задачи с таким ID» (task f5929f37ee01 из предыдущего polling-фикса).
+
+Контекст: предыдущий фикс (sprint7-hotfix-clusters-404-polling) лечил симптом
+— бесконечный polling при 404. Этот фикс лечит root cause — задача вообще
+не была сохранена в БД, поэтому 404 и возник.
+
+Root cause (3 проблемы):
+1. pipeline.create_task использовал fire-and-forget asyncio.create_task(save_task(task))
+   без done-callback. Если корутина не успевала выполниться до рестарта
+   контейнера — задача терялась навсегда. Если save_task падал внутри —
+   исключение терялось без trace (нет await → нет обработки).
+2. pipeline.execute_task exception-handler (semaphore-wrapped) менял статус
+   на FAILED в памяти, но НЕ вызывал save_task. При рестарте задача
+   оставалась со старым статусом в БД (или вообще без записи).
+3. main.py lifespan shutdown закрывал пул БД, но не сбрасывал in-memory
+   _tasks. Все RUNNING/FETCHING задачи терялись.
+
+Work Log:
+- Прочитан worklog.md, найдена предыдущая запись sprint7-hotfix-clusters-404-polling.
+- Изучен код:
+  * pipeline.py create_task (строки 92-126) — fire-and-forget save_task
+  * pipeline.py execute_task exception-handler (строки 185-195) — без save_task
+  * main.py lifespan shutdown (строки 367-404) — нет persist'а _tasks
+  * dtp.py create_dtp_task — вызывает create_task, не await'ит save_task
+  * task_registry.py get_task_async — проверяет in-memory + БД
+  * repository.py save_task — upsert в tasks таблицу
+
+- Реализован фикс (3 файла):
+  1. pipeline.py (822 → 878 строк, +56):
+     +create_task: синхронное обновление _TASKS_MEMORY[task_id] = task
+     +create_task: fut.add_done_callback(_make_save_task_callback(task_id))
+     +новая функция _make_save_task_callback — логирует WARNING при ошибках
+      save_task, корректно обрабатывает CancelledError (normal at shutdown)
+     +execute_task exception-handler: await save_task(task) в try/except
+      с WARNING-логом при ошибке persist'а
+
+  2. dtp.py (330 → 348 строк, +18):
+     +create_dtp_task: await save_task(task) между create_task() и
+      asyncio_create_task(task.id). Это ГЛАВНАЯ защита — к моменту когда
+      фронтенд получает task_id в HTTP-ответе, задача уже гарантированно
+      в БД (или WARNING-лог, если persist упал).
+
+  3. main.py (864 → 913 строк, +49):
+     +lifespan shutdown: persist всех _tasks в БД ДО db_close_pool().
+      Проходит по pending_task_ids = list(_tasks.keys()), для каждого
+      вызывает await save_task(t) в try/except. Логирует итог:
+      "Shutdown: persisted N/M задач в БД". Проверяет is_db_ready()
+      чтобы не упасть при запуске без DATABASE_URL.
+
+- Тесты (tests/smoke/test_sprint7_hotfix_task_persistence.py, 380 строк, 18 тестов):
+  * TestCreateTaskPersistsImmediately (5) — _TASKS_MEMORY sync update,
+    done-callback, _make_save_task_callback exists + logs warnings,
+    create_task still returns Task
+  * TestDtpRouterPersistsTaskBeforeExecute (2) — await save_task в
+    create_dtp_task, WARNING-лог при ошибке
+  * TestExecuteTaskPersistsFailedStatus (2) — save_task в exception-handler,
+    try/except не роняет pipeline
+  * TestLifespanShutdownPersistsTasks (5) — shutdown-persist блок существует,
+    persist ДО db_close_pool, проверка is_db_ready, обработка ошибок
+    отдельных задач, итоговый лог
+  * TestCreateTaskRegression (2) — сигнатура create_task не изменилась,
+    возвращает Task с 12-символьным id
+  * TestBugReportScenario (2) — save_task вызывается после create_task,
+    POST /dtp/tasks persist'ит до return TaskCreateResponse
+  * Все 18 тестов проходят за 0.47 сек.
+  * Regression smoke: 179 passed, 23 skipped (без изменений).
+  * Regression integration: 98 passed (без изменений).
+
+- Установлены psycopg + psycopg_pool в dev venv (раньше были только в
+  Docker image) — теперь smoke-тесты могут импортировать repository.py.
+
+- Создан архив:
+  * /home/z/my-project/download/sprint7-hotfix-task-persistence.tar.gz
+    (30 KB, sha256: d277282b3eafe4612cd1e4d7c187fd21995dbde7099bbdc3582a4c4c2f04a701)
+  * /home/z/my-project/download/sprint7-hotfix-task-persistence.zip
+    (35 KB, sha256: 6c802f0707df17b7201549b89c072ef5356fb82d0d9d06315c8606888cc28533)
+  * Содержит 5 файлов:
+    - README.md — инструкция по деплою
+    - main.py (913) — ИЗМЕНЁН (shutdown-persist блок)
+    - miniapp/backend/services/pipeline.py (878) — ИЗМЕНЁН (create_task + exception-handler)
+    - miniapp/backend/routers/dtp.py (348) — ИЗМЕНЁН (await save_task)
+    - tests/smoke/test_sprint7_hotfix_task_persistence.py (380) — новый
+
+Stage Summary:
+- 3 уровня защиты от потери задач:
+  1. create_task — синхронный _TASKS_MEMORY update + async save_task с callback
+  2. create_dtp_task endpoint — await save_task ДО запуска execute_task
+     (главная защита — задача в БД к моменту HTTP-ответа)
+  3. lifespan shutdown — persist всех _tasks перед закрытием пула БД
+- Дополнительно: execute_task exception-handler persist'ит FAILED-статус
+  (раньше терялся в in-memory).
+- Backward compatibility: create_task остался синхронным, сигнатура не
+  изменилась. 98 integration-тестов + 179 smoke-тестов — все проходят.
+- Архивы готовы для скачивания: .tar.gz (30 KB) и .zip (35 KB).
+- Зависимости от предыдущего фикса (sprint7-hotfix-clusters-404-polling)
+  НЕТ — можно деплоить независимо. Но рекомендуется деплоить оба: первый
+  фикс прекращает бесконечный polling фронтенда, этот фикс — гарантирует
+  что новые задачи не теряются.
+- Следующий шаг: пользователь деплоит hotfix на bothost, проверяет:
+  1. После docker compose restart в логах "Shutdown: persisted N/N задач в БД"
+  2. При создании новой задачи — она сразу появляется в таблице tasks
+  3. При рестарте в середине pipeline — задача помечается failed (Sprint 5
+     recovery), пользователь видит её в списке задач
+
+---
+Task ID: sprint7-hotfix-clusters-404-dist-bundle
+Agent: main
+Task: Собрать полный архив с pre-built dist/ для деплоя hotfix на bothost (без npm run build)
+
+Work Log:
+- Обнаружено: локальный /home/z/my-project/miniapp/frontend/ — старая версия (нет useAnalysisPolling.ts, нет ClustersView.tsx)
+- Проверены архивы в /home/z/my-project/download/: gibdd-bot-files-v2 (нет long-polling), long-polling-fix.zip (только api.ts+useAnalysisPolling.ts+старый dist, без компонентов), miniapp-fixes-v4 (нет wait-параметра)
+- Найден полный и актуальный исходник в /home/z/my-project/gibdd-bot/miniapp/frontend/ — hotfix УЖЕ применён в useAnalysisPolling.ts (71 строка), ClustersView.tsx (701 строка), telegram.ts (есть isTelegramDesktop), api.ts (860 строк, есть ApiError+wait+is_lost)
+- Backend _common.py в /home/z/my-project/gibdd-bot/miniapp/backend/routers/ тоже уже содержит WARNING-лог при 404/403 (104 строки)
+- Текущий dist/ был собран 10 августа — ДО применения фикса в исходниках
+- Выполнен npm run build в /home/z/my-project/gibdd-bot/miniapp/frontend/ — успешно (681 модуль, 3.90 сек, без TS-ошибок)
+- Проверены маркеры фикса в новом dist/assets/index-D_59RIIW.js:
+  * 'Задача не найдена' — 1 совпадение ✓
+  * 'Доступ запрещён' — 1 совпадение ✓
+  * status===404 — 4 совпадения ✓ (2 в refetchInterval+retry, 2 в ClustersView)
+  * status===403 — 3 совпадения ✓
+- Собран бандл: /home/z/my-project/download/sprint7-hotfix-clusters-404-dist-bundle/
+  * dist/ (4 файла: index.html, index-D_59RIIW.js 579KB, index-iDH2XStX.css 16KB, react-vendor, query-vendor)
+  * src/ (4 файла для аудита: useAnalysisPolling.ts, ClustersView.tsx, api.ts, telegram.ts)
+  * backend/_common.py
+  * README.md (инструкции по деплою Вариант A/B, проверка, откат)
+  * verify-deployed-bundle.sh (скрипт валидации деплоя на bothost)
+- Архивы: .zip (260 KB) + .tar.gz (254 KB)
+- Скрипт verify-deployed-bundle.sh протестирован локально: PASS=4, FAIL=0
+
+Stage Summary:
+- Артефакты: /home/z/my-project/download/sprint7-hotfix-clusters-404-dist-bundle.{zip,tar.gz}
+- Деплой на bothost: достаточно заменить /app/miniapp/frontend/dist/ содержимым из бандла
+- После деплоя: запустить bash verify-deployed-bundle.sh /app/miniapp/frontend/dist для проверки
+- Рестарт uvicorn НЕ нужен (StaticFiles подхватит новые файлы); НО браузер должен сделать hard refresh (Ctrl+Shift+R) или закрыть/открыть вкладки Mini App
+- Backend _common.py уже задеплоен на bothost (видно по WARNING в логах) — повторно копировать не обязательно
+
+---
+Task ID: sprint7-hotfix-v2-soft-failed
+Agent: main
+Task: Hotfix v2 — backend возвращает 200 OK с status=failed вместо 404, чтобы остановить polling даже в старом JS (кэшированном в Telegram WebView)
+
+Work Log:
+- Пользователь сообщил: после деплоя Hotfix v1 polling продолжается с интервалом ~2 сек
+- Анализ логов: интервал 0.5/1.5 сек чередуется — два polling'а с интервалом 2 сек, смещённых на 0.5 сек
+- Проверка репозитория GitHub (raw.githubusercontent.com/flame1188-cmyk/MiniAPPgibdd/main/...):
+  * useAnalysisPolling.ts — содержит фикс (retry: false при 404, refetchInterval: false при 404)
+  * ClustersView.tsx — содержит notFoundError UI
+  * api.ts — содержит ApiError и getClusters с wait
+- Docker build лог: прошёл успешно, 681 модуль, 7.14 сек, имя бандла index-C-zHU4LT.js
+- Диагноз: Telegram WebView кэширует старый JS (index-Dwtow6gx.js или index-jhwEmcfX.js), не подхватывает новый несмотря на no-cache middleware
+- Решение: backend возвращает 200 OK с status=failed вместо HTTP 404 — это останавливает polling в ЛЮБОМ JS (старом и новом), потому что оба проверяют status === 'failed'
+
+Реализация:
+- _common.py: добавлена функция _check_task_soft(task_id, user, error_label)
+  * При 404: возвращает (None, AnalysisStatusResponse(status="failed", error="Задача не найдена: ..."))
+  * При 403: возвращает (None, AnalysisStatusResponse(status="failed", error="Доступ запрещён: ..."))
+  * При успехе: возвращает (task, None)
+  * Логирует WARNING при 404/403 (как и _require_done_task)
+- clusters.py: GET /clusters и POST /clusters заменены _require_done_task → _check_task_soft
+  * При 404/403: return ClustersResponse(state=soft_error, result=None) с HTTP 200
+  * При успехе: работает как раньше (long polling, возврат статуса)
+- ClustersView.tsx: в блоке if (data?.state.status === 'failed') добавлена проверка
+  * error содержит "задача не найдена"/"удалена из памяти"/"создайте новую выгрузку" → UI "📭 Задача не найдена"
+  * error содержит "доступ запрещён"/"другому пользователю" → UI "🔒 Доступ запрещён"
+  * иначе → обычный "❌ Ошибка расчёта" с кнопкой "Повторить расчёт"
+
+Тесты:
+- Создан scripts/test_hotfix_v2.py — 7 sanity-тестов
+- Все 7 тестов прошли: _check_task_soft существует, 404/403/успех работают, clusters.py использует soft-check, ClustersView обрабатывает soft-failed, dist содержит маркеры
+- npm run build: успешно, 681 модуль, 3.77 сек, бандл index-B2Z7EQ_A.js (581 KB)
+- Маркеры в dist: 'Задача не найдена' (2), 'Доступ запрещён' (2), 'удалена из памяти' (3), status===404 (4), status===403 (3)
+
+Stage Summary:
+- Артефакты: /home/z/my-project/download/sprint7-hotfix-v2-soft-failed.{zip,tar.gz}
+- Архив содержит: dist/ (pre-built), src/ (4 исходника), backend/ (_common.py + clusters.py), README.md
+- Деплой: залить backend/_common.py + backend/clusters.py + src/ClustersView.tsx в репозиторий, пересобрать Docker image
+- После деплоя: в логах HTTP 200 OK вместо 404, polling остановится даже в старом JS
+- UI: старый JS покажет "❌ Ошибка расчёта" (приемлемо), новый JS покажет "📭 Задача не найдена" (идеально)
+
+---
+Task ID: version-check-banner
+Agent: main (super-z)
+Task: Реализовать cache-busting для index.html + version-check баннер «Доступна новая версия, обновите страницу»
+
+Work Log:
+- Изучена структура проекта: backend (FastAPI main.py + miniapp/backend/main.py), frontend (React + Vite + react-query)
+- Обнаружено: cache-busting для index.html уже реализован — NoCacheIndexHTMLASGIMiddleware (main.py строки 826-861) добавляет Cache-Control: no-cache, no-store, must-revalidate для /app, /app/, /app/index.html
+- Создан miniapp/backend/version.py — определение версии сборки (приоритет: env APP_BUILD_VERSION → env APP_GIT_COMMIT → файл APP_BUILD_VERSION_FILE → git rev-parse → mtime fallback)
+- Добавлен GET /version endpoint в miniapp/backend/main.py (публичный, без аутентификации) — отдаёт {version, build_time, service}
+- В lib/api.ts добавлен метод api.getVersion()
+- Создан src/hooks/useVersionCheck.ts — polling /api/version каждые 60 сек, сравнение с VITE_APP_VERSION встроенной в bundle; после первого срабатывания прекращает опрос
+- Создан src/components/VersionBanner.tsx — fixed-top баннер с кнопкой «Обновить», не закрывается без window.location.reload()
+- Внедрён в App.tsx: useVersionCheck() + <VersionBanner visible={hasUpdate} /> первым элементом в корневом div
+- Обновлён vite-env.d.ts — типизация VITE_APP_VERSION
+- Обновлён build_frontend.sh — определяет версию (git commit / env / mtime), передаёт в VITE_APP_VERSION, проверяет маркеры фикса в собранном bundle
+- Обновлён Dockerfile — build-arg APP_BUILD_VERSION, сохраняет версию в /app/.build_version, runtime читает через APP_BUILD_VERSION_FILE env
+- Локальная сборка: APP_BUILD_VERSION=ec67eb2 (git commit), маркеры фикса в bundle проверены (version-check-v1, ec67eb2, Доступна новая версия, /api/version)
+- Тест backend: python -c "from miniapp.backend.main import app; ..." → 200 OK, {version: "e67ea1d", build_time: "...", service: "gibdd-miniapp"}
+- Создан архив /home/z/my-project/download/version-check-bundle.zip (256 KB) с README + всеми файлами
+
+Stage Summary:
+- Cache-busting: уже было реализовано (NoCacheIndexHTMLASGIMiddleware), без изменений
+- Version-check баннер: НОВОЕ, полностью реализован end-to-end
+- Backend: /api/version endpoint возвращает {version, build_time, service}
+- Frontend: useVersionCheck hook (poll 60 сек) + VersionBanner компонент (fixed-top, не закрывается без reload)
+- Версия сборки: ec67eb2 (текущий git commit) — встроена в bundle, синхронизирована с backend
+- Деплой: залить файлы в репозиторий https://github.com/flame1188-cmyk/MiniAPPgibdd → bothost redeploy
+- Архив: /home/z/my-project/download/version-check-bundle.zip (256 KB)
+- Поведение после деплоя: версии совпадут → баннер НЕ покажется; при следующем деплое (новый commit) → backend отдаст новую версию → mismatch → баннер → пользователь жмёт «Обновить» → новый bundle → версии совпадут
+
+---
+Task ID: version-check-banner-v2
+Agent: main (super-z)
+Task: Фикс рассинхрона версий backend/frontend (v1: backend local-6a7d9e96 vs frontend ec67eb2 → ложный баннер)
+
+Work Log:
+- Диагностика: bothost НЕ использует Dockerfile multi-stage, не передаёт APP_BUILD_VERSION build-arg. version.py падал в mtime-fallback → local-6a7d9e96, тогда как frontend bundle содержал ec67eb2 (git commit).
+- Корень проблемы: в v1 version.py искал .build_version только через env APP_BUILD_VERSION_FILE, который на bothost не задан.
+- Доп. баг: _PROJECT_ROOT = parents[3] был неверным (давал my-project/ вместо gibdd-bot/), из-за чего путь miniapp/frontend/dist/.build_version считался неправильно.
+- Фикс 1: _PROJECT_ROOT изменён на parents[2] (на bothost это /app, локально — gibdd-bot).
+- Фикс 2: version.py теперь ищет .build_version в нескольких стандартных местах БЕЗ env:
+  - miniapp/frontend/dist/.build_version (создаётся build_frontend.sh)
+  - .build_version в корне проекта
+  - /app/.build_version (Docker COPY, если multi-stage используется)
+- Фикс 3: build_frontend.sh теперь пишет .build_version и .build_time ПРЯМО В dist/ — файлы едут на bothost вместе с bundle.
+- Фикс 4: Dockerfile упрощён — не нужен отдельный COPY VERSION.txt, файл лежит внутри dist/ и копируется вместе.
+- Локальная проверка:
+  - python -c "from miniapp.backend.version import VERSION" → ec67eb2 ✓
+  - _try_file_version() → 'ec67eb2' ✓
+  - TestClient.get('/version') → 200 OK {'version': 'ec67eb2', 'build_time': '2026-08-13T10:43:01Z'} ✓
+  - Версия в bundle: ec67eb2 ✓ (grep по index-CJEIdB4C.js)
+- Создан архив /home/z/my-project/download/version-check-bundle-v2.zip (258 KB) с README
+
+Stage Summary:
+- Корень проблемы v1: bothost не использует multi-stage Dockerfile, env APP_BUILD_VERSION_FILE не задан → version.py искал в несуществующих местах
+- Фикс v2: .build_version файл пишется ВНУТРЬ dist/ при сборке frontend, едет на bothost вместе с bundle, backend сам находит его без env
+- Синхронизация: frontend bundle содержит ec67eb2 (VITE_APP_VERSION), .build_version файл содержит ec67eb2, /api/version отдаёт ec67eb2 — все три совпадают
+- Поведение после деплоя: баннер НЕ покажется (версии совпадут); при следующем деплое с новым git commit — обе версии обновятся, баннер корректно сработает
+- Архив: /home/z/my-project/download/version-check-bundle-v2.zip
+
+---
+Task ID: version-check-banner-final
+Agent: main (super-z)
+Task: Актуализация worklog.md и README.md — фикс финального состояния после v2 фикса рассинхрона
+
+Work Log:
+- Прочитан текущий worklog: последние 3 записи (version-check-banner v1, version-check-banner-v2, sprint7-hotfix-v2-soft-failed)
+- Прочитан README.md в /home/z/my-project/download/version-check-bundle/ — содержал историю v1 vs v2, неоптимальную для production
+- README переписан: убрана история v1/v2 из основной части (оставлена в секции "История изменений" внизу), добавлены:
+  * Таблица "Текущий статус" с тремя синхронизированными источниками версии ec67eb2
+  * Чёткое описание проблемы (24+ часовая сессия, polling /clusters?wait=25)
+  * Таблица файлов с размерами
+  * Два варианта деплоя (репозиторий / только dist/)
+  * Предупреждение о dotfiles (.build_version, .build_time)
+  * Пошаговая проверка после деплоя (3 curl-команды)
+  * Алгоритм определения версии в виде таблицы с приоритетами
+  * Список кандидатов .build_version (4 пути по порядку)
+- Финальный статус: v2 готов к деплою, awaiting user action
+
+Stage Summary:
+- README: /home/z/my-project/download/version-check-bundle/README.md (переписан, 8.8 KB)
+- Worklog: эта запись (финальная для version-check-banner задачи)
+- Архив: /home/z/my-project/download/version-check-bundle-v2.zip (258 KB) — нужно пересобрать с обновлённым README
+- Текущее состояние: v2 фикс готов, всё синхронизировано на ec67eb2, awaiting deploy на bothost
+- После деплоя: баннер НЕ покажется (версии совпадут); при следующем деплое с новым commit — сработает корректно
+
+---
+Task ID: version-check-banner-v3
+Agent: main (super-z)
+Task: Фикс рассинхрона v3 — dist/ в .gitignore + dotfiles теряются при web-upload на bothost
+
+Work Log:
+- Диагностика логов bothost 11:03: Build version: local-6a7d7d79 (mtime fallback), root=/app
+- root=/app — значит _PROJECT_ROOT теперь правильный (v2 фикс сработал)
+- Но backend всё равно не нашёл .build_version файл → упал в mtime fallback
+- HTTP-проверка bothost: curl /app/.build_version → 404 Not Found
+- HTTP-проверка: curl /app/assets/index-CJEIdB4C.js → 200 OK + содержит ec67eb2
+- HTTP-проверка GitHub raw: miniapp/frontend/dist/.build_version → 404, build_version.txt → 404
+- HTTP-проверка GitHub raw: miniapp/frontend/dist/index.html → 200 (значит dist/ частично залит)
+- Корневая причина: в .gitignore есть строка `miniapp/frontend/dist/` → dist/ не попадает в git
+- Пользователь заливал dist/ через bothost web-upload, при этом dotfiles (.build_version) и мелкие текстовые файлы (build_version.txt) терялись
+- Фикс v3 — три слоя защиты:
+  1. dist/build_version.txt (видимый файл, не dotfile)
+  2. dist/.build_version (dotfile, backward compat)
+  3. miniapp/backend/BUILD_VERSION.txt — ДУБЛИКАТ в исходном коде, гарантированно в git
+- miniapp/backend/BUILD_VERSION.txt — критически важный кандидат: miniapp/backend/ НЕ в .gitignore
+- version.py: список кандидатов расширен с 3 до 7 (видимые + dotfiles + backend-дубликат)
+- version.py: добавлено INFO-логирование каждого кандидата (miss/HIT/error) для диагностики
+- build_frontend.sh: теперь пишет 4 файла (2 в dist/, 2 в miniapp/backend/)
+- Dockerfile: build-frontend stage пишет 4 файла (2 видимых + 2 dotfile)
+- Локальная проверка:
+  - python с симуляцией отсутствия dist/ → backend находит BUILD_VERSION.txt → 'ec67eb2' ✓
+  - Все 4 файла созданы: dist/{build_version.txt,.build_version}, backend/{BUILD_VERSION.txt}
+  - Версия в bundle: ec67eb2 ✓
+- Создан архив /home/z/my-project/download/version-check-bundle-v3.zip (260 KB) с README
+
+Stage Summary:
+- Корень проблемы v2: miniapp/frontend/dist/ в .gitignore → пользователь заливал dist/ через bothost web-upload, dotfiles и мелкие файлы терялись
+- Фикс v3: три слоя защиты — dist/build_version.txt (видимый) + dist/.build_version (dotfile) + miniapp/backend/BUILD_VERSION.txt (в исходнике, точно в git)
+- Backend ищет в 7 местах, логирует каждый кандидат на INFO уровне
+- Синхронизация: frontend bundle = ec67eb2, dist/build_version.txt = ec67eb2, backend/BUILD_VERSION.txt = ec67eb2
+- Даже если dist/ вообще не зальётся — backend найдёт BUILD_VERSION.txt в исходнике
+- Архив: /home/z/my-project/download/version-check-bundle-v3.zip
+- После деплоя: проверить /api/version = ec67eb2 (не local-XXX), в логах видеть "[version] file candidate HIT: ... → ec67eb2"
+
+---
+Task ID: version-check-banner-v3-deploy-confirm
+Agent: main (super-z)
+Task: Подтверждение деплоя v3 на bothost по логам пользователя (11:24)
+
+Work Log:
+- Прочитаны логи bothost от 2026-08-13 11:24:57 — старт приложения после деплоя v3
+- Ключевые строки из лога:
+  * [version] file candidate miss: /app/.build_version
+  * [version] file candidate HIT: /app/miniapp/frontend/dist/build_version.txt → ec67eb2
+  * [version] build_time HIT: /app/miniapp/frontend/dist/build_time.txt
+  * Build version: ec67eb2 (build_time=2026-08-13T11:16:11Z, root=/app)
+- Проверены HTTP-запросы в логе:
+  * GET /app/ → 200 OK (index.html, no-cache middleware работает)
+  * GET /app/assets/index-CJEIdB4C.js → 304 Not Modified (assets кэшируются корректно)
+  * GET /api/version → 200 OK (endpoint жив)
+  * GET /api/cameras, /api/dtp/tasks, /api/np-bdd/* → 200 OK (приложение работает)
+- Подтверждена синхронизация: frontend VITE_APP_VERSION=ec67eb2 ↔ backend /api/version=ec67eb2
+- Баннер НЕ должен показываться (версии совпадают)
+- Build_time=2026-08-13T11:16:11Z — совпадает с деплоем, не mtime
+
+Stage Summary:
+- Статус: v3 фикс полностью сработал на bothost
+- Backend: /api/version = ec67eb2 (build_time=2026-08-13T11:16:11Z, root=/app)
+- Backend нашёл видимый файл dist/build_version.txt — dotfile не нужен
+- Frontend bundle: index-CJEIdB4C.js (содержит VITE_APP_VERSION=ec67eb2)
+- Синхронизация: все три источника (bundle, build_version.txt, /api/version) = ec67eb2 ✓
+- Баннер скрыт (версии совпадут), версия-check система готова к работе
+- Алгоритм срабатывания: при следующем деплое с новым git commit → frontend получит новый bundle с новым VITE_APP_VERSION, backend перечитает build_version.txt → mismatch → баннер «🔄 Доступна новая версия [Обновить]» → пользователь жмёт → window.location.reload() → новый bundle → совпадение
+- Задача version-check-banner: ЗАКРЫТА, всё работает в production

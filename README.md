@@ -512,21 +512,37 @@ gibdd-bot/
 │   │   ├── main.py         ← Точка входа FastAPI (Prometheus, slowapi, middleware)
 │   │   ├── config.py       ← Pydantic-settings
 │   │   ├── telegram_auth.py← Проверка подписи initData (HMAC-SHA256)
-│   │   ├── middleware/     ← request_id, CORS, логирование
+│   │   ├── version.py      ← Определение версии сборки (Sprint 7 version-check v3):
+│   │   │                      поиск в 7 местах (env → dist/build_version.txt →
+│   │   │                      dist/.build_version → backend/BUILD_VERSION.txt → git → mtime)
+│   │   ├── middleware/     ← request_id, CORS, логирование, NoCacheIndexHTMLASGI
 │   │   ├── routers/        ← regions, parse, dtp, point, cameras, analyze, np_bdd, llm
-│   │   │   └── analyze.py  ←   агрегирующий router с prefix="/dtp",
-│   │   │                       включает в себя clusters, point, llm
+│   │   │   ├── analyze.py  ←   агрегирующий router с prefix="/dtp",
+│   │   │   │                  включает в себя clusters, point, llm
+│   │   │   └── _common.py ←   _require_done_task (404/403 + WARNING-лог),
+│   │   │                       _check_task_soft (soft-failed 200 для старого JS в WebView)
 │   │   ├── services/
 │   │   │   ├── gibdd_service.py  ← Мост к модулям gibdd-bot (Task, pipeline, recovery)
 │   │   │   ├── llm_ops.py        ← LLM-операции: summary/Q&A, SSE-стрим, кэш, retry 429
 │   │   │   ├── task_registry.py  ← In-memory LRU _tasks + восстановление LLM-сессий
 │   │   │   ├── pipeline.py       ← Анализатор конвейера (cards→analytics→clusters)
+│   │   │   │                       Sprint 7 C.2.4: feature flag GIBDD_USE_CORE_PIPELINE
+│   │   │   │                       routing 4 CPU-bound шагов через core/ via asyncio.to_thread
 │   │   │   ├── analytics_ops.py  ← Аналитические операции (comparison, cross-tables)
 │   │   │   ├── clusters_ops.py   ← Расчёт очагов (concentration_points v2)
 │   │   │   ├── point_stats_ops.py← Статистика по геоточке
 │   │   │   ├── query_ops.py      ← Парсинг запросов пользователя
 │   │   │   ├── cleanup.py        ← Background cleanup (cards/clusters/excel cache TTL)
 │   │   │   └── np_bdd_service.py ← Сервис НП БДД
+│   │   ├── core/           ← Sprint 7 C.2: синхронные pure functions для Celery (C.3)
+│   │   │   ├── __init__.py       ← Re-export всех 12 функций
+│   │   │   ├── fetching.py       ← fetch_cards_for_period_sync (asyncio.run обёртка)
+│   │   │   ├── parsing.py        ← build_excel_data_sync
+│   │   │   ├── analytics_core.py ← build_analytics_sync
+│   │   │   ├── exporting.py      ← generate_excel_bytes_sync + generate_map_html_sync
+│   │   │   ├── llm_core.py       ← run_llm_summary_sync + ask_llm_question_sync
+│   │   │   ├── clusters_core.py  ← calculate_clusters_sync
+│   │   │   └── pipeline_steps.py ← step_fetch/parse/analytics/export (compositional)
 │   │   └── db/             ← Слой PostgreSQL (Этап 2-6)
 │   │       ├── connection.py     ← Async-пул (psycopg), init_pool/close_pool/health_check
 │   │       ├── schema.sql        ← CREATE TABLE IF NOT EXISTS: tasks, access_log,
@@ -540,12 +556,14 @@ gibdd-bot/
 │   │       └── llm_cache.py      ← L2-кэш LLM-резюме (Sprint 2, по cache_key SHA-256)
 │   └── frontend/           ← Vite + React + TypeScript + Tailwind
 │       ├── src/
-│       │   ├── App.tsx     ← Главный layout с табами
-│       │   ├── lib/        ← telegram.ts, api.ts, utils.ts
-│       │   ├── hooks/      ← useTaskPolling.ts, useAnalysisPolling.ts
-│       │   └── components/ ← ClustersView, LLMAnalysisView, AnalyticsView,
-│       │                     NpBddView, PointStatsView, StructuredForm, ...
-│       └── dist/           ← Собранная ститика (после npm run build)
+│       │   ├── App.tsx     ← Главный layout с табами + VersionBanner (Sprint 7 v3)
+│       │   ├── lib/        ← telegram.ts, api.ts, utils.ts (getVersion, ApiError)
+│       │   ├── hooks/      ← useTaskPolling.ts, useAnalysisPolling.ts,
+│       │   │                 useVersionCheck.ts (polling /api/version 60s, Sprint 7 v3)
+│       │   └── components/ ← ClustersView (404/403 UI), LLMAnalysisView, AnalyticsView,
+│       │                     NpBddView, PointStatsView, StructuredForm,
+│       │                     VersionBanner (fixed-top «Доступна новая версия»), ...
+│       └── dist/           ← Собранная ститика + build_version.txt / .build_version
 ├── tests/                  ← Полный набор тестов (464 теста, 77% coverage)
 │   ├── unit/               ← Wave 1-2: чистые функции + LLM/service mocks
 │   ├── integration/        ← Wave 3: end-to-end pipeline + stubs
@@ -553,6 +571,10 @@ gibdd-bot/
 │   └── golden/             ← Wave 4: эталонные выходы (11 файлов)
 ├── data/                   ← Рабочая директория (кэш камер, регионов, OSM)
 ├── Dockerfile              ← Multi-stage: build frontend + Python runtime
+│                              Sprint 7 C.1: +supervisor +redis-server для multi-режима
+├── docker/                 ← Sprint 7 C.1: bothost supervisor инфраструктура
+│   ├── supervisord.conf    ←   4 программы (redis, api, worker, beat) под 2 ГБ RAM
+│   └── entrypoint.sh       ←   DEPLOYMENT_MODE=single|multi переключатель
 ├── requirements.txt        ← Зависимости Python
 ├── .env.example            ← Шаблон конфигурации
 ├── install.bat             ← Установка зависимостей (Windows)
@@ -605,6 +627,7 @@ gibdd-bot/
 | POST | `/api/np-bdd/freeze` | Заморозить год |
 | POST | `/api/np-bdd/unfreeze` | Разморозить год |
 | GET | `/api/np-bdd/frozen` | Список замороженных лет |
+| GET | `/api/version` | Версия сборки backend + build_time (Sprint 7 v3, для version-check баннера) |
 
 ### Telegram-бот
 
@@ -777,7 +800,18 @@ CORS_ORIGINS=https://bot1234.bothost.tech,https://web.telegram.org,https://a.tel
 
 ### Frontend не обновляется после деплоя
 
-Vite добавляет хэш к именам файлов (`index-AbCd1234.js`). Если старый `index.html` закеширован — он будет ссылаться на несуществующий файл. Решение: убедитесь, что bothost не кэширует `/app/` агрессивно, или добавьте version-busting.
+**Решение Sprint 7 v3 (рекомендуется):** в `index.html` добавлен cache-busting через `NoCacheIndexHTMLASGIMiddleware` (`Cache-Control: no-cache, no-store, must-revalidate` для `/app`, `/app/`, `/app/index.html`). Assets с хешированными именами кэшируются навсегда — это безопасно, Vite меняет имя при любой правке.
+
+Дополнительно работает **version-check баннер**: фронтенд раз в 60 сек опрашивает `GET /api/version`, сравнивает с `VITE_APP_VERSION` из bundle. При mismatch показывается fixed-top баннер «🔄 Доступна новая версия приложения [Обновить]» — пользователь жмёт кнопку, страница перезагружается, подгружается новый bundle.
+
+Проверка версии backend:
+```bash
+curl https://<BOTHOST_DOMAIN>/api/version
+# Ожидается: {"version":"ec67eb2","build_time":"2026-08-13T11:16:11Z","service":"gibdd-miniapp"}
+# Если "local-XXX" — backend не нашёл build_version.txt, проверьте dist/build_version.txt
+```
+
+**Старая проблема (до Sprint 7):** Vite добавляет хэш к именам файлов (`index-AbCd1234.js`). Если старый `index.html` закеширован в Telegram WebView — он будет ссылаться на несуществующий файл. В long-lived сессиях (24+ часа) браузерный кэш мог крутить старый JS-bundle бесконечно, что приводило к 404-шторму при polling устаревших задач.
 
 ### PostgreSQL: кэш не срабатывает (всегда MISS)
 
@@ -796,6 +830,86 @@ Vite добавляет хэш к именам файлов (`index-AbCd1234.js`
 ---
 
 ## Журнал изменений
+
+### Sprint 7 — bothost supervisor, core/ рефакторинг, hotfix'ы, version-check (`2026-08-13`)
+
+**C.1 — bothost supervisor (4 процесса в 1 контейнере под 2 ГБ RAM)** (`sprint7-phase-c1-bothost-supervisor.{tar.gz,zip}`)
+- `docker/supervisord.conf` — 4 программы: redis, api, worker, beat с оптимизациями под 2 ГБ RAM
+  - Redis: `maxmemory 128mb`, `--save ""` (без RDB), `--appendonly no` (без AOF)
+  - Worker: `--concurrency=4` (по числу vCPU), `--max-tasks-per-child=10` (вместо 50, для освобождения памяти)
+  - API: `--workers 1` (Telegram webhook требует единственного процесса)
+  - Все процессы: `stopasgroup=true`, `killasgroup=true` (корректное завершение детей)
+- `docker/entrypoint.sh` — переключатель `DEPLOYMENT_MODE=single|multi` (single = `python main.py`, backward compatible)
+- `Dockerfile` — добавлены `supervisor` + `redis-server`, backward compatible
+- `env.example` — секция `DEPLOYMENT_MODE` с описанием режимов
+- `README_DEPLOY_BOTHOST.md` — инструкция multi-режима + troubleshooting
+- `tests/smoke/test_sprint7_bothost_supervisor.py` — 48 smoke-тестов
+- **Default: `DEPLOYMENT_MODE=single`** — backward compatible, multi активируется только после C.3
+
+**C.2 — core/ пакет синхронных pure functions** (`sprint7-phase-c2-core.{tar.gz,zip}`)
+- Новый пакет `miniapp/backend/core/` с 12 синхронными pure functions, готовыми для Celery-тасков (C.3):
+  - `fetching.py` — `fetch_cards_for_period_sync()`
+  - `parsing.py` — `build_excel_data_sync()`
+  - `analytics_core.py` — `build_analytics_sync()`
+  - `exporting.py` — `generate_excel_bytes_sync()`, `generate_map_html_sync()`
+  - `llm_core.py` — `run_llm_summary_sync()`, `ask_llm_question_sync()`
+  - `clusters_core.py` — `calculate_clusters_sync()`
+  - `pipeline_steps.py` — `step_fetch/parse/analytics/export` (compositional helpers для Celery)
+- Принципы: sync, принимают параметры (не `Task`), не мутируют `task_registry._tasks`, возвращают `dict/tuple/bytes`
+- Защита от event loop: при вызове из running loop падают с понятной `RuntimeError`
+- Production-код (`pipeline.execute_task`, `llm_ops`, `clusters_ops`) НЕ тронут
+- 37 новых smoke-тестов (41 subtests), regression: 94 passed / 29 skipped
+
+**C.2.4 — Pipeline wiring через feature flag** (`sprint7-phase-c2-4-core-pipeline-wiring.{tar.gz,zip}`)
+- `GIBDD_USE_CORE_PIPELINE` env (default `"0"` = OFF, backward compatible)
+- При `=1`: 4 CPU-bound шага (PARSING, ANALYTICS, GENERATING Excel, GENERATING map) идут через `core/*_sync` via `asyncio.to_thread()`
+- FETCHING остаётся async-native (`fetch_cards_for_period_sync` использует `asyncio.run`, конфликтует с FastAPI event loop)
+- Лог: `execute_task started (path=core|legacy)` — для A/B-тестирования
+- Архитектурный выигрыш: FastAPI path и будущий Celery path используют одни и те же core-функции
+- 47 smoke-тестов (37 C.2 + 10 C.2.4), regression: 141 passed / 29 skipped
+- Задеплоено на bothost с флагом OFF — backward compatible, готово к A/B-тесту
+
+**Hotfix 1 — Бесконечный polling `/clusters?wait=25` при 404** (`sprint7-hotfix-clusters-404-polling.{tar.gz,zip}`)
+- **Symptom:** фронтенд крутил long-polling при 404 (Task not found), ~80+ запросов/мин
+- **Root cause:** `useAnalysisPolling` не различал 404 (не восстановимо) и 5xx (transient)
+- **Fix (3 файла):**
+  - `useAnalysisPolling.ts` — `retry: false` для 404/403, `<3` для остальных; `refetchInterval: false` для 404/403; `REFETCH_AFTER_TRANSIENT_ERROR_MS=5000` для 5xx
+  - `ClustersView.tsx` — UI блоки «📭 Задача не найдена» (404) / «🔒 Доступ запрещён» (403) с кнопкой «Понятно»
+  - `_common.py` — `logger.warning` при 404/403 с task_id+user_id
+- 14 новых smoke-тестов
+
+**Hotfix 2 — Гарантированное сохранение задачи в БД** (`sprint7-hotfix-task-persistence.{tar.gz,zip}`)
+- **Symptom:** задача `f5929f37ee01` не найдена в таблице `tasks` после рестарта
+- **Root cause (3 проблемы):**
+  1. `pipeline.create_task` использовал fire-and-forget `asyncio.create_task(save_task(task))` без done-callback
+  2. `execute_task` exception-handler менял статус на FAILED в памяти, но НЕ вызывал `save_task`
+  3. `main.py` shutdown закрывал пул БД, но не сбрасывал in-memory `_tasks`
+- **Fix (3 файла):**
+  - `pipeline.py` — `_TASKS_MEMORY[task_id] = task` синхронно + `fut.add_done_callback(_make_save_task_callback(task_id))`; exception-handler `await save_task(task)`
+  - `dtp.py` — `await save_task(task)` между `create_task()` и `asyncio_create_task(execute_task)` (главная защита — задача в БД к моменту HTTP-ответа)
+  - `main.py` — shutdown: persist всех `_tasks` в БД ДО `db_close_pool()` с логом `Shutdown: persisted N/M задач в БД`
+- 18 новых smoke-тестов
+
+**Hotfix 3 — Backend soft-failed 200 для старого JS в Telegram WebView** (`sprint7-hotfix-v2-soft-failed.{zip,tar.gz}`)
+- **Symptom:** после Hotfix 1 polling продолжался — Telegram WebView кэшировал старый JS
+- **Fix:** backend возвращает **200 OK с `status=failed`** вместо HTTP 404 — останавливает polling в ЛЮБОМ JS (старом и новом)
+- `_common.py`: `_check_task_soft(task_id, user, error_label)` — при 404/403 возвращает `(None, AnalysisStatusResponse(status="failed", error="..."))`
+- `clusters.py`: `GET /clusters` и `POST /clusters` заменены `_require_done_task` → `_check_task_soft`
+- `ClustersView.tsx`: в `if (data?.state.status === 'failed')` проверка `error` на «задача не найдена»/«доступ запрещён» → специфичный UI
+
+**Version-check v3 — Баннер обновления приложения** (`version-check-bundle-v3.zip`)
+- **Проблема:** пользователь держал Mini App открытым 24+ часа, браузерный кэш Telegram WebView отдавал старый JS-bundle при деплоях
+- **Решение — 2 слоя защиты:**
+  1. **Cache-busting для `index.html`** (уже было): `NoCacheIndexHTMLASGIMiddleware` (pure ASGI) добавляет `Cache-Control: no-cache, no-store, must-revalidate` для `/app`, `/app/`, `/app/index.html`. Assets с хешированными именами кэшируются навсегда.
+  2. **Version-check баннер (новое):**
+     - `miniapp/backend/version.py` — определение версии (приоритет: env `APP_BUILD_VERSION` → env `APP_GIT_COMMIT` → `dist/build_version.txt` → `dist/.build_version` → `miniapp/backend/BUILD_VERSION.txt` → `git rev-parse` → mtime fallback). Поиск в 7 местах с INFO-логированием каждого кандидата.
+     - `GET /api/version` endpoint — отдаёт `{version, build_time, service}`
+     - `useVersionCheck` hook — polling `/api/version` каждые 60 сек, сравнение с `VITE_APP_VERSION` из bundle; после первого mismatch — прекращает опрос
+     - `VersionBanner` компонент — fixed-top баннер «🔄 Доступна новая версия приложения [Обновить]», не закрывается без `window.location.reload()`
+- **Backend ищет версию в 7 местах** — даже если часть файлов потеряется при деплое (dotfiles на bothost), найдётся хотя бы один
+- Деплой v3 подтверждён логами bothost 11:24: `Build version: ec67eb2 (build_time=2026-08-13T11:16:11Z, root=/app)` — backend нашёл видимый файл `dist/build_version.txt`
+
+---
 
 ### Sprint 6 — Персистентные LLM-сессии + UX-правки (`2026-08-10`)
 
