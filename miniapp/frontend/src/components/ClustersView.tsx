@@ -268,6 +268,55 @@ export function ClustersView({ task }: ClustersViewProps) {
 
   // === Failed ===
   if (data?.state.status === 'failed') {
+    // Hotfix Sprint 7 (v2): backend при 404/403 возвращает 200 OK с
+    // status=failed и error, содержащим "Задача не найдена" или
+    // "Доступ запрещён". Показываем понятный UI вместо "Ошибка расчёта".
+    const errMsg = data.state.error ?? ''
+    const isNotFound =
+      errMsg.toLowerCase().includes('задача не найдена') ||
+      errMsg.toLowerCase().includes('удалена из памяти') ||
+      errMsg.toLowerCase().includes('создайте новую выгрузку')
+    const isAccessDenied =
+      errMsg.toLowerCase().includes('доступ запрещён') ||
+      errMsg.toLowerCase().includes('другому пользователю')
+
+    if (isNotFound || isAccessDenied) {
+      return (
+        <div className="tg-card">
+          <div
+            className="font-medium mb-2"
+            style={{ color: '#ff3b30' }}
+          >
+            {isNotFound ? '📭 Задача не найдена' : '🔒 Доступ запрещён'}
+          </div>
+          <div className="text-xs opacity-80 mb-3">
+            {isNotFound
+              ? 'Задача удалена из памяти сервера и не может быть восстановлена. ' +
+                'Это могло произойти из-за перезапуска контейнера или истечения ' +
+                'срока хранения (LRU-кэш на 50 последних задач). ' +
+                'Создайте новую выгрузку ДТП для расчёта очагов.'
+              : 'Эта задача принадлежит другому пользователю. ' +
+                'Попросите владельца поделиться ссылкой или создайте свою выгрузку.'}
+          </div>
+          <button
+            onClick={() => {
+              setStarted(false)
+              setStarting(false)
+              setStartError(null)
+            }}
+            className="w-full py-2.5 rounded-xl font-medium text-sm"
+            style={{
+              backgroundColor: 'var(--tg-color-button, #2481cc)',
+              color: 'var(--tg-color-button-text, #ffffff)',
+            }}
+          >
+            Понятно
+          </button>
+        </div>
+      )
+    }
+
+    // Обычная ошибка расчёта (не 404/403)
     return (
       <div className="tg-card">
         <div
