@@ -102,3 +102,69 @@ def _state_to_response(state) -> AnalysisStatusResponse:
         started_at=state.started_at.isoformat() if state.started_at else None,
         finished_at=state.finished_at.isoformat() if state.finished_at else None,
     )
+
+
+# ============================================================
+# Hotfix Sprint 7 (v2): "soft 404" для polling-эндпоинтов
+# ============================================================
+# Проблема: Telegram WebView кэширует старый JS-бандл очень агрессивно.
+# Даже после деплоя нового бандла с фиксом (retry: false при 404,
+# refetchInterval: false при 404), старый JS в кэше WebView продолжает
+# бесконечный polling. No-cache middleware на index.html не помогает —
+# WebView игнорирует Cache-Control.
+#
+# Решение: для polling-эндпоинтов (GET /clusters, GET /llm/summary)
+# при несуществующей задаче возвращать НЕ 404, а 200 OK с
+# status="failed" и error="Task not found". Это останавливает polling
+# в ЛЮБОМ JS-коде (старом и новом), потому что оба проверяют
+# status === 'failed' и возвращают refetchInterval: false.
+#
+# Frontend (новый) дополнительно проверяет error message и показывает
+# понятный UI "Задача не найдена" (см. ClustersView.tsx).
+#
+# get_task_status_soft() возвращает (task, error_response):
+# - (task, None) если задача найдена и принадлежит пользователю
+# - (None, ClustersResponse/LLMSummaryResponse с status=failed) если 404/403
+# - (None, None) если задача найдена, но статус != done (409 Conflict)
+#   — в этом случае роутер должен сам решить, что вернуть
+async def _check_task_soft(task_id: str, user: TelegramUser, error_label: str = "Задача не найдена"):
+    """
+    Soft-проверка задачи для polling-эндпоинтов.
+
+    Возвращает кортеж (task, soft_error_response):
+    - task — найденная задача (или None)
+    - soft_error_response — AnalysisStatusResponse со status=failed
+      (или None если задача найдена)
+
+    Логирует WARNING при 404/403 (для диагностики).
+    НЕ логирует при 409 (task not done) — это нормальный сценарий.
+    """
+    task = await get_task_async(task_id)
+    if not task:
+        logger.warning(
+            f"_check_task_soft: 404 task_id={task_id} user_id={user.id} "
+            f"not found (ни in-memory, ни в БД). Возвращаем soft-failed "
+            f"ответ, чтобы остановить polling в старом JS."
+        )
+        soft_error = AnalysisStatusResponse(
+            status="failed",
+            progress=0,
+            stage="",
+            error=f"{error_label}: задача удалена из памяти сервера. "
+                  f"Создайте новую выгрузку ДТП.",
+        )
+        return None, soft_error
+    if task.user_id != user.id:
+        logger.warning(
+            f"_check_task_soft: 403 task_id={task_id} requester_user_id="
+            f"{user.id} != owner_user_id={task.user_id} (access denied). "
+            f"Возвращаем soft-failed ответ."
+        )
+        soft_error = AnalysisStatusResponse(
+            status="failed",
+            progress=0,
+            stage="",
+            error=f"Доступ запрещён: задача принадлежит другому пользователю.",
+        )
+        return None, soft_error
+    return task, None

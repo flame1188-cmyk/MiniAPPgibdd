@@ -34,7 +34,7 @@ from ..services.gibdd_service import (
     start_clusters_calculation,
 )
 from ..telegram_auth import TelegramUser, get_current_user
-from ._common import AnalysisStatusResponse, _require_done_task, _state_to_response
+from ._common import AnalysisStatusResponse, _require_done_task, _state_to_response, _check_task_soft
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +154,16 @@ async def start_clusters(
 
     Повторный вызов возвращает текущий статус.
     Если расчёт уже выполнен — возвращает готовый результат без пересчёта.
+
+    Hotfix Sprint 7 (v2): при 404/403 возвращаем 200 OK с status=failed
+    (см. get_clusters_status для подробностей).
     """
-    task = await _require_done_task(task_id, user)
+    # Soft-проверка: при 404/403 возвращаем 200 OK с failed
+    task, soft_error = await _check_task_soft(task_id, user, "Задача не найдена")
+    if soft_error is not None:
+        return ClustersResponse(state=soft_error, result=None)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
     state = task.clusters_state
 
     # Если уже выполнено — возвращаем готовое.
@@ -216,8 +224,21 @@ async def get_clusters_status(
     Поддержка long polling: если ?wait=N (секунды) и статус running,
     endpoint держит соединение открытым до N секунд, ожидая завершения.
     Возвращает сразу при смене статуса на done/failed или по таймауту.
+
+    Hotfix Sprint 7 (v2): при 404/403 возвращаем 200 OK с status=failed,
+    а не HTTP 404. Это останавливает polling в ЛЮБОМ JS-коде (старом
+    и новом), потому что оба проверяют status === 'failed' и
+    возвращают refetchInterval: false. Раньше HTTP 404 не останавливал
+    polling в старом JS (который кэширован в Telegram WebView).
     """
-    task = await _require_done_task(task_id, user)
+    # Soft-проверка: при 404/403 возвращаем 200 OK с failed
+    task, soft_error = await _check_task_soft(task_id, user, "Задача не найдена")
+    if soft_error is not None:
+        return ClustersResponse(state=soft_error, result=None)
+    # task может быть None только если soft_error не None — но мы уже проверили
+    if task is None:
+        # Не должно случиться, но для type checker
+        raise HTTPException(status_code=404, detail="Task not found")
     state = task.clusters_state
 
     # Long polling: ждём, пока статус running, до `wait` секунд.
