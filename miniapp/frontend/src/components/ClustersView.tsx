@@ -15,6 +15,7 @@
 import { useEffect, useState } from 'react'
 import {
   api,
+  ApiError,
   type ClusterItem,
   type TaskStatusResponse,
 } from '@/lib/api'
@@ -64,7 +65,18 @@ export function ClustersView({ task }: ClustersViewProps) {
   const {
     data,
     isError,
+    error,
   } = useClustersPolling(task.task_id, started)
+
+  // Hotfix Sprint 7: при 404 (Task not found) или 403 (Access denied)
+  // задача недоступна навсегда — polling уже остановлен в хуке, но нам
+  // нужно явно отрендерить сообщение вместо «бесконечного запуска».
+  // Если задача пропала (вытеснена из LRU + не сохранилась в БД, либо
+  // контейнер перезапущен) — просим пользователя создать новую выгрузку.
+  const notFoundError =
+    isError &&
+    error instanceof ApiError &&
+    (error.status === 404 || error.status === 403)
 
   // Если при загрузке уже есть результат — автоматически показываем его
   useEffect(() => {
@@ -110,6 +122,49 @@ export function ClustersView({ task }: ClustersViewProps) {
     } finally {
       setExcelLoading(false)
     }
+  }
+
+  // === Task not found / access denied (после polling-ошибки 404/403) ===
+  // Показываем понятное сообщение и кнопку «создать новую выгрузку».
+  // Кнопка «Рассчитать очаги» здесь не поможет — POST /clusters тоже
+  // упадёт с 404, т.к. task_id не существует.
+  if (notFoundError) {
+    const is404 = (error as ApiError).status === 404
+    return (
+      <div className="tg-card">
+        <div
+          className="font-medium mb-2"
+          style={{ color: '#ff3b30' }}
+        >
+          {is404 ? '📭 Задача не найдена' : '🔒 Доступ запрещён'}
+        </div>
+        <div className="text-xs opacity-80 mb-3">
+          {is404
+            ? 'Задача удалена из памяти сервера и не может быть восстановлена. ' +
+              'Это могло произойти из-за перезапуска контейнера или истечения ' +
+              'срока хранения (LRU-кэш на 50 последних задач). ' +
+              'Создайте новую выгрузку ДТП для расчёта очагов.'
+            : 'Эта задача принадлежит другому пользователю. ' +
+              'Попросите владельца поделиться ссылкой или создайте свою выгрузку.'}
+        </div>
+        <button
+          onClick={() => {
+            // Сбрасываем локальное состояние, чтобы UI вернулся к кнопке
+            // «Рассчитать очаги». Пользователь должен создать новую задачу.
+            setStarted(false)
+            setStarting(false)
+            setStartError(null)
+          }}
+          className="w-full py-2.5 rounded-xl font-medium text-sm"
+          style={{
+            backgroundColor: 'var(--tg-color-button, #2481cc)',
+            color: 'var(--tg-color-button-text, #ffffff)',
+          }}
+        >
+          Понятно
+        </button>
+      </div>
+    )
   }
 
   // === Starting (мгновенный прогресс после клика, до первого ответа API) ===

@@ -54,11 +54,27 @@ async def _require_done_task(task_id: str, user: TelegramUser) -> Task:
 
     Используется всеми роутерами аналитики: clusters, point, llm.
     Вынесено в _common, чтобы не дублировать логику 3 раза.
+
+    Hotfix (Sprint 7): логируем 404/403 на WARNING, чтобы в логах
+    было видно, какой task_id и user_id запрашивает несуществующую
+    задачу. Раньше бесконечный polling с 404 засорял access-log, но
+    не оставлял понятного диагностического сообщения.
     """
     task = await get_task_async(task_id)
     if not task:
+        logger.warning(
+            f"_require_done_task: 404 task_id={task_id} user_id={user.id} "
+            f"not found (ни in-memory, ни в БД). Возможно: контейнер "
+            f"перезапущен, задача вытеснена из LRU и не сохранилась в БД, "
+            f"или task_id никогда не существовал. Polling должен быть "
+            f"остановлен клиентом."
+        )
         raise HTTPException(status_code=404, detail="Task not found")
     if task.user_id != user.id:
+        logger.warning(
+            f"_require_done_task: 403 task_id={task_id} requester_user_id="
+            f"{user.id} != owner_user_id={task.user_id} (access denied)"
+        )
         raise HTTPException(status_code=403, detail="Access denied")
     if task.status != TaskStatus.DONE:
         raise HTTPException(
