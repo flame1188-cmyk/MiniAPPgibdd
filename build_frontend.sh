@@ -86,7 +86,29 @@ if [ -d "$DIST_DIR/assets" ]; then
     else
         echo "⚠ ВНИМАНИЕ: /api/version НЕ найден в bundle — проверьте сборку"
     fi
+    if grep -rE "$VITE_APP_VERSION" "$DIST_DIR/assets/" >/dev/null 2>&1; then
+        echo "✓ Версия $VITE_APP_VERSION встроена в bundle"
+    else
+        echo "⚠ ВНИМАНИЕ: версия $VITE_APP_VERSION НЕ найдена в bundle"
+    fi
 fi
+
+# ============================================================
+# Сохраняем версию в файлы внутри dist/, чтобы backend мог её
+# прочитать из того же места после деплоя.
+# Файлы едут на bothost вместе с dist/ — синхронно с frontend bundle.
+# miniapp/backend/version.py ищет miniapp/frontend/dist/.build_version.
+# ============================================================
+echo "$VITE_APP_VERSION" > "$DIST_DIR/.build_version"
+echo "$APP_BUILD_TIME"   > "$DIST_DIR/.build_time"
+echo ""
+echo "=== Версия сохранена в dist/.build_version ==="
+echo "  version:    $(cat "$DIST_DIR/.build_version")"
+echo "  build_time: $(cat "$DIST_DIR/.build_time")"
+echo ""
+echo "  Backend version.py будет искать этот файл в:"
+echo "    miniapp/frontend/dist/.build_version (после деплоя)"
+echo "    /app/.build_version (если Dockerfile скопировал отдельно)"
 
 echo ""
 echo "=== Готово ==="
@@ -96,16 +118,18 @@ if [ -d "$DIST_DIR" ]; then
     echo "Размер: $SIZE"
     echo ""
     echo "Файлы:"
-    ls -lh "$DIST_DIR"
+    ls -lhA "$DIST_DIR"
     echo ""
     echo "Версия: $VITE_APP_VERSION"
+    echo "Build time: $APP_BUILD_TIME"
     echo ""
     echo "Теперь загрузите на bothost:"
     echo "  - Весь проект целиком (включая miniapp/frontend/dist/)"
     echo "  - ИЛИ только miniapp/frontend/dist/, если остальной код уже на bothost"
     echo ""
-    echo "После деплоя проверьте: https://<BOTHOST_DOMAIN>/app/"
-    echo "                       https://<BOTHOST_DOMAIN>/api/version"
+    echo "После деплоя проверьте:"
+    echo "  https://<BOTHOST_DOMAIN>/app/"
+    echo "  https://<BOTHOST_DOMAIN>/api/version  (должен вернуть ту же версию: $VITE_APP_VERSION)"
 else
     echo "ОШИБКА: dist/ не создан"
     exit 1

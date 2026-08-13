@@ -66,11 +66,12 @@ RUN if [ -z "$VITE_APP_VERSION" ] && command -v git >/dev/null 2>&1; then \
         export APP_BUILD_VERSION="$VITE_APP_VERSION"; \
     fi; \
     echo "[frontend build] VITE_APP_VERSION=$VITE_APP_VERSION"; \
-    npm run build
-
-# Сохраняем версию в файл — runtime-stage заберёт через COPY
-RUN echo "$VITE_APP_VERSION" > /build/VERSION.txt && \
-    echo "${APP_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > /build/BUILD_TIME.txt
+    npm run build; \
+    # Сохраняем версию рядом с dist/, чтобы runtime-stage мог её прочитать.
+    # miniapp/backend/version.py ищет miniapp/frontend/dist/.build_version
+    # как первый кандидат — это позволяет обойти отсутствие env на bothost.
+    echo "$VITE_APP_VERSION" > /build/dist/.build_version; \
+    echo "${APP_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > /build/dist/.build_time
 
 
 # --- Stage 2: Runtime ---
@@ -96,16 +97,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем весь код проекта (gibdd-bot + miniapp + worker/)
 COPY . .
 
-# Копируем собранный frontend
+# Копируем собранный frontend (включая .build_version и .build_time внутри dist/)
 COPY --from=build-frontend /build/dist ./miniapp/frontend/dist
-# Копируем версию сборки из build-stage — будет прочитана miniapp/backend/version.py
-COPY --from=build-frontend /build/VERSION.txt /app/.build_version
-COPY --from=build-frontend /build/BUILD_TIME.txt /app/.build_time
-
-# Пробрасываем версию в env, чтобы miniapp/backend/version.py её подхватил
-# (приоритет: env APP_BUILD_VERSION > git > mtime)
-ENV APP_BUILD_VERSION_FILE=/app/.build_version
-ENV APP_BUILD_TIME_FILE=/app/.build_time
 
 # Копируем конфигурацию supervisor и entrypoint
 COPY docker/supervisord.conf /etc/supervisord.conf
