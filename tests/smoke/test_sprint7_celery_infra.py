@@ -155,7 +155,12 @@ def test_cleanup_tasks_registered():
 
 
 def test_cleanup_expired_caches_runs_in_eager_mode():
-    """cleanup_expired_caches выполняется в eager режиме (без worker) и возвращает stub."""
+    """cleanup_expired_caches выполняется в eager режиме (без worker).
+
+    Sprint 7 / Фаза C.3: задача реализована (не stub). При недоступности БД
+    (тестовое окружение) возвращает все *_deleted=0 и errors со списком
+    модулей, которые не удалось импортировать.
+    """
     from worker.celery_app import app
     from worker.tasks.cleanup_tasks import cleanup_expired_caches
 
@@ -163,16 +168,19 @@ def test_cleanup_expired_caches_runs_in_eager_mode():
     old_value = app.conf.task_always_eager
     app.conf.task_always_eager = True
     try:
-        result = cleanup_expired_caches.apply().get(timeout=5)
+        result = cleanup_expired_caches.apply().get(timeout=10)
     finally:
         app.conf.task_always_eager = old_value
 
     assert isinstance(result, dict)
-    assert result.get("stub") is True
+    # stub=False означает что задача РЕАЛИЗОВАНА (не заглушка)
+    assert result.get("stub") is False
     assert "cards_deleted" in result
     assert "clusters_deleted" in result
     assert "excel_deleted" in result
     assert "llm_deleted" in result
+    assert "total_deleted" in result
+    assert "errors" in result  # может быть пустым если БД доступна
 
 
 # ============================================================

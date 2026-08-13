@@ -47,13 +47,13 @@ app = Celery(
     broker=config.CELERY_BROKER_URL,
     backend=config.CELERY_RESULT_BACKEND,
     include=[
-        # Импортируем модули с задачами, чтобы Celery их зарегистрировал
-        # (раскомментируем по мере реализации в Фазе C.3)
-        # "worker.tasks.gibdd_tasks",
-        # "worker.tasks.llm_tasks",
-        # "worker.tasks.clusters_tasks",
-        # "worker.tasks.exports_tasks",
-        # "worker.tasks.cleanup_tasks",
+        # Sprint 7 / Фаза C.3: все task-модули подключены.
+        # Каждый модуль при импорте регистрирует свои @app.task в Celery app.
+        "worker.tasks.gibdd_tasks",
+        "worker.tasks.llm_tasks",
+        "worker.tasks.clusters_tasks",
+        "worker.tasks.exports_tasks",
+        "worker.tasks.cleanup_tasks",
     ],
 )
 
