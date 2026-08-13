@@ -47,7 +47,7 @@ case "$DEPLOYMENT_MODE" in
         echo "[entrypoint]   1. redis-server (maxmemory 128mb, без AOF)"
         echo "[entrypoint]   2. uvicorn main:app --workers 1 --port ${PORT:-8080}"
         echo "[entrypoint]   3. celery worker --concurrency=4 -Q gibdd,llm,clusters,exports,celery"
-        echo "[entrypoint]   4. celery beat --max-loop-interval=60"
+        echo "[entrypoint]   4. celery beat --max-interval=60"
         echo "[entrypoint] Ожидаемое потребление RAM: ~700MB базовое, ~1.3GB пиковое"
         exec supervisord -n -c /etc/supervisord.conf
         ;;
