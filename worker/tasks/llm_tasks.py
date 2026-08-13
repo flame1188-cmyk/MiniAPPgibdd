@@ -33,7 +33,7 @@ from celery import Task as CeleryTask
 
 from worker.celery_app import app
 from worker.redis_pubsub import publish_done, publish_error, publish_progress
-from worker.task_state import load_task_state, save_task_state
+from worker.task_state import load_task_state, save_task_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -75,13 +75,10 @@ def _update_llm_state_in_snapshot(
     snapshot["llm_summary_state"] = state
     snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    # save_task_state ожидает объект с атрибутами
-    class _TaskStub:
-        pass
-    stub = _TaskStub()
-    for key, value in snapshot.items():
-        setattr(stub, key, value)
-    save_task_state(stub)
+    # Сохраняем dict напрямую — без конвертации в stub-объект.
+    # Раньше тут был _TaskStub + save_task_state(stub), который падал с
+    # AttributeError на отсутствующих полях (user_id, region_code, ...).
+    save_task_state_dict(task_id, snapshot)
 
 
 # ============================================================

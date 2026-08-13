@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 from celery import Task as CeleryTask
 
 from worker.celery_app import app
-from worker.task_state import load_task_state, save_task_state
+from worker.task_state import load_task_state, save_task_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +74,10 @@ def _update_clusters_state_in_snapshot(
     snapshot["clusters_state"] = state
     snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    class _TaskStub:
-        pass
-    stub = _TaskStub()
-    for key, value in snapshot.items():
-        setattr(stub, key, value)
-    save_task_state(stub)
+    # Сохраняем dict напрямую — без конвертации в stub-объект.
+    # Раньше тут был _TaskStub + save_task_state(stub), который падал с
+    # AttributeError на отсутствующих полях (user_id, region_code, ...).
+    save_task_state_dict(task_id, snapshot)
 
 
 # ============================================================

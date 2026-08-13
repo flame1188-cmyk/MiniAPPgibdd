@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional
 from celery import Task as CeleryTask
 
 from worker.celery_app import app
-from worker.task_state import save_task_state, load_task_state
+from worker.task_state import save_task_state_dict, load_task_state
 
 # Lazy imports — чтобы Celery worker не падал при импорте, если
 # miniapp.backend.core ещё не на sys.path (см. celery_app.py:sys.path.insert)
@@ -77,6 +77,58 @@ def _sanitize_filename(s: str, max_len: int = 30) -> str:
     return out or "unknown"
 
 
+def _init_snapshot(
+    task_id: str,
+    *,
+    dat_list: List[str],
+    reg_code: str,
+    region_name: str,
+    period_label: str,
+    user_id: int = 0,
+    raw_query: str = "",
+    prev_label: Optional[str] = None,
+) -> None:
+    """Создаёт полный начальный snapshot в Redis, если его ещё нет.
+
+    Вызывается ОДИН раз в начале execute_pipeline_task. Если snapshot уже
+    существует (например, FastAPI-сторона успела его создать через
+    save_task_state(real_task)) — ничего не делает.
+
+    Это гарантирует, что в Redis есть ВСЕ поля (user_id, region_code, ...),
+    которые потом читает _maybe_merge_redis_snapshot на API-стороне.
+    """
+    existing = load_task_state(task_id)
+    if existing is not None:
+        # Snapshot уже есть — не перезаписываем (FastAPI мог сохранить больше)
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    snapshot = {
+        "id": task_id,
+        "user_id": user_id,
+        "region_code": reg_code,
+        "region_name": region_name,
+        "period_label": period_label,
+        "dat_list": list(dat_list or []),
+        "raw_query": raw_query or "",
+        "prev_label": prev_label or "",
+        "status": "pending",
+        "progress": 0,
+        "error": None,
+        "files": [],
+        "analytics": None,
+        "total_dtp": 0,
+        "total_dead": 0,
+        "total_injured": 0,
+        "created_at": now,
+        "updated_at": now,
+        "llm_summary_state": {},
+        "clusters_state": {},
+        "_source": "celery_v1_init",
+    }
+    save_task_state_dict(task_id, snapshot)
+
+
 def _update_snapshot(
     task_id: str,
     *,
@@ -91,23 +143,37 @@ def _update_snapshot(
 ) -> Optional[Dict[str, Any]]:
     """Обновляет snapshot task_state в Redis.
 
-    Загружает существующий snapshot, применяет указанные поля, сохраняет.
+    Загружает существующий snapshot, применяет указанные поля, сохраняет
+    напрямую через save_task_state_dict (БЕЗ конвертации dict → stub → dict,
+    которая раньше падала на отсутствующих атрибутах _TaskStub).
+
     Возвращает обновлённый snapshot или None если Redis недоступен.
     """
     snapshot = load_task_state(task_id)
     if snapshot is None:
-        # Snapshot ещё не создан — создаём минимальный
+        # Snapshot ещё не создан — создаём минимальный.
+        # Это может случиться только если _init_snapshot не был вызван
+        # (например, в тестах). В проде _init_snapshot вызывается первым.
         snapshot = {
             "id": task_id,
-            "status": status or "pending",
-            "progress": progress or 0,
-            "error": error,
+            "user_id": 0,
+            "region_code": "",
+            "region_name": "",
+            "period_label": "",
+            "dat_list": [],
+            "raw_query": "",
+            "status": "pending",
+            "progress": 0,
+            "error": None,
             "files": [],
+            "analytics": None,
             "total_dtp": 0,
             "total_dead": 0,
             "total_injured": 0,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "llm_summary_state": {},
+            "clusters_state": {},
         }
 
     if status is not None:
@@ -127,15 +193,8 @@ def _update_snapshot(
     if analytics is not None:
         snapshot["analytics"] = analytics
 
-    snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    # save_task_state ожидает объект с атрибутами — обёртка
-    class _TaskStub:
-        pass
-    stub = _TaskStub()
-    for key, value in snapshot.items():
-        setattr(stub, key, value)
-    save_task_state(stub)
+    # save_task_state_dict сам обновит updated_at
+    save_task_state_dict(task_id, snapshot)
     return snapshot
 
 
@@ -230,6 +289,21 @@ def execute_pipeline_task(
                 prev_label = "Прошлый период"
         except Exception:
             prev_label = "Прошлый период"
+
+    # === Шаг 0: Инициализация snapshot в Redis (если ещё нет) ===
+    # Важно: это должно происходить ДО первого _update_snapshot, иначе
+    # _update_snapshot создаст минимальный snapshot без user_id/region_code/...
+    # и API-сторона не сможет смержить корректные поля.
+    _init_snapshot(
+        task_id,
+        dat_list=dat_list,
+        reg_code=reg_code,
+        region_name=region_name,
+        period_label=period_label,
+        user_id=user_id,
+        raw_query=raw_query,
+        prev_label=prev_label,
+    )
 
     # === Шаг 1: FETCHING (current period) ===
     _update_snapshot(task_id, status="fetching", progress=10)
