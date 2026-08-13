@@ -3,12 +3,8 @@
  *
  * Все запросы автоматически добавляют Telegram initData в заголовок
  * X-Tg-Init-Data — это нужно для проверки подписи на сервере.
- *
- * Sprint 7 fix: используем getInitDataFresh() вместо getInitData(),
- * чтобы не отправлять протухший (>24ч) initData. При 401 вызываем
- * ensureFreshInitData() — принудительный reload для получения свежего токена.
  */
-import { getInitDataFresh, ensureFreshInitData, isInsideTelegram } from './telegram'
+import { getInitData } from './telegram'
 
 export const API_BASE = import.meta.env.VITE_API_BASE ?? ''
 
@@ -27,16 +23,7 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
-  // Sprint 7 fix: getInitDataFresh() возвращает '' если initData устарел (>23ч).
-  // Сервер всё равно вернёт 401, поэтому нет смысла отправлять запрос.
-  // Вместо этого сразу триггерим reload — Telegram выдаст свежий initData.
-  const initData = getInitDataFresh()
-  if (!initData && isInsideTelegram()) {
-    // initData устарел — перезагружаем страницу для получения свежего
-    ensureFreshInitData()
-    // Возвращаем Promise, который никогда не resolve'нся — страница сейчас перезагрузится
-    return new Promise<T>(() => {})
-  }
+  const initData = getInitData()
   const headers = new Headers(options.headers)
   headers.set('X-Tg-Init-Data', initData)
 
@@ -54,16 +41,6 @@ async function request<T>(
   })
 
   if (!response.ok) {
-    // Sprint 7 fix: при 401 проверяем, не устарел ли initData
-    if (response.status === 401 && isInsideTelegram()) {
-      console.warn(
-        '[api] 401 Unauthorized — возможно initData устарел. ' +
-        'Перезагружаем страницу для получения свежего токена.'
-      )
-      ensureFreshInitData()
-      // Возвращаем Promise, который никогда не resolve'нся
-      return new Promise<T>(() => {})
-    }
     let detail = `HTTP ${response.status}`
     let body: unknown
     try {
@@ -93,12 +70,7 @@ async function request<T>(
  * Обычный <a download> не подходит, т.к. не передаёт custom headers.
  */
 async function downloadBlobUrl(url: string, fallbackFilename: string): Promise<void> {
-  // Sprint 7 fix: используем getInitDataFresh() и проверяем 401
-  const initData = getInitDataFresh()
-  if (!initData && isInsideTelegram()) {
-    ensureFreshInitData()
-    return new Promise<void>(() => {})
-  }
+  const initData = getInitData()
   const headers = new Headers()
   headers.set('X-Tg-Init-Data', initData)
 
@@ -506,12 +478,7 @@ async function consumeSSE(
   },
   signal?: AbortSignal,
 ): Promise<void> {
-  // Sprint 7 fix: getInitDataFresh() чтобы не отправлять протухший токен
-  const initData = getInitDataFresh()
-  if (!initData && isInsideTelegram()) {
-    ensureFreshInitData()
-    return new Promise<void>(() => {})
-  }
+  const initData = getInitData()
   const headers = new Headers({
     'Content-Type': 'application/json',
     'X-Tg-Init-Data': initData,
@@ -666,10 +633,10 @@ export const api = {
     request<TaskFile[]>(`/api/dtp/tasks/${taskId}/files`),
 
   getMapUrl: (taskId: string) =>
-    `${API_BASE}/api/dtp/tasks/${taskId}/map?tg_init_data=${encodeURIComponent(getInitDataFresh())}`,
+    `${API_BASE}/api/dtp/tasks/${taskId}/map?tg_init_data=${encodeURIComponent(getInitData())}`,
 
   getDownloadUrl: (taskId: string, fileType: string) =>
-    `${API_BASE}/api/dtp/tasks/${taskId}/download/${fileType}?tg_init_data=${encodeURIComponent(getInitDataFresh())}`,
+    `${API_BASE}/api/dtp/tasks/${taskId}/download/${fileType}?tg_init_data=${encodeURIComponent(getInitData())}`,
 
   // ============================================================
   // Cameras
@@ -712,7 +679,7 @@ export const api = {
     ),
 
   getClustersMapUrl: (taskId: string) =>
-    `${API_BASE}/api/dtp/tasks/${taskId}/clusters/map?tg_init_data=${encodeURIComponent(getInitDataFresh())}`,
+    `${API_BASE}/api/dtp/tasks/${taskId}/clusters/map?tg_init_data=${encodeURIComponent(getInitData())}`,
 
   /**
    * Скачивает Excel с очагами (4 листа: очаги/динамика/детализация/предочаги).
@@ -753,7 +720,7 @@ export const api = {
   ) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/point/map` +
     `?lat=${lat}&lon=${lon}&radius_m=${radius_m}` +
-    `&tg_init_data=${encodeURIComponent(getInitDataFresh())}`,
+    `&tg_init_data=${encodeURIComponent(getInitData())}`,
 
   // ============================================================
   // Analysis: LLM
