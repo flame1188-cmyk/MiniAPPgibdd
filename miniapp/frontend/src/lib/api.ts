@@ -592,6 +592,13 @@ async function consumeSSE(
 export const api = {
   health: () => request<{ status: string }>('/health'),
 
+  // Версия backend-сборки для cache-busting баннера.
+  // Не требует аутентификации — публичный endpoint.
+  getVersion: () =>
+    request<{ version: string; build_time: string; service: string }>(
+      '/api/version'
+    ),
+
   listRegions: () => request<Region[]>('/api/regions'),
 
   searchRegions: (q: string) =>
