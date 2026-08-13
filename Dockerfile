@@ -40,7 +40,37 @@ RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
 
 # Копируем исходники и собираем
 COPY miniapp/frontend/ ./
-RUN npm run build
+
+# Версия сборки — sync с miniapp/backend/version.py.
+# Если APP_BUILD_VERSION не передан, fallback на git rev-parse (если .git есть)
+# или на mtime-based версию в version.py.
+# Build-arg можно передать при сборке: --build-arg APP_BUILD_VERSION=<sha>
+ARG APP_BUILD_VERSION
+ARG APP_GIT_COMMIT
+ARG APP_BUILD_TIME
+
+ENV APP_BUILD_VERSION=${APP_BUILD_VERSION:-}
+ENV APP_GIT_COMMIT=${APP_GIT_COMMIT:-}
+ENV APP_BUILD_TIME=${APP_BUILD_TIME:-}
+# Vite читает VITE_* переменные из env и встраивает в bundle как import.meta.env.*
+ENV VITE_APP_VERSION=${APP_BUILD_VERSION:-${APP_GIT_COMMIT:-}}
+
+RUN if [ -z "$VITE_APP_VERSION" ] && command -v git >/dev/null 2>&1; then \
+        GIT_VER="$(git rev-parse --short HEAD 2>/dev/null || true)"; \
+        if [ -n "$GIT_VER" ]; then \
+            export VITE_APP_VERSION="$GIT_VER" && export APP_BUILD_VERSION="$GIT_VER"; \
+        fi; \
+    fi; \
+    if [ -z "$VITE_APP_VERSION" ]; then \
+        export VITE_APP_VERSION="docker-$(date +%s)"; \
+        export APP_BUILD_VERSION="$VITE_APP_VERSION"; \
+    fi; \
+    echo "[frontend build] VITE_APP_VERSION=$VITE_APP_VERSION"; \
+    npm run build
+
+# Сохраняем версию в файл — runtime-stage заберёт через COPY
+RUN echo "$VITE_APP_VERSION" > /build/VERSION.txt && \
+    echo "${APP_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > /build/BUILD_TIME.txt
 
 
 # --- Stage 2: Runtime ---
@@ -68,6 +98,14 @@ COPY . .
 
 # Копируем собранный frontend
 COPY --from=build-frontend /build/dist ./miniapp/frontend/dist
+# Копируем версию сборки из build-stage — будет прочитана miniapp/backend/version.py
+COPY --from=build-frontend /build/VERSION.txt /app/.build_version
+COPY --from=build-frontend /build/BUILD_TIME.txt /app/.build_time
+
+# Пробрасываем версию в env, чтобы miniapp/backend/version.py её подхватил
+# (приоритет: env APP_BUILD_VERSION > git > mtime)
+ENV APP_BUILD_VERSION_FILE=/app/.build_version
+ENV APP_BUILD_TIME_FILE=/app/.build_time
 
 # Копируем конфигурацию supervisor и entrypoint
 COPY docker/supervisord.conf /etc/supervisord.conf
