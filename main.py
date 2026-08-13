@@ -790,6 +790,77 @@ async def health_celery():
     return result
 
 
+# ============================================================
+# /debug/supervisor-logs — чтение логов supervisord из контейнера
+# ============================================================
+# Эндпоинт для диагностики multi-режима без shell-доступа к bothost.
+# Возвращает последние N байт каждого лог-файла:
+#   - /var/log/supervisor/supervisord.log
+#   - /var/log/supervisor/api.log + api.err.log
+#   - /var/log/supervisor/worker.log + worker.err.log
+#   - /var/log/supervisor/beat.log + beat.err.log
+#   - /var/log/supervisor/redis.log + redis.err.log
+#
+# Защита: если задан env DEBUG_LOGS_TOKEN — требует ?token=<значение>.
+# Если не задан — эндпоинт отключён (возвращает 403).
+#
+# Пример: GET /debug/supervisor-logs?tail=20000&token=secret
+@app.get("/debug/supervisor-logs")
+async def debug_supervisor_logs(tail: int = 20000, token: str = ""):
+    import os as _os
+
+    expected_token = _os.getenv("DEBUG_LOGS_TOKEN", "")
+    if not expected_token:
+        return {
+            "error": "DEBUG_LOGS_TOKEN not set — debug endpoint disabled",
+            "hint": "Set DEBUG_LOGS_TOKEN env var to enable",
+        }
+    if token != expected_token:
+        return {"error": "Invalid token"}, 403
+
+    # Ограничиваем tail сверху — не более 200 KB на файл
+    tail = max(1, min(int(tail), 200_000))
+
+    log_dir = "/var/log/supervisor"
+    names = [
+        "supervisord.log",
+        "api.log", "api.err.log",
+        "worker.log", "worker.err.log",
+        "beat.log", "beat.err.log",
+        "redis.log", "redis.err.log",
+    ]
+
+    result = {"tail_bytes": tail, "logs": {}}
+    for name in names:
+        path = f"{log_dir}/{name}"
+        try:
+            with open(path, "rb") as f:
+                # Читаем последние tail байт
+                try:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    read_size = min(size, tail)
+                    f.seek(max(0, size - read_size))
+                    raw = f.read(read_size)
+                except OSError:
+                    # seek не работает (pipe) — читаем всё
+                    raw = f.read()
+            try:
+                text = raw.decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(raw)
+            result["logs"][name] = {
+                "size_bytes": len(raw),
+                "content": text,
+            }
+        except FileNotFoundError:
+            result["logs"][name] = None
+        except Exception as exc:
+            result["logs"][name] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    return result
+
+
 @app.get("/")
 async def root():
     """Корневой endpoint с информацией о сервисе."""

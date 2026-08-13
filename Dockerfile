@@ -92,6 +92,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     redis-server \
     && rm -rf /var/lib/apt/lists/*
 
+# Sanity check: убеждаемся, что redis-server доступен по ожидаемому пути.
+# На Debian (python:3.11-slim) apt-get install redis-server кладёт бинарник
+# в /usr/bin/redis-server. supervisord.conf ссылается именно на этот путь.
+# Если в будущем поменяется базовый образ — этот check упадёт на build-стадии.
+RUN test -x /usr/bin/redis-server \
+    && /usr/bin/redis-server --version \
+    || (echo "ERROR: /usr/bin/redis-server not found or not executable" && exit 1)
+
 WORKDIR /app
 
 # Устанавливаем Python-зависимости
