@@ -97,18 +97,41 @@ fi
 # Сохраняем версию в файлы внутри dist/, чтобы backend мог её
 # прочитать из того же места после деплоя.
 # Файлы едут на bothost вместе с dist/ — синхронно с frontend bundle.
-# miniapp/backend/version.py ищет miniapp/frontend/dist/.build_version.
+# miniapp/backend/version.py ищет miniapp/frontend/dist/build_version.txt.
+#
+# ВАЖНО: используем ВИДИМЫЕ имена (build_version.txt, не .build_version),
+# потому что bothost/git/FTP иногда теряют dotfiles при деплое.
+# Для backward compat пишем оба варианта (.build_version и build_version.txt).
 # ============================================================
+echo "$VITE_APP_VERSION" > "$DIST_DIR/build_version.txt"
 echo "$VITE_APP_VERSION" > "$DIST_DIR/.build_version"
+echo "$APP_BUILD_TIME"   > "$DIST_DIR/build_time.txt"
 echo "$APP_BUILD_TIME"   > "$DIST_DIR/.build_time"
+
+# ============================================================
+# ДУБЛИРУЕМ версию в miniapp/backend/ — это часть ИСХОДНОГО кода,
+# которая точно попадёт в git-репозиторий (в отличие от dist/, который
+# в .gitignore). Этот файл — последняя линия обороны от ситуаций,
+# когда dist/ залили на bothost без dotfiles/мелких файлов.
+# miniapp/backend/version.py ищет miniapp/backend/BUILD_VERSION.txt.
+# ============================================================
+BACKEND_DIR="$SCRIPT_DIR/miniapp/backend"
+echo "$VITE_APP_VERSION" > "$BACKEND_DIR/BUILD_VERSION.txt"
+echo "$APP_BUILD_TIME"   > "$BACKEND_DIR/BUILD_TIME.txt"
+
 echo ""
-echo "=== Версия сохранена в dist/.build_version ==="
-echo "  version:    $(cat "$DIST_DIR/.build_version")"
-echo "  build_time: $(cat "$DIST_DIR/.build_time")"
+echo "=== Версия сохранена ==="
+echo "  dist/build_version.txt:        $(cat "$DIST_DIR/build_version.txt")"
+echo "  dist/.build_version (dotfile): $(cat "$DIST_DIR/.build_version")"
+echo "  backend/BUILD_VERSION.txt:     $(cat "$BACKEND_DIR/BUILD_VERSION.txt")"
+echo "  backend/BUILD_TIME.txt:        $(cat "$BACKEND_DIR/BUILD_TIME.txt")"
 echo ""
-echo "  Backend version.py будет искать этот файл в:"
-echo "    miniapp/frontend/dist/.build_version (после деплоя)"
-echo "    /app/.build_version (если Dockerfile скопировал отдельно)"
+echo "  Backend version.py будет искать в (по порядку):"
+echo "    1. miniapp/frontend/dist/build_version.txt (видимый, recommended)"
+echo "    2. miniapp/frontend/dist/.build_version (dotfile fallback)"
+echo "    3. miniapp/backend/BUILD_VERSION.txt (исходник, гарантированно в git)"
+echo "    4. /app/build_version.txt (Docker COPY, если multi-stage)"
+echo "    5. /app/.build_version (Docker COPY dotfile)"
 
 echo ""
 echo "=== Готово ==="

@@ -68,9 +68,13 @@ RUN if [ -z "$VITE_APP_VERSION" ] && command -v git >/dev/null 2>&1; then \
     echo "[frontend build] VITE_APP_VERSION=$VITE_APP_VERSION"; \
     npm run build; \
     # Сохраняем версию рядом с dist/, чтобы runtime-stage мог её прочитать.
-    # miniapp/backend/version.py ищет miniapp/frontend/dist/.build_version
+    # miniapp/backend/version.py ищет miniapp/frontend/dist/build_version.txt
     # как первый кандидат — это позволяет обойти отсутствие env на bothost.
+    # Пишем оба варианта (видимый + dotfile) для надёжности — bothost/git/FTP
+    # иногда теряют dotfiles при деплое.
+    echo "$VITE_APP_VERSION" > /build/dist/build_version.txt; \
     echo "$VITE_APP_VERSION" > /build/dist/.build_version; \
+    echo "${APP_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > /build/dist/build_time.txt; \
     echo "${APP_BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" > /build/dist/.build_time
 
 
