@@ -18,6 +18,16 @@ worker/tasks/gibdd_tasks.py — Celery задачи для выгрузки ка
   Прогресс пишется в task_state (Redis) после каждого шага — FastAPI router
   читает его для polling.
 
+  === Phase C.3 hotfix (этот коммит): persist финального состояния в БД ===
+  После DONE/FAILED воркер дополнительно вызывает
+  save_task_final_state_from_snapshot_sync() — обновляет tasks таблицу напрямую
+  через sync-соединение (Celery-воркер не имеет async-пула FastAPI).
+  Это предотвращает появление "ghost"-задач: ранее БД оставалась в состоянии
+  status='pending' / progress=0 даже после успешного завершения pipeline,
+  потому что Celery-воркер писал только в Redis snapshot, а не в БД.
+  Если Redis протухал или терялся (как в случае с _TaskStub багом),
+  задача навсегда оставалась "вечной pending" в БД.
+
 - fetch_cards_task — отдельная задача для лёгкой выгрузки (без pipeline).
   Используется для pre-fetch (например, для предзагрузки популярных регионов).
 
@@ -44,6 +54,67 @@ from worker.task_state import save_task_state_dict, load_task_state
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_final_state_to_db(
+    task_id: str,
+    *,
+    status: str,
+    progress: int,
+    error: Optional[str] = None,
+    total_dtp: int = 0,
+    total_dead: int = 0,
+    total_injured: int = 0,
+    files: Optional[List[Dict[str, Any]]] = None,
+    analytics: Optional[Dict[str, Any]] = None,
+    log_prefix: str = "",
+) -> None:
+    """Phase C.3 hotfix: сохраняет финальное состояние задачи в БД напрямую.
+
+    Celery-воркер работает в sync-контексте без async-пула FastAPI —
+    используем sync-версию save_task_final_state_from_snapshot_sync()
+    из repository.py (открывает свежее sync-соединение, выполняет UPDATE,
+    закрывает).
+
+    Это предотвращает появление "ghost"-задач в БД:
+    - Раньше: воркер пишет только в Redis snapshot, БД остаётся в
+      status='pending'/progress=0 навсегда (если Redis протух/потерян).
+    - Теперь: БД обновляется синхронно при завершении pipeline (DONE/FAILED).
+
+    Не роняет pipeline при ошибке записи в БД — только логирует WARNING.
+    Redis snapshot всё равно уже обновлён через _update_snapshot выше.
+    """
+    try:
+        from miniapp.backend.db.repository import (
+            save_task_final_state_from_snapshot_sync,
+        )
+        ok = save_task_final_state_from_snapshot_sync(
+            task_id,
+            status=status,
+            progress=progress,
+            error=error,
+            total_dtp=total_dtp,
+            total_dead=total_dead,
+            total_injured=total_injured,
+            files=files,
+            analytics=analytics,
+        )
+        if ok:
+            logger.debug(
+                f"{log_prefix}: финальное состояние сохранено в БД "
+                f"(status={status}, progress={progress})"
+            )
+        else:
+            logger.debug(
+                f"{log_prefix}: save_final_state_sync вернул False "
+                f"(БД недоступна или DATABASE_URL не задан) — продолжаем "
+                f"(Redis snapshot уже обновлён)"
+            )
+    except Exception as exc:
+        logger.warning(
+            f"{log_prefix}: save_final_state_sync failed: {exc} — "
+            f"продолжаем (Redis snapshot уже обновлён)"
+        )
 
 
 # ============================================================
@@ -315,6 +386,10 @@ def execute_pipeline_task(
     if not fetch_result["ok"]:
         err = fetch_result.get("error", "Fetch failed")
         _update_snapshot(task_id, status="failed", progress=10, error=err)
+        _persist_final_state_to_db(
+            task_id, status="failed", progress=10, error=err,
+            log_prefix=log_prefix,
+        )
         logger.error(f"{log_prefix}: FETCHING failed — {err}")
         return {
             "ok": False,
@@ -368,6 +443,13 @@ def execute_pipeline_task(
     if not parse_result["ok"]:
         err = parse_result.get("error", "Parse failed")
         _update_snapshot(task_id, status="failed", progress=45, error=err)
+        _persist_final_state_to_db(
+            task_id, status="failed", progress=45, error=err,
+            total_dtp=stats["total_dtp"],
+            total_dead=stats["total_dead"],
+            total_injured=stats["total_injured"],
+            log_prefix=log_prefix,
+        )
         logger.error(f"{log_prefix}: PARSING failed — {err}")
         return {
             "ok": False,
@@ -386,6 +468,9 @@ def execute_pipeline_task(
         f"{log_prefix}: PARSING done — file1={len(file1_data)} строк, "
         f"file2={len(file2_data)} строк"
     )
+
+    # NOTE: блок 'if not parse_result["ok"]' уже обработан выше — здесь
+    # мы точно знаем, что parse_result['ok'] == True.
 
     # === Шаг 3: ANALYTICS ===
     _update_snapshot(task_id, status="analytics", progress=65)
@@ -446,6 +531,13 @@ def execute_pipeline_task(
     if not export_result["ok"]:
         err = export_result.get("error", "Export failed")
         _update_snapshot(task_id, status="failed", progress=80, error=err)
+        _persist_final_state_to_db(
+            task_id, status="failed", progress=80, error=err,
+            total_dtp=stats["total_dtp"],
+            total_dead=stats["total_dead"],
+            total_injured=stats["total_injured"],
+            log_prefix=log_prefix,
+        )
         logger.error(f"{log_prefix}: GENERATING failed — {err}")
         return {
             "ok": False,
@@ -518,6 +610,15 @@ def execute_pipeline_task(
         progress=100,
         files=files_meta,
         analytics=analytics_dict,
+    )
+    _persist_final_state_to_db(
+        task_id, status="done", progress=100,
+        total_dtp=stats["total_dtp"],
+        total_dead=stats["total_dead"],
+        total_injured=stats["total_injured"],
+        files=files_meta,
+        analytics=analytics_dict,
+        log_prefix=log_prefix,
     )
 
     logger.info(
