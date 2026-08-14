@@ -87,6 +87,9 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
 - **Локальный флаг `starting`** для мгновенного показа прогресс-бара после клика, не дожидаясь первого long-poll ответа
 - **Elasped-time тикер** для LLM-анализа с предупреждениями при > 90 сек и рекомендацией отмены при > 240 сек
 - **Сброс кэша react-query** при retry после ошибки — иначе кнопка «Повторить» возвращает старую ошибку
+- **Сворачивание списка задач** — кнопка-чекбокс с шевроном ▾ в заголовке «Последние запросы»; состояние сохраняется в localStorage (`history-list-collapsed`), между сессиями пользователь видит список свёрнутым, если сам его свернул. Счётчик задач рядом с шевроном
+- **Удаление задач пользователем** — иконка 🗑 в правом верхнем углу каждой карточки задачи; подтверждение через Telegram `showConfirm` (нативный диалог); после подтверждения задача удаляется из БД + in-memory кэша + файлы на диске (с ownership-проверкой и логированием в access_log по 152-ФЗ)
+- **Оптимистичное обновление при удалении** — `useMutation.onMutate` убирает задачу из кэша react-query мгновенно (через `setQueryData`), UI обновляется без ожидания ответа сервера; при ошибке — кэш восстанавливается из снимка, показывается alert; `onSettled` делает финальный refetch для консистентности
 - **Telegram theme** — автоматическое применение цветовой схемы (light/dark) через CSS-переменные
 - **Haptic feedback** — нативная вибрация на клики/ошибки/успехи
 - **Fullscreen mode** — кнопка раскрытия на десктопе
@@ -599,8 +602,9 @@ gibdd-bot/
 | GET | `/api/regions/search?q=` | Поиск регионов (autocomplete) |
 | POST | `/api/parse` | Парсинг естественного языка → `{region_code, period}` |
 | POST | `/api/dtp/tasks` | Создать задачу выгрузки, вернуть `task_id` |
-| GET | `/api/dtp/tasks` | Список задач пользователя |
+| GET | `/api/dtp/tasks` | Список задач пользователя (последние N, по умолчанию 20) |
 | GET | `/api/dtp/tasks/{id}` | Статус задачи (для polling) |
+| DELETE | `/api/dtp/tasks/{id}` | Удалить задачу пользователя (БД + in-memory кэш + файлы на диске; с ownership-проверкой и логированием в access_log) |
 | GET | `/api/dtp/tasks/{id}/files` | Список готовых файлов |
 | GET | `/api/dtp/tasks/{id}/map` | HTML-карта ДТП (для iframe) |
 | GET | `/api/dtp/tasks/{id}/download/{file_type}` | Скачать Excel/HTML |
@@ -830,6 +834,42 @@ curl https://<BOTHOST_DOMAIN>/api/version
 ---
 
 ## Журнал изменений
+
+### Sprint 8 — UX правки списка задач (`2026-08-14`)
+
+**8.1 — Сворачивание списка задач + удаление через 🗑** (`task-list-improvements.zip`)
+- **Проблема:** при большом количестве задач список «Последние запросы» занимал весь экран и мешал работе с формой запроса
+- **Сворачивание (frontend-only):**
+  - Кнопка-заголовок с шевроном ▾ и счётчиком задач
+  - Состояние сохраняется в `localStorage` (`history-list-collapsed`), персистит между сессиями
+  - Анимация поворота шеврона через CSS `transform: rotate(-90deg)`
+- **Удаление задач (full-stack):**
+  - `DELETE /api/dtp/tasks/{task_id}` — новый endpoint в `routers/dtp.py` с pre-check ownership (404/403), логированием в `access_log` (152-ФЗ)
+  - `repository.delete_task(task_id, user_id)` — удаляет из БД (с ownership-проверкой `WHERE id=%s AND user_id=%s`), in-memory кэша `_TASKS_MEMORY` + `_TASKS_HEAVY_STATE`, и файлов с диска (`data/tasks/{task_id}/` + все файлы из `task.files[].path`)
+  - `api.deleteTask(taskId)` — новый метод в frontend API клиенте
+  - `HistoryList.tsx` — иконка 🗑 в правом верхнем углу карточки, `showConfirm` для подтверждения, `useMutation` для вызова, `invalidateQueries` для refetch
+- 4 файла: `routers/dtp.py`, `db/repository.py`, `frontend/src/lib/api.ts`, `frontend/src/components/HistoryList.tsx`
+
+**8.2 — Bugfix: задача не пропадала из списка после удаления** (`delete-task-fix.zip`)
+- **Symptom:** после подтверждения удаления задача становилась полупрозрачной, затем список обновлялся, но задача не пропадала — она просто перемещалась выше. В логах: `delete_task: task=... — удалена (db=да)` — БД-удаление работало корректно
+- **Root cause:** в коде существовало **ДВА отдельных in-memory кэша** задач:
+  1. `_TASKS_MEMORY` в `repository.py` — чистился в `delete_task` ✓
+  2. `_tasks` (OrderedDict, LRU) в `task_registry.py` — **НЕ чистился** ✗
+  - Цепочка бага: DELETE endpoint вызывает `get_task_async(task_id)` для pre-check → через `_register_task()` задача попадает в `_tasks` → `delete_task` чистит БД + `_TASKS_MEMORY`, но не `_tasks` → фронтенд инвалидирует кэш → `GET /tasks` → `list_user_tasks()` видит задачу в `_tasks`, но не в БД → срабатывает логика "in-memory задача, которой нет в БД → свежая → вставить в начало списка" → задача возвращается на вершину списка
+- **Backend fix (КРИТИЧНО):**
+  - `task_registry.py` — новая функция `unregister_task(task_id, user_id)`: удаляет задачу из `_tasks` под `_tasks_lock`, с проверкой `user_id` (защита от race condition: если задача уже вытеснена LRU и на её месте чужая — не трогаем), обновляет Prometheus gauge
+  - `repository.py` — `delete_task()` теперь вызывает `unregister_task()` через lazy import (шаг 3, после `_TASKS_MEMORY` cleanup)
+- **Frontend fix (UX):**
+  - `HistoryList.tsx` — мутация удаления переписана с **оптимистичным обновлением**: `onMutate` отменяет исходящие refetch, снимает снапшот кэша, убирает задачу из кэша через `setQueryData` → UI обновляется мгновенно; `onError` восстанавливает кэш из снапшота, показывает alert; `onSettled` делает финальный refetch для консистентности
+- **Проверка в логах после деплоя (обе строки должны присутствовать):**
+  ```
+  delete_task: task=XXX user=YYY — удалена (db=да)
+  unregister_task: task=XXX удалена из _tasks
+  ```
+- 3 файла: `services/task_registry.py`, `db/repository.py`, `frontend/src/components/HistoryList.tsx` + пересобранный `dist/`
+- Деплой подтверждён логами bothost 15:17–15:34: обе строки присутствуют, пользователь подтвердил корректное исчезновение задачи из списка
+
+---
 
 ### Sprint 7 — bothost supervisor, core/ рефакторинг, hotfix'ы, version-check (`2026-08-13`)
 

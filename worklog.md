@@ -2786,3 +2786,140 @@ Stage Summary:
 - Баннер скрыт (версии совпадут), версия-check система готова к работе
 - Алгоритм срабатывания: при следующем деплое с новым git commit → frontend получит новый bundle с новым VITE_APP_VERSION, backend перечитает build_version.txt → mismatch → баннер «🔄 Доступна новая версия [Обновить]» → пользователь жмёт → window.location.reload() → новый bundle → совпадение
 - Задача version-check-banner: ЗАКРЫТА, всё работает в production
+
+---
+Task ID: sprint8-task-list-improvements
+Agent: main (Super Z)
+Task: Реализация сворачивания списка задач + удаления задач пользователем через иконку 🗑.
+
+Work Log:
+- Прочитан контекст: при большом количестве задач список "Последние запросы" занимал весь экран и мешал работе с формой.
+- Изучены файлы: miniapp/frontend/src/components/HistoryList.tsx (существующий список без сворачивания), miniapp/frontend/src/lib/api.ts (API клиент), miniapp/backend/routers/dtp.py (роутер задач), miniapp/backend/db/repository.py (репозиторий).
+- Реализовано сворачивание списка (frontend-only):
+  * Кнопка-заголовок с шевроном ▾ и счётчиком задач
+  * Состояние collapsed сохраняется в localStorage (ключ history-list-collapsed)
+  * Анимация поворота шеврона через CSS transform: rotate(-90deg)
+  * readCollapsed/writeCollapsed хелперы с try/catch для случая недоступности localStorage
+- Реализовано удаление задач (full-stack):
+  * Backend: новый endpoint DELETE /api/dtp/tasks/{task_id} в dtp.py с pre-check ownership (404/403), логированием в access_log (152-ФЗ)
+  * Repository: новая функция delete_task(task_id, user_id) — удаляет из БД (с ownership-проверкой WHERE id=%s AND user_id=%s), in-memory кэша _TASKS_MEMORY + _TASKS_HEAVY_STATE, и файлов с диска (data/tasks/{task_id}/ + все файлы из task.files[].path)
+  * Frontend API: новый метод deleteTask(taskId) → request<{ok, task_id, deleted}>(..., {method: 'DELETE'})
+  * HistoryList.tsx: иконка 🗑 в правом верхнем углу карточки, showConfirm для подтверждения, useMutation для вызова, invalidateQueries для refetch
+- TypeScript: tsc --noEmit прошёл без ошибок.
+- Python: py_compile прошёл без ошибок.
+- Все 4 файла скопированы в /home/z/my-project/download/task-list-improvements/ + README с инструкцией по деплою.
+
+Stage Summary:
+- Реализованы 2 фичи: сворачивание списка (frontend-only) и удаление задач (full-stack).
+- Backend: DELETE endpoint + repository.delete_task с ownership-проверкой и 152-ФЗ логированием.
+- Frontend: 🗑 иконка с showConfirm, useMutation + invalidateQueries.
+- Все файлы валидны (tsc + py_compile).
+- Артефакт: /home/z/my-project/download/task-list-improvements/
+
+---
+Task ID: sprint8-dist-build-and-deploy-instructions
+Agent: main (Super Z)
+Task: Собрать dist/ через npm run build и предоставить готовые файлы для замены на сервере.
+
+Work Log:
+- Пользователь сообщил, что правки не сработали (старый UI без иконки корзины и кнопки сворачивания).
+- VLM-анализ скриншота подтверждил: в браузере старый UI, без иконки 🗑 и без кнопки сворачивания.
+- Выявлена причина: пользователь копировал исходники .tsx/.ts, но не пересобирал dist/. Vite-бандл не обновляется автоматически при изменении исходников — нужен npm run build.
+- Пользователь подтвердил: "Обычно я обновлял папку /dist вручную на Git".
+- Запущен bash build_frontend.sh (использует VITE_APP_VERSION + создаёт build_version.txt + .build_version + build_time.txt + .build_time + backend/BUILD_VERSION.txt + BUILD_TIME.txt).
+- Сборка успешна: 683 модуля трансформированы, размер бандла 584 KB (gzip 168 KB).
+- Проверены маркеры фикса в собранном бандле dist/assets/index-*.js: deleteTask, COLLAPSE_KEY, 🗑 — все присутствуют.
+- Все файлы (включая dist/, исходники и README) упакованы в zip для скачивания.
+
+Stage Summary:
+- Сборка dist/ выполнена через build_frontend.sh (с корректными version-маркерами).
+- VITE_APP_VERSION=ec67eb2 встроена в bundle, build_version.txt и backend/BUILD_VERSION.txt синхронизированы.
+- Пользователю передан zip с готовым к деплою dist/ + инструкцией по замене.
+
+---
+Task ID: sprint8-delete-task-bug-investigation
+Agent: main (Super Z)
+Task: Анализ бага — после подтверждения удаления задача становится полупрозрачной, затем список обновляется, но задача не пропадает — просто перемещается выше.
+
+Work Log:
+- Прочитаны логи bothost (api.err.log): видно, что delete_task успешно удаляет задачу из БД ("delete_task: task=... — удалена (db=да)"), но в UI задача остаётся.
+- Изучена цепочка вызовов:
+  * DELETE endpoint в dtp.py вызывает get_task_async(task_id) для pre-check ownership
+  * get_task_async() в task_registry.py при cache-miss загружает задачу из БД через load_task() и регистрирует в _tasks через _register_task()
+  * Затем вызывается repository.delete_task(task_id, user_id), который чистит БД + _TASKS_MEMORY + _TASKS_HEAVY_STATE + файлы на диске
+  * Фронтенд инвалидирует кэш react-query → GET /tasks → list_user_tasks() в task_registry.py
+- Найдена корневая причина: в коде существует ДВА отдельных in-memory кэша задач:
+  1. _TASKS_MEMORY в repository.py — чистился в delete_task ✓
+  2. _tasks (OrderedDict, LRU на 50 записей) в task_registry.py — НЕ чистился в delete_task ✗
+- Цепочка бага (подтверждена анализом list_user_tasks):
+  * DELETE endpoint → get_task_async → _register_task кладёт задачу в _tasks
+  * delete_task чистит БД + _TASKS_MEMORY, но НЕ _tasks
+  * list_user_tasks() (task_registry.py:412-451) берёт задачи из БД (удалённой там НЕТ) + задачи из _tasks (удалённая ЕСТЬ)
+  * Для задач "в памяти, но не в БД" срабатывает логика: "свежая, добавить в начало списка" → db_tasks.insert(0, t) → задача возвращается на вершину списка
+  * Именно поэтому пользователь видел "задача не пропадает, а перемещается выше" — она буквально вставлялась в начало списка
+
+Stage Summary:
+- Корневая причина: два in-memory кэша (_TASKS_MEMORY в repository + _tasks в task_registry), delete_task чистил только первый.
+- DELETE endpoint успешно удалял задачу из БД, но из-за pre-check через get_task_async задача попадала в _tasks и оставалась там.
+- list_user_tasks имеет логику "in-memory задача, которой нет в БД → свежая → вставить в начало списка", которая возвращала удалённую задачу на вершину списка.
+- Решение: добавить unregister_task(task_id, user_id) в task_registry.py и вызывать его из delete_task.
+
+---
+Task ID: sprint8-delete-task-fix-v2
+Agent: main (Super Z)
+Task: Фикс удаления задачи — задача не пропадала из списка, а перемещалась вверх.
+
+Work Log:
+- Реализован backend фикс:
+  * task_registry.py: добавлена функция unregister_task(task_id, user_id=None) — удаляет задачу из _tasks под _tasks_lock с проверкой user_id (защита от race condition: если задача уже вытеснена LRU и на её месте чужая — не трогаем), обновляет Prometheus gauge.
+  * repository.py: delete_task() теперь вызывает unregister_task через lazy import (шаг 3, после _TASKS_MEMORY cleanup).
+- Реализован frontend фикс:
+  * HistoryList.tsx: мутация удаления переписана с оптимистичным обновлением через onMutate/setQueryData.
+  * onMutate: отменяет исходящие refetch (cancelQueries), снимает снапшот кэша (getQueryData), убирает задачу из кэша через setQueryData → UI обновляется мгновенно.
+  * onError: восстанавливает кэш из снапшота, показывает showAlert.
+  * onSettled: финальный refetch для консистентности (включая задачи, которые могли добавиться параллельно).
+  * Использованы явные generic-типы useMutation<TData, TError, TVariables, TContext> для корректной типизации context.previousTasks.
+- TypeScript: tsc --noEmit прошёл без ошибок.
+- Python: py_compile repository.py task_registry.py — без ошибок.
+- Сборка: bash build_frontend.sh отработал, создан новый bundle index-Ba0FhQj5.js (старый был index-DsPSczsb.js).
+- Проверены маркеры в новом бандле: previousTasks (3), setQueryData (2), onMutate (1), cancelQueries (1), invalidateQueries (8) — все присутствуют.
+- Все файлы упакованы в /home/z/my-project/download/delete-task-fix/ (включая dist/, .py и .tsx исходники + README с инструкцией по деплою).
+- ZIP: /home/z/my-project/download/delete-task-fix.zip (275 KB).
+
+Stage Summary:
+- Корневая причина: два in-memory кэша (_TASKS_MEMORY в repository + _tasks в task_registry), delete_task чистил только первый.
+- Backend фикс (КРИТИЧНО): unregister_task в task_registry.py + вызов из delete_task.
+- Frontend фикс (UX): оптимистичное обновление через setQueryData для мгновенного исчезновения задачи.
+- Деплой: СНАЧАЛА бэкенд (repository.py + task_registry.py + restart api/worker), ПОТОМ dist/ (с hard reload браузера).
+- Проверка в логах: должны быть обе строки — "delete_task: ... — удалена (db=да)" И "unregister_task: ... удалена из _tasks".
+- Артефакт: /home/z/my-project/download/delete-task-fix.zip
+
+---
+Task ID: sprint8-delete-task-deploy-confirmation
+Agent: main (Super Z)
+Task: Подтверждение деплоя фикса удаления задач на bothost по логам пользователя (15:17–15:34).
+
+Work Log:
+- Прочитаны логи bothost от 2026-08-14 15:08:44 (старт supervisord) до 15:34:56.
+- Найдены ДВА успешных удаления задач:
+  * Задача 3e594ef2723b (15:17:13): unregister_task + delete_task — обе строки присутствуют.
+  * Задача 18ccb9d2ad15 (15:34:56): unregister_task + delete_task — обе строки присутствуют, после полного жизненного цикла задачи (fetch → parse → analytics → export → LLM summary → удаление).
+- Жизненный цикл задачи 18ccb9d2ad15 (Московская обл., 7 мес. 2026) — полностью здоров:
+  * 15:17:58: dispatcher запустил Celery-задачу
+  * 15:18:00–15:18:25: FETCHING (10→20%), загрузка 1757 текущих + 2012 предыдущих ДТП через web-fallback
+  * 15:18:26: GENERATING 80% — analytics built, Excel generation started
+  * 15:18:35: DONE 100% — 3 файла (cards 883 KB, participants 1641 KB, map 2143 KB)
+  * 15:18:36: Celery-task succeeded in 38.7s
+  * 15:18:49–15:18:54: Mini App восстановил задачу (cards + clusters + cameras из кэша)
+  * 15:22:14–15:22:18: пользователь открыл результаты, analytics пересчитан
+  * 15:22:18–15:23:26: LLM summary через GLM-4.7-Flash (68 сек, 4738 символов, cost=$0.0018)
+  * 15:34:56: пользователь удалил задачу — чисто и без ошибок
+- Замечены 2 некритичных предупреждения telegram_auth: 401 (15:32:42 и 15:32:50) — tg_init_data не передан (возможно, Mini App открыт вне Telegram или bothost-прокси стрипает заголовок).
+- Стандартное предупреждение Celery: SecurityWarning (running worker with superuser privileges) — нормально для bothost-окружения.
+
+Stage Summary:
+- Статус: фикс полностью сработал на bothost.
+- Оба лог-маркера (delete_task + unregister_task) присутствуют в обоих удалениях.
+- Пользователь подтвердил: "Да все успешно удаляется. Задача пропадает из списка."
+- Задача sprint8 (UX правки списка задач): ЗАКРЫТА, всё работает в production.
+- Замечание: 2 предупреждения tg_init_data — некритично, но если повторяется часто, стоит проверить конфигурацию bothost-прокси.
