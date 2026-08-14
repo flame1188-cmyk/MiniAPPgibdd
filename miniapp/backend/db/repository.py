@@ -579,6 +579,18 @@ async def delete_task(
         drop_heavy_state(task_id)
         deleted = True
 
+    # 3. Чистим task_registry._tasks (LRU-кэш, отдельный от _TASKS_MEMORY).
+    # Это критично: pre-check в роутере вызывает get_task_async(), который
+    # через _register_task() кладёт задачу в _tasks. Если её не убрать —
+    # list_user_tasks() добавит её обратно в список ("в памяти, но не в БД
+    # → свежая → вставить в начало").
+    try:
+        from ..services.task_registry import unregister_task
+        if unregister_task(task_id, user_id=user_id):
+            deleted = True
+    except Exception as exc:
+        logger.warning(f"delete_task({task_id}) unregister_task failed: {exc}")
+
     if deleted:
         logger.info(
             f"delete_task: task={task_id} user={user_id} — удалена "
