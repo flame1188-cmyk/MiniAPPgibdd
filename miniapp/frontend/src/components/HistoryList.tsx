@@ -10,7 +10,7 @@
  */
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api } from '@/lib/api'
+import { api, type TaskStatusResponse } from '@/lib/api'
 import { cn, statusLabel } from '@/lib/utils'
 import { haptic, showAlert, showConfirm } from '@/lib/telegram'
 
@@ -48,15 +48,54 @@ export function HistoryList({ onSelectTask }: HistoryListProps) {
   })
 
   // === Мутация удаления задачи ===
-  const deleteMutation = useMutation({
+  // Оптимистичное обновление: задача убирается из кэша сразу при клике,
+  // до получения ответа сервера. Если запрос упадёт — возвращаем обратно.
+  const deleteMutation = useMutation<
+    { ok: boolean; task_id: string; deleted: boolean },
+    Error,
+    string,
+    { previousTasks: TaskStatusResponse[] | undefined }
+  >({
     mutationFn: (taskId: string) => api.deleteTask(taskId),
+
+    onMutate: async (taskId: string) => {
+      // Отменяем исходящие refetch, чтобы они не перезаписали оптимистичное
+      // обновление.
+      await queryClient.cancelQueries({ queryKey: ['tasks'] })
+
+      // Снимок текущего кэша — для отката в onError.
+      const previousTasks = queryClient.getQueryData<TaskStatusResponse[]>(['tasks'])
+
+      // Оптимистично убираем задачу из кэша — UI обновится мгновенно.
+      if (previousTasks) {
+        queryClient.setQueryData<TaskStatusResponse[]>(
+          ['tasks'],
+          previousTasks.filter((t) => t.task_id !== taskId)
+        )
+      }
+
+      // Возвращаем контекст для onError (восстановление кэша).
+      return { previousTasks }
+    },
+
     onSuccess: () => {
       haptic('success')
-      queryClient.invalidateQueries({ queryKey: ['tasks'] })
     },
-    onError: async (err: Error) => {
+
+    onError: async (err: Error, _taskId: string, context) => {
       haptic('error')
+      // Восстанавливаем кэш — задача вернётся в список.
+      if (context?.previousTasks) {
+        queryClient.setQueryData(['tasks'], context.previousTasks)
+      }
       await showAlert(`Не удалось удалить задачу:\n${err.message}`)
+    },
+
+    // Финальный refetch в любом случае — чтобы получить актуальный список
+    // с сервера (включая задачи, которые могли добавиться параллельно, и
+    // чтобы убедиться, что оптимистичное удаление совпадает с реальностью).
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
     },
   })
 
