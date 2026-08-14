@@ -22,6 +22,61 @@ from .pipeline import ensure_cards, ensure_prev_cards
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# Sprint 7 / Phase C.4: прогресс очагов в Redis snapshot
+# ============================================================
+# Раньше прогресс писался ТОЛЬКО в task.clusters_state (in-memory Task-объект).
+# При polling от UI (GET /clusters) роутер берёт state из task.clusters_state,
+# но если задача была восстановлена из БД (cards_cache) или если
+# task_registry выгрузил её из LRU — state теряется, UI видит progress=0.
+#
+# Теперь дублируем прогресс в Redis snapshot (gibdd:task_state:{task_id}).
+# Это работает и в in-memory режиме (start_clusters_calculation), и при
+# future-переключении на Celery-путь (clusters_calc_task уже делает то же
+# самое через worker.tasks.clusters_tasks._update_clusters_state_in_snapshot).
+def _push_clusters_state_to_redis(task: Task) -> None:
+    """Синхронизирует clusters_state из task в Redis snapshot.
+
+    Делает best-effort попытку: при любой ошибке (Redis недоступен,
+    snapshot отсутствует) — тихо логирует и продолжает. Расчёт очагов
+    не должен падать из-за проблем с обновлением прогресса в Redis.
+    """
+    try:
+        from worker.task_state import load_task_state, save_task_state_dict
+
+        snapshot = load_task_state(task.id)
+        if snapshot is None:
+            # Snapshot ещё не создан (например, при ручном запуске расчёта
+            # до того, как pipeline успел записать начальный snapshot).
+            # В этом случае нет смысла создавать пустой — пропускаем.
+            return
+
+        state = task.clusters_state
+        redis_state: Dict[str, Any] = {
+            "status": state.status.value if hasattr(state.status, "value") else str(state.status),
+            "progress": state.progress,
+            "stage": state.stage or "",
+            "started_at": state.started_at.isoformat() if state.started_at else None,
+            "finished_at": state.finished_at.isoformat() if state.finished_at else None,
+            "error": state.error,
+        }
+        if state.result is not None:
+            # result может быть тяжёлым (сотни KB), но snapshot и так хранит
+            # его при cache hit / Celery-пути. Сохраняем, чтобы при polling
+            # от UI можно было вернуть результат даже если task был выгружен
+            # из in-memory LRU.
+            redis_state["result"] = state.result
+
+        snapshot["clusters_state"] = redis_state
+        snapshot["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        save_task_state_dict(task.id, snapshot)
+    except Exception as exc:
+        logger.debug(
+            f"Task {task.id}: _push_clusters_state_to_redis failed: {exc}"
+        )
+
+
 async def start_clusters_calculation(task: Task) -> None:
     """
     Асинхронный расчёт очагов концентрации ДТП.
@@ -30,6 +85,10 @@ async def start_clusters_calculation(task: Task) -> None:
     кластеризация + динамика vs прошлый год.
 
     Результат сохраняется в task.clusters_state.result.
+
+    Sprint 7 / Phase C.4: прогресс дублируется в Redis snapshot через
+    _push_clusters_state_to_redis(), чтобы UI видел его даже при
+    восстановлении task из БД или выгрузке из in-memory LRU.
     """
     state = task.clusters_state
     state.status = AnalysisStatus.RUNNING
@@ -38,6 +97,7 @@ async def start_clusters_calculation(task: Task) -> None:
     state.started_at = datetime.now(timezone.utc)
     state.error = None
     state.result = None
+    _push_clusters_state_to_redis(task)  # Phase C.4: UI видит progress=5
 
     try:
         # Sprint 3.1: восстанавливаем task.cards из cards_cache, если
@@ -110,6 +170,8 @@ async def start_clusters_calculation(task: Task) -> None:
                     if cached_raw_preclusters is not None:
                         task.raw_preclusters = cached_raw_preclusters
 
+                    _push_clusters_state_to_redis(task)  # Phase C.4: cache hit → done
+
                     logger.info(
                         f"Task {task.id}: clusters loaded from cache — "
                         f"{cached_result.get('total_clusters', 0)} очагов, "
@@ -128,6 +190,7 @@ async def start_clusters_calculation(task: Task) -> None:
         # Загружаем прошлый год (если ещё нет)
         state.progress = 10
         state.stage = "Загрузка данных за прошлый год..."
+        _push_clusters_state_to_redis(task)  # Phase C.4: progress=10
         if not task.prev_cards_loaded:
             await ensure_prev_cards(task)
         prev_cards = task.prev_cards or []
@@ -135,9 +198,11 @@ async def start_clusters_calculation(task: Task) -> None:
         async def progress_cb(text: str) -> None:
             state.stage = text
             state.progress = min(85, state.progress + 5)
+            _push_clusters_state_to_redis(task)  # Phase C.4: incremental
 
         state.progress = 20
         state.stage = "Загрузка границ НП из OpenStreetMap..."
+        _push_clusters_state_to_redis(task)  # Phase C.4: progress=20 (OSM)
 
         clusters, _saved_polys, preclusters_raw = await conc_module.calculate_concentration_dynamics(
             current_cards=task.cards,
@@ -148,6 +213,7 @@ async def start_clusters_calculation(task: Task) -> None:
 
         state.progress = 90
         state.stage = "Обогащение камерами..."
+        _push_clusters_state_to_redis(task)  # Phase C.4: progress=90
 
         # Обогащение камерами (если есть в кэше)
         try:
@@ -187,6 +253,7 @@ async def start_clusters_calculation(task: Task) -> None:
 
         state.progress = 95
         state.stage = "Формирование результата..."
+        _push_clusters_state_to_redis(task)  # Phase C.4: progress=95
 
         # Сериализуем очаги для JSON-ответа
         clusters_data = [_serialize_cluster(c) for c in clusters]
@@ -271,6 +338,7 @@ async def start_clusters_calculation(task: Task) -> None:
         state.progress = 100
         state.stage = "Готово"
         state.finished_at = datetime.now(timezone.utc)
+        _push_clusters_state_to_redis(task)  # Phase C.4: done
 
         # === Этап 4: сохраняем result + raw_clusters в кэш очагов ===
         # Ключ: (reg_code, current_dat_hash, prev_dat_hash).
@@ -318,6 +386,7 @@ async def start_clusters_calculation(task: Task) -> None:
         state.error = str(exc)
         state.stage = "Ошибка"
         state.finished_at = datetime.now(timezone.utc)
+        _push_clusters_state_to_redis(task)  # Phase C.4: failed → UI видит ошибку
         # Персистим failed-статус
         try:
             from ..db.repository import save_task
