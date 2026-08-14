@@ -72,6 +72,24 @@ async def _fetch_cards_for_period(
         )
         return cards, errors
 
+    # --- 🆕 L2.5: Постоянный архив (gibdd_cards) ---
+    # Если запрошенные месяцы уже загружены в архив — отдаём мгновенно,
+    # без обращения к stat.gibdd.ru.
+    try:
+        from miniapp.backend.db.archive import get_cards_from_archive
+        archived = await get_cards_from_archive(reg_code, dat_list)
+        if archived is not None:
+            logger.info(
+                f"  {log_prefix}: из архива gibdd_cards "
+                f"({len(archived)} ДТП, {len(dat_list)} мес)"
+            )
+            # Сохраняем в кэш для следующих запросов (TTL 7 дней)
+            if cache_result and archived:
+                await data_cache_put_async(reg_code, dat_list, archived, [])
+            return archived, []
+    except Exception as e:
+        logger.warning(f"  {log_prefix}: archive lookup failed: {e}, продолжаем через API")
+
     cards: list[dict] = []
     errors: list[str] = []
 

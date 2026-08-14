@@ -387,3 +387,193 @@ CREATE TRIGGER trg_llm_sessions_updated_at
     BEFORE UPDATE ON llm_sessions
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+-- ─────────────────────────────────────────────────────────────────────────
+-- МИГРАЦИЯ: Архив данных ГИБДД (нормализованные таблицы)
+-- Дата: 2026-08-14
+-- Назначение: Постоянное хранение карточек ДТП, загруженных из API ГИБДД.
+--              Заменяет зависимость от dtp_cards_cache (TTL=7 дней) на
+--              постоянный архив для исторических периодов.
+-- Объём: ~6-7 млн ДТП × ~600 байт/карточка = ~2 GB нормализованных данных
+-- ─────────────────────────────────────────────────────────────────────────
+
+-- Примечание: PostGIS в тарифе bothost не установлен.
+-- Для пространственных запросов по координатам используем обычные B-tree
+-- индексы на coord_w / coord_l. Для карты ДТП этого достаточно.
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 1. КАРТОЧКИ ДТП (1 строка = 1 ДТП, уникальный kart_id)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS gibdd_cards (
+    id              BIGSERIAL    PRIMARY KEY,
+    kart_id         VARCHAR(32)  NOT NULL,            -- empt_number (уникальный ID ДТП)
+    reg_code        VARCHAR(16)  NOT NULL,            -- "1146" Московская обл.
+    dat_period      VARCHAR(8)   NOT NULL,            -- "7.2026" (месяц публикации)
+    date_dtp        DATE         NOT NULL,            -- дата ДТП
+    time            TIME,
+    coord_w         NUMERIC(9,6),                     -- широта
+    coord_l         NUMERIC(9,6),                     -- долгота
+    dtpv            TEXT,                              -- вид ДТП
+    k_ts            SMALLINT,                          -- кол-во ТС
+    k_uch           SMALLINT,                          -- кол-во участников
+    pog             SMALLINT      NOT NULL DEFAULT 0, -- погибших
+    ran             SMALLINT      NOT NULL DEFAULT 0, -- раненых
+    s_dtp           TEXT,                              -- код схемы
+    district        TEXT,                              -- район
+    house           TEXT,
+    km              TEXT,                              -- километр
+    m               TEXT,                              -- метр
+    np              TEXT,                              -- населённый пункт
+    street          TEXT,                              -- улица
+    dor             TEXT,                              -- наименование дороги
+    dor_z           TEXT,                              -- значение дороги
+    dor_k           TEXT,                              -- категория дороги
+    k_ul            TEXT,                              -- категория улицы
+    -- dor_usl (дорожные условия, 8 полей)
+    s_pch           TEXT,                              -- состояние проезжей части
+    osv             TEXT,                              -- освещение
+    chom            TEXT,                              -- изменения в режиме движения
+    sdor            JSONB,                             -- дорожные условия (массив)
+    obj_dtp         JSONB,                             -- объекты УДС на месте
+    ndu             JSONB,                             -- недостатки содержания
+    factor          JSONB,                             -- факторы режима движения
+    spog             JSONB,                             -- состояние погоды
+    -- служебные поля
+    raw_payload     JSONB,                             -- полная сырая карточка (аудит/миграции)
+    source          VARCHAR(16)  NOT NULL DEFAULT 'api', -- 'api' | 'web_fallback'
+    fetched_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    UNIQUE (kart_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cards_reg_date
+    ON gibdd_cards (reg_code, date_dtp);
+
+CREATE INDEX IF NOT EXISTS idx_cards_dat_period
+    ON gibdd_cards (dat_period);
+
+CREATE INDEX IF NOT EXISTS idx_cards_reg_dat
+    ON gibdd_cards (reg_code, dat_period);
+
+CREATE INDEX IF NOT EXISTS idx_cards_dtpv
+    ON gibdd_cards (dtpv);
+
+CREATE INDEX IF NOT EXISTS idx_cards_pog
+    ON gibdd_cards (pog) WHERE pog > 0;
+
+CREATE INDEX IF NOT EXISTS idx_cards_ran
+    ON gibdd_cards (ran) WHERE ran > 0;
+
+-- GIST-индекс по координатам требует PostGIS (недоступен на bothost).
+-- Используем обычные B-tree индексы по широте и долготе.
+CREATE INDEX IF NOT EXISTS idx_cards_coord_w
+    ON gibdd_cards (coord_w);
+
+CREATE INDEX IF NOT EXISTS idx_cards_coord_l
+    ON gibdd_cards (coord_l);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 2. ТРАНСПОРТНЫЕ СРЕДСТВА (1 строка = 1 ТС в ДТП)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS gibdd_vehicles (
+    id              BIGSERIAL    PRIMARY KEY,
+    card_id         BIGINT       NOT NULL REFERENCES gibdd_cards(id) ON DELETE CASCADE,
+    n_ts            SMALLINT,                          -- порядковый номер ТС в ДТП
+    ts_s            TEXT,                              -- остался/скрылся
+    t_ts            TEXT,                              -- тип ТС
+    m_ts            TEXT,                              -- модель
+    marka_ts        TEXT,                              -- марка
+    color           TEXT,                              -- цвет
+    m_pov           TEXT,                              -- места повреждения
+    t_n             TEXT,                              -- технические неисправности
+    r_rul           TEXT,                              -- расположение руля / тип привода
+    g_v             SMALLINT,                          -- год выпуска
+    o_pf            TEXT                               -- форма собственности
+);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_card
+    ON gibdd_vehicles (card_id);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_marka
+    ON gibdd_vehicles (marka_ts);
+
+CREATE INDEX IF NOT EXISTS idx_vehicles_type
+    ON gibdd_vehicles (t_ts);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 3. УЧАСТНИКИ ДТП (1 строка = 1 участник: в ТС или без ТС)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS gibdd_participants (
+    id              BIGSERIAL    PRIMARY KEY,
+    card_id         BIGINT       NOT NULL REFERENCES gibdd_cards(id) ON DELETE CASCADE,
+    vehicle_id      BIGINT       REFERENCES gibdd_vehicles(id) ON DELETE CASCADE,
+    -- NULL для пешеходов / велосипедистов без ТС
+    n_uch           SMALLINT,                          -- порядковый номер участника
+    kt_uch          TEXT,                              -- Водитель / Пассажир / Пешеход
+    s_sm            TEXT,                              -- скрылся ли с места ДТП
+    pol             VARCHAR(10),                       -- Пол
+    s_t             TEXT,                              -- степень тяжести последствий
+    npdd            JSONB,                             -- непосредственные нарушения ПДД
+    sop_npdd        JSONB,                             -- сопутствующие нарушения ПДД
+    safety_belt     TEXT,                              -- пристёгнут (для водителя/пассажира)
+    s_seat_group    TEXT,                              -- тип детского удерживающего
+    alco            VARCHAR(2),                        -- код трезвости ("00"=трезв)
+    v_st            SMALLINT                           -- водительский стаж (99 = нет данных)
+);
+
+CREATE INDEX IF NOT EXISTS idx_participants_card
+    ON gibdd_participants (card_id);
+
+CREATE INDEX IF NOT EXISTS idx_participants_vehicle
+    ON gibdd_participants (vehicle_id);
+
+CREATE INDEX IF NOT EXISTS idx_participants_kt
+    ON gibdd_participants (kt_uch);
+
+CREATE INDEX IF NOT EXISTS idx_participants_alco
+    ON gibdd_participants (alco) WHERE alco != '00';
+
+CREATE INDEX IF NOT EXISTS idx_participants_pol
+    ON gibdd_participants (pol);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 4. ЖУРНАЛ ETL (resumability — докачка при сбое)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS etl_log (
+    id              BIGSERIAL    PRIMARY KEY,
+    reg_code        VARCHAR(16)  NOT NULL,
+    dat_period      VARCHAR(8)   NOT NULL,
+    status          VARCHAR(16)  NOT NULL,             -- 'pending'|'fetching'|'done'|'error'
+    cards_count     INT          NOT NULL DEFAULT 0,
+    error           TEXT,
+    attempts        SMALLINT     NOT NULL DEFAULT 0,
+    fetched_at      TIMESTAMPTZ,
+    UNIQUE (reg_code, dat_period)
+);
+
+CREATE INDEX IF NOT EXISTS idx_etl_log_status
+    ON etl_log (status);
+
+CREATE INDEX IF NOT EXISTS idx_etl_log_dat
+    ON etl_log (dat_period);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 5. СПРАВОЧНИК РЕГИОНОВ (актуальный, из API ГИБДД)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS gibdd_regions (
+    reg_code        VARCHAR(16)  PRIMARY KEY,
+    reg_name        TEXT         NOT NULL,
+    start_date      DATE,
+    finish_date     DATE,
+    is_active       BOOLEAN      NOT NULL DEFAULT TRUE,
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 6. СПРАВОЧНИК ПОКАЗАТЕЛЕЙ (для будущих аналитик по pok)
+-- ─────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS gibdd_indicators (
+    pok_code        VARCHAR(8)   PRIMARY KEY,
+    pok_name        TEXT         NOT NULL,
+    start_date      DATE,
+    finish_date     DATE,
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
