@@ -273,6 +273,29 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Sprint 5 recovery failed: {exc}")
 
+    # === Phase C.3 hotfix: восстановление "ghost"-задач (stale pending) ===
+    # После фикса _TaskStub AttributeError старые pre-fix задачи оказались
+    # в подвешенном состоянии: status='pending', progress=0 в БД, но в Redis
+    # snapshot отсутствует (воркер не смог сохранить из-за бага). Такие
+    # задачи вечно висят в UI как "Ожидание / 0%". Эта функция:
+    #   1. Если Redis snapshot есть с status=done → переносит в БД как done
+    #   2. Иначе если файлы есть на диске → восстанавливает как done
+    #   3. Иначе помечает как failed ("прервано рестартом сервера")
+    try:
+        from miniapp.backend.db.repository import (
+            recover_stale_pending_tasks,
+            _STALE_PENDING_MINUTES,
+        )
+        recovered_stale = await recover_stale_pending_tasks()
+        if recovered_stale > 0:
+            logger.info(
+                f"Phase C.3 stale-pending recovery: {recovered_stale} "
+                f"ghost-задач восстановлено (stale pending > "
+                f"{_STALE_PENDING_MINUTES} мин)"
+            )
+    except Exception as exc:
+        logger.warning(f"Phase C.3 stale-pending recovery failed: {exc}")
+
     # === Фоновая задача: периодическая очистка старых задач ===
     # In-memory хранилище _tasks растёт без ограничений — каждая задача
     # держит мегабайты карточек ДТП, prev_cards, raw_clusters и т.д.
