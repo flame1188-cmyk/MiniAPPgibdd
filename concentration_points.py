@@ -839,10 +839,23 @@ OVERPASS_HEADERS = {
 }
 
 # Rate limiting для Overpass API
-OVERPASS_MIN_INTERVAL = 10.0  # мин. интервал между запросами (сек)
+# Phase C.4: уменьшено с 10.0 до 5.0 сек.
+# При недоступности Overpass (504 на всех зеркалах) прежние 10 сек sleep
+# означали 4 зеркала × 10 сек = 40 сек бесполезного ожидания. 5 сек всё
+# ещё достаточно для соблюдения rate limit (Overpass рекомендует ≥5 сек
+# между запросами от одного User-Agent).
+OVERPASS_MIN_INTERVAL = 5.0  # мин. интервал между запросами (сек)
 OVERPASS_429_WAIT = 30.0     # базовое ожидание при 429 (сек)
 _overpass_client: httpx.AsyncClient | None = None  # общий HTTP-клиент
 _overpass_last_request_time: float = 0.0  # время последнего запроса
+
+# Phase C.4: таймаут на один запрос к Overpass.
+# Раньше было 60 сек (унаследовано из дефолта httpx). При 504 (gateway
+# timeout у самого Overpass) это не помогает — 504 приходит за ~300 мс.
+# Но при сетевых лагах 60 сек слишком долго: 4 зеркала × 60 сек = 4 мин
+# бесполезного ожидания. 30 сек — баланс между «реальный медленный, но
+# отвечающий Overpass» и быстрым failover.
+OVERPASS_REQUEST_TIMEOUT = 30.0
 
 PLACE_FILTER = "city|town|village|hamlet"
 
@@ -1151,7 +1164,7 @@ def _get_overpass_client() -> httpx.AsyncClient:
         _overpass_client = httpx.AsyncClient(
             verify=False,
             headers=OVERPASS_HEADERS,
-            timeout=60.0,
+            timeout=OVERPASS_REQUEST_TIMEOUT,  # Phase C.4: 30 сек вместо 60
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
     return _overpass_client
@@ -1169,7 +1182,7 @@ async def _overpass_request(
     url: str,
     query: str,
     mode: str,
-) -> list[dict] | None:
+) -> tuple[list[dict] | None, int | None]:
     """
     Выполняет единичный запрос к Overpass API с rate limiting.
 
@@ -1177,6 +1190,16 @@ async def _overpass_request(
     - Между любыми запросами — мин. OVERPASS_MIN_INTERVAL секунд
     - При HTTP 429 — пауза Retry-After или OVERPASS_429_WAIT
     - Использует общий httpx.AsyncClient (connection pooling)
+
+    Phase C.4: возвращает tuple (elements, status_code).
+    - elements = list[dict] | None: распарсенные OSM elements (или None при ошибке)
+    - status_code = int | None: HTTP-статус ответа (для диагностики failover).
+      None — если сетевая ошибка / таймаут (не HTTP-ответ).
+
+    Это позволяет _fetch_overpass_parallel отличать:
+    - 504 от всех зеркал → сразу поднять RuntimeError (быстрый failover)
+    - 429 от всех зеркал → подождать и retry
+    - None (сетевая ошибка) → попробовать следующее зеркало
     """
     global _overpass_last_request_time
 
@@ -1195,7 +1218,7 @@ async def _overpass_request(
         _overpass_last_request_time = time.time()
 
         client = _get_overpass_client()
-        resp = await client.post(url, data={"data": query}, timeout=60.0)
+        resp = await client.post(url, data={"data": query}, timeout=OVERPASS_REQUEST_TIMEOUT)
 
         if resp.status_code == 429:
             # Парсим Retry-After
@@ -1214,7 +1237,16 @@ async def _overpass_request(
             await asyncio.sleep(wait_sec)
             # Повторный запрос после ожидания
             _overpass_last_request_time = time.time()
-            resp = await client.post(url, data={"data": query}, timeout=60.0)
+            resp = await client.post(url, data={"data": query}, timeout=OVERPASS_REQUEST_TIMEOUT)
+
+        if resp.status_code >= 400:
+            # Любая HTTP-ошибка (включая 504, 502, 503, 429) — логируем
+            # и возвращаем статус для failover-логики.
+            logger.warning(
+                f"Overpass API ({url}, mode={mode}): "
+                f"HTTP {resp.status_code}"
+            )
+            return None, resp.status_code
 
         resp.raise_for_status()
         data = resp.json()
@@ -1224,19 +1256,20 @@ async def _overpass_request(
             f"Overpass API ({url}): получено "
             f"{len(elements)} элементов (mode={mode})"
         )
-        return elements
+        return elements, 200
 
     except httpx.HTTPStatusError as e:
         logger.warning(
             f"Overpass API ({url}, mode={mode}): "
             f"HTTP {e.response.status_code}"
         )
-        return None
+        return None, e.response.status_code
     except Exception as e:
+        # Сетевая ошибка / таймаут / парсинг JSON — нет HTTP-статуса.
         logger.warning(
             f"Overpass API ({url}, mode={mode}): {e}"
         )
-        return None
+        return None, None
 
 
 async def _fetch_overpass_parallel(
@@ -1249,9 +1282,20 @@ async def _fetch_overpass_parallel(
     Последовательный запрос к зеркалам Overpass API с rate limiting.
 
     Стратегия:
-    1. Последовательно пробуем все зеркала — out geom (2 прохода)
+    1. Последовательно пробуем все зеркала — out geom (1 проход)
+       Phase C.4: раньше было 2 прохода, но если все зеркала дали 504/429,
+       второй проход бесполезен — Overpass лежит глобально.
     2. Fallback: последовательно — out bb на всех зеркалах
-    3. Rate limiter обеспечивает мин. 10с между запросами
+       (только если geom вернул EmptyElements, а не 504 — иначе нет смысла)
+    3. Rate limiter обеспечивает мин. 5 сек между запросами
+
+    Phase C.4: БЫСТРЫЙ FAILOVER при 504/502/503
+    - Если ВСЕ зеркала на первом проходе вернули 5xx (gateway errors) —
+      поднимаем RuntimeError. Раньше цикл шёл дальше: второй проход +
+      bb-fallback = ~30 сек бесполезного ожидания. Теперь fail-fast.
+    - 429 (rate limit) НЕ считается 5xx — для него остаётся обычный путь.
+    - Сетевые ошибки (None status) тоже идут обычным путём — возможно,
+      следующее зеркало доступно.
     """
     pf = place_filter or PLACE_FILTER
     geom_query = (
@@ -1272,32 +1316,52 @@ async def _fetch_overpass_parallel(
         "out bb;\n"
     )
 
-    # --- Последовательно пробуем зеркала: сначала geom, потом bb ---
-    # Сначала geom на всех зеркалах
-    for attempt in range(1, 3):  # максимум 2 прохода по всем зеркалам
-        for url in OVERPASS_URLS:
-            elements = await _overpass_request(url, geom_query, "geom")
-            if elements is not None:
-                polygons, is_bbox = _parse_overpass_elements(elements)
-                if polygons and not is_bbox:
-                    logger.info(
-                        f"Тайл {tile_idx + 1}/{total_tiles}: "
-                        f"{len(polygons)} полигонов (out geom"
-                        f"{f', попытка {attempt}' if attempt > 1 else ''})"
-                    )
-                    _save_cache(bbox_str, elements)
-                    return elements
+    # --- Сбор статистики по первому проходу ---
+    # Track HTTP-статусы для решения: продолжать ли с bb-fallback или падать.
+    first_pass_5xx_count = 0
+    first_pass_network_errors = 0
+    first_pass_total = 0
 
-        if attempt == 1:
-            logger.info(
-                f"Тайл {tile_idx + 1}/{total_tiles}: "
-                f"geom не удался, повторная попытка через 10 сек..."
-            )
-            await asyncio.sleep(10)
+    # --- Последовательно пробуем зеркала: geom (1 проход) ---
+    # Phase C.4: убран второй проход — при 504 на всех зеркалах он бесполезен.
+    for url in OVERPASS_URLS:
+        elements, status_code = await _overpass_request(url, geom_query, "geom")
+        first_pass_total += 1
+
+        if status_code is not None and 500 <= status_code < 600:
+            first_pass_5xx_count += 1
+        elif status_code is None:
+            first_pass_network_errors += 1
+
+        if elements is not None:
+            polygons, is_bbox = _parse_overpass_elements(elements)
+            if polygons and not is_bbox:
+                logger.info(
+                    f"Тайл {tile_idx + 1}/{total_tiles}: "
+                    f"{len(polygons)} полигонов (out geom)"
+                )
+                _save_cache(bbox_str, elements)
+                return elements
+
+    # --- Phase C.4: быстрый failover при 5xx на всех зеркалах ---
+    # Если все зеркала вернули 5xx (504/502/503) — Overpass лежит глобально,
+    # нет смысла делать bb-fallback или второй проход. Падаем с понятной ошибкой.
+    if first_pass_5xx_count == first_pass_total and first_pass_total > 0:
+        logger.error(
+            f"Тайл {tile_idx + 1}/{total_tiles}: все {first_pass_total} зеркал "
+            f"Overpass вернули 5xx — сервис недоступен глобально"
+        )
+        raise RuntimeError(
+            "Сервис границ OpenStreetMap (Overpass API) временно недоступен — "
+            "HTTP 5xx на всех зеркалах. Попробуйте пересчитать очаги через "
+            "несколько минут."
+        )
 
     # --- Fallback: out bb на всех зеркалах ---
+    # Делается только если geom НЕ вернул 5xx на всех зеркалах (например,
+    # были сетевые ошибки или 429 — тогда bb может помочь).
     for url in OVERPASS_URLS:
-        elements = await _overpass_request(url, bb_query, "bb")
+        elements, _status = await _overpass_request(url, bb_query, "bb")
         if elements is not None:
             polygons, is_bbox = _parse_overpass_elements(elements)
             if polygons:
@@ -1309,7 +1373,9 @@ async def _fetch_overpass_parallel(
                 return elements
 
     logger.warning(
-        f"Тайл {tile_idx + 1}/{total_tiles}: все зеркала недоступны"
+        f"Тайл {tile_idx + 1}/{total_tiles}: все зеркала недоступны "
+        f"(5xx={first_pass_5xx_count}, network={first_pass_network_errors}, "
+        f"total={first_pass_total})"
     )
     return None
 
