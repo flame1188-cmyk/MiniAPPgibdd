@@ -462,6 +462,51 @@ def _touch_task_lru(task_id: str) -> None:
             _tasks.move_to_end(task_id)
 
 
+def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
+    """Удаляет задачу из in-memory LRU-кэша _tasks.
+
+    Используется repository.delete_task() — после удаления задачи из БД
+    нужно также убрать её из _tasks, иначе list_user_tasks() добавит
+    её обратно в список (т.к. она есть в памяти, но уже нет в БД —
+    сработает логика "in-memory задача, которой нет в БД → свежая,
+    добавить в начало списка").
+
+    Args:
+        task_id: id задачи для удаления из кэша.
+        user_id: если передан — задача удаляется только если её user_id
+            совпадает. Это защита от race condition: если задача уже
+            вытеснена из кэша и на её место встала другая (с другим
+            user_id), мы не должны удалить чужую задачу. Если None —
+            удаляем без проверки (для cleanup-сценариев).
+
+    Returns:
+        True если задача была в кэше и удалена, False если её там не было
+        или user_id не совпал.
+    """
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+        if task is None:
+            return False
+        if user_id is not None and task.user_id != user_id:
+            # Race condition: задача уже вытеснена/перезаписана — не трогаем.
+            logger.warning(
+                f"unregister_task({task_id}): user_id mismatch "
+                f"(expected={user_id}, actual={task.user_id}) — пропускаем"
+            )
+            return False
+        _tasks.pop(task_id, None)
+
+    # Обновляем Prometheus gauge
+    try:
+        from ..middleware.metrics import update_tasks_in_memory
+        update_tasks_in_memory(len(_tasks))
+    except Exception:
+        pass
+
+    logger.info(f"unregister_task: task={task_id} удалена из _tasks")
+    return True
+
+
 def _now_utc() -> datetime:
     """Хелпер для общей временной метки (используется в нескольких модулях)."""
     return datetime.now(timezone.utc)
