@@ -289,7 +289,18 @@ async def list_user_tasks_from_db(
     """
     Возвращает последние N задач пользователя (из БД).
     Если БД недоступна — fallback на in-memory.
+
+    Phase C.3 hotfix: перед SELECT лениво вызывает
+    _maybe_recover_stale_pending_tasks() (TTL 60 сек) — это помечает
+    "ghost"-задачи (stale pending) как failed/done, чтобы пользователь
+    увидел cleanup в списке без ожидания рестарта сервера.
     """
+    # Phase C.3 hotfix: lazy cleanup ghost-задач (TTL-protected)
+    try:
+        await _maybe_recover_stale_pending_tasks()
+    except Exception as exc:
+        logger.debug(f"list_user_tasks_from_db: stale recovery skipped: {exc}")
+
     if not is_db_ready():
         # In-memory fallback
         user_tasks = [
@@ -679,6 +690,485 @@ async def recover_incomplete_tasks() -> int:
         logger.warning(f"Sprint 5 recovery failed: {exc}")
 
     return recovered_count
+
+
+# ====================================================================
+# Phase C.3 hotfix: восстановление "ghost"-задач (stale pending)
+# ====================================================================
+# После фикса _TaskStub AttributeError (предыдущая итерация Phase C.3)
+# старые pre-fix задачи оказались в подвешенном состоянии:
+#   - DB: status='pending', progress=0, files=[]
+#   - Redis: snapshot отсутствует (воркер не смог сохранить из-за _TaskStub)
+#   - in-memory _tasks: пусто (сброшено при redeploy)
+#
+# Существующая recover_incomplete_tasks() НЕ ловит их — она ищет только
+# fetching/parsing/analytics/generating/running, а pending считается
+# легитимным начальным состоянием (задача только что создана, ещё в очереди).
+#
+# Эта функция определяет "stale pending" как:
+#   - status='pending' AND progress=0
+#   - created_at < NOW() - INTERVAL 'N minutes'  (N = GIBDD_STALE_PENDING_MINUTES, по умолч. 15)
+#
+# Для каждой такой задачи пытается восстановить реальное состояние:
+#   1. Проверяем Redis snapshot — если есть с status='done', переносим
+#      финальные поля (status, progress, files, total_*, analytics) в БД.
+#      Это случай, когда воркер УСПЕШНО выполнил pipeline, но БД не была
+#      обновлена (Celery-воркер не пишет в БД напрямую — только в Redis).
+#   2. Если Redis snapshot отсутствует или не 'done' — проверяем диск
+#      на наличие файлов (data/tasks/{task_id}/dtp_cards_*.xlsx).
+#      Если файлы есть — pipeline фактически завершился, восстанавливаем
+#      как done с метаданными файлов, найденными на диске.
+#   3. Если ни Redis, ни диск не дают данных — помечаем как failed с
+#      понятным сообщением "Задача прервана (перезапуск сервера во время
+#      выполнения)".
+#
+# Вызывается:
+#   - При старте сервера (main.py, после recover_incomplete_tasks)
+#   - Lazily в list_user_tasks_from_db (через TTL-кэш 60 сек) — чтобы
+#     пользователь увидел cleanup без ожидания рестарта
+# ====================================================================
+
+# Порог staleness в минутах (env-configurable для тонкой настройки).
+import os as _os
+try:
+    _STALE_PENDING_MINUTES = int(
+        _os.environ.get("GIBDD_STALE_PENDING_MINUTES", "15")
+    )
+    if _STALE_PENDING_MINUTES < 1:
+        _STALE_PENDING_MINUTES = 15
+except Exception:
+    _STALE_PENDING_MINUTES = 15
+
+# TTL для lazy-вызова в list_user_tasks_from_db — чтобы не дёргать
+# recover_stale_pending_tasks() на каждый GET /tasks.
+_STALE_RECOVERY_TTL_SECONDS = 60
+_last_stale_recovery_at: Optional[datetime] = None
+
+
+def _find_task_files_on_disk(task_id: str) -> List[Dict[str, Any]]:
+    """Сканирует data/tasks/{task_id}/ на наличие сгенерированных файлов.
+
+    Возвращает список метаданных файлов в формате, совместимом с
+    task.files (для записи в БД). Если директория не существует или
+    пуста — возвращает пустой список.
+
+    Файлы ищутся по glob-шаблонам:
+      - dtp_cards_*.xlsx  → type=dtp_cards
+      - dtp_uch_*.xlsx    → type=dtp_participants
+      - dtp_map_*.html    → type=map_html
+    """
+    try:
+        from ..services._imports import _PROJECT_ROOT
+    except Exception:
+        return []
+
+    task_dir = _PROJECT_ROOT / "data" / "tasks" / task_id
+    if not task_dir.is_dir():
+        return []
+
+    files_meta: List[Dict[str, Any]] = []
+    mime_map = {
+        "dtp_cards": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "dtp_participants": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "map_html": "text/html",
+    }
+
+    patterns = [
+        ("dtp_cards", "dtp_cards_*.xlsx"),
+        ("dtp_participants", "dtp_uch_*.xlsx"),
+        ("map_html", "dtp_map_*.html"),
+    ]
+
+    for ftype, pattern in patterns:
+        matches = sorted(task_dir.glob(pattern))
+        if not matches:
+            continue
+        # Берём первый (на случай дубликатов — маловероятно, но безопасно)
+        path = matches[0]
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size == 0:
+            continue  # пустой файл — игнорируем
+        files_meta.append({
+            "type": ftype,
+            "filename": path.name,
+            "path": str(path),
+            "size_bytes": size,
+            "mime": mime_map.get(ftype, "application/octet-stream"),
+        })
+
+    return files_meta
+
+
+async def recover_stale_pending_tasks() -> int:
+    """Помечает "stale pending" ghost-задачи как failed или done.
+
+    См. подробное описание выше (_STALE_PENDING_MINUTES, логика
+    Redis-snapshot → disk-files → failed fallback).
+
+    Returns:
+        Количество задач, для которых было изменено состояние в БД.
+    """
+    global _last_stale_recovery_at
+    _last_stale_recovery_at = datetime.now(timezone.utc)
+
+    if not is_db_ready():
+        return 0
+    pool = get_pool()
+    if pool is None:
+        return 0
+
+    recovered_count = 0
+    try:
+        async with pool.connection() as conn:
+            # Находим все stale pending задачи
+            cur = await conn.execute(
+                """
+                SELECT id, status, progress, created_at
+                FROM tasks
+                WHERE status = 'pending'
+                  AND progress = 0
+                  AND created_at < NOW() - (%s || ' minutes')::interval
+                """,
+                params=(_STALE_PENDING_MINUTES,),
+                prepare=False,
+            )
+            rows = await cur.fetchall()
+
+            if not rows:
+                return 0
+
+            # Логируем обнаруженные ghost-задачи
+            logger.info(
+                f"recover_stale_pending: обнаружено {len(rows)} stale pending "
+                f"задач (старше {_STALE_PENDING_MINUTES} мин) — восстановление"
+            )
+
+            # Lazy import worker.task_state (может быть недоступен в тестах)
+            load_task_state_fn = None
+            try:
+                from worker.task_state import load_task_state
+                load_task_state_fn = load_task_state
+            except Exception:
+                pass
+
+            tasks_to_fail: List[str] = []
+            tasks_to_complete_from_snapshot: List[tuple] = []  # (id, snapshot)
+            tasks_to_complete_from_disk: List[tuple] = []  # (id, files_meta)
+
+            for row in rows:
+                tid = row["id"]
+
+                # 1. Проверяем Redis snapshot
+                snapshot = None
+                if load_task_state_fn is not None:
+                    try:
+                        snapshot = load_task_state_fn(tid)
+                    except Exception as exc:
+                        logger.debug(
+                            f"recover_stale_pending({tid}): "
+                            f"load_task_state failed: {exc}"
+                        )
+
+                if snapshot and isinstance(snapshot, dict) and \
+                        snapshot.get("status") == "done":
+                    # Задача фактически завершилась — переносим финал в БД
+                    tasks_to_complete_from_snapshot.append((tid, snapshot))
+                    logger.info(
+                        f"recover_stale_pending({tid}): Redis snapshot имеет "
+                        f"status=done — восстановление как done из snapshot"
+                    )
+                    continue
+
+                # 2. Проверяем файлы на диске
+                disk_files = _find_task_files_on_disk(tid)
+                if disk_files:
+                    # Файлы есть → pipeline завершился, но snapshot потерян
+                    tasks_to_complete_from_disk.append((tid, disk_files))
+                    logger.info(
+                        f"recover_stale_pending({tid}): найдено "
+                        f"{len(disk_files)} файлов на диске — восстановление "
+                        f"как done"
+                    )
+                    continue
+
+                # 3. Нет ни snapshot, ни файлов → помечаем как failed
+                tasks_to_fail.append(tid)
+                logger.warning(
+                    f"recover_stale_pending({tid}): ни Redis snapshot, ни "
+                    f"файлов на диске — помечаем как failed "
+                    f"(прервано рестартом сервера)"
+                )
+
+            # Применяем обновления к БД
+            if tasks_to_fail:
+                await conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'failed',
+                        error = %s,
+                        updated_at = NOW()
+                    WHERE id = ANY(%s)
+                    """,
+                    params=[
+                        "Задача прервана (перезапуск сервера во время выполнения)",
+                        tasks_to_fail,
+                    ],
+                )
+                recovered_count += len(tasks_to_fail)
+
+            for tid, snap in tasks_to_complete_from_snapshot:
+                files_json = snap.get("files") or []
+                analytics_val = snap.get("analytics")
+                await conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'done',
+                        progress = 100,
+                        total_dtp = %s,
+                        total_dead = %s,
+                        total_injured = %s,
+                        files = %s,
+                        analytics = COALESCE(%s, analytics),
+                        error = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    params=[
+                        int(snap.get("total_dtp") or 0),
+                        int(snap.get("total_dead") or 0),
+                        int(snap.get("total_injured") or 0),
+                        Json(files_json),
+                        Json(analytics_val) if analytics_val else None,
+                        tid,
+                    ],
+                )
+                recovered_count += 1
+
+            for tid, files_meta in tasks_to_complete_from_disk:
+                await conn.execute(
+                    """
+                    UPDATE tasks
+                    SET status = 'done',
+                        progress = 100,
+                        files = %s,
+                        error = NULL,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    params=[Json(files_meta), tid],
+                )
+                recovered_count += 1
+
+            await conn.commit()
+
+            # Логируем итог
+            if recovered_count > 0:
+                logger.info(
+                    f"recover_stale_pending: восстановлено {recovered_count} "
+                    f"задач "
+                    f"(failed={len(tasks_to_fail)}, "
+                    f"done_from_snapshot={len(tasks_to_complete_from_snapshot)}, "
+                    f"done_from_disk={len(tasks_to_complete_from_disk)})"
+                )
+
+            # Также чистим in-memory кэш от ghost-задач
+            for tid in list(_TASKS_MEMORY.keys()):
+                task = _TASKS_MEMORY[tid]
+                try:
+                    if hasattr(task, "status") and hasattr(task.status, "value"):
+                        if task.status.value == "pending" and task.progress == 0:
+                            # Проверяем created_at — задача должна быть stale
+                            if task.created_at:
+                                age = (
+                                    datetime.now(timezone.utc) - task.created_at
+                                ).total_seconds() / 60
+                                if age > _STALE_PENDING_MINUTES:
+                                    # Помечаем в in-memory тоже
+                                    from ..services.gibdd_service import TaskStatus
+                                    task.status = TaskStatus.FAILED
+                                    task.error = (
+                                        "Задача прервана (перезапуск сервера "
+                                        "во время выполнения)"
+                                    )
+                except Exception:
+                    pass
+
+    except Exception as exc:
+        logger.warning(f"recover_stale_pending failed: {exc}")
+
+    return recovered_count
+
+
+async def _maybe_recover_stale_pending_tasks() -> None:
+    """Lazily вызывает recover_stale_pending_tasks() с TTL-защитой.
+
+    Используется в list_user_tasks_from_db — чтобы пользователь увидел
+    cleanup ghost-задач без ожидания рестарта сервера. TTL 60 сек
+    предотвращает спам БД-запросами на каждый GET /tasks.
+    """
+    global _last_stale_recovery_at
+    now = datetime.now(timezone.utc)
+    if _last_stale_recovery_at is not None:
+        elapsed = (now - _last_stale_recovery_at).total_seconds()
+        if elapsed < _STALE_RECOVERY_TTL_SECONDS:
+            return
+    try:
+        await recover_stale_pending_tasks()
+    except Exception as exc:
+        logger.debug(f"_maybe_recover_stale_pending_tasks: {exc}")
+
+
+async def save_task_final_state_from_snapshot(
+    task_id: str,
+    *,
+    status: str,
+    progress: int,
+    error: Optional[str] = None,
+    total_dtp: int = 0,
+    total_dead: int = 0,
+    total_injured: int = 0,
+    files: Optional[List[Dict[str, Any]]] = None,
+    analytics: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Обновляет финальное состояние задачи в БД напрямую из snapshot-полей.
+
+    Используется Celery-воркером после завершения pipeline (DONE или FAILED),
+    чтобы БД содержала корректный статус — даже если Redis snapshot
+    потом протухнет или будет потерян. Это предотвращает появление
+    ghost-задач в будущем (см. recover_stale_pending_tasks выше).
+
+    В отличие от save_task(), НЕ требует полного Task-объекта — принимает
+    плоские поля, которые воркер уже имеет в snapshot.
+
+    Returns:
+        True если обновление прошло успешно, False иначе.
+    """
+    if not is_db_ready():
+        return False
+    pool = get_pool()
+    if pool is None:
+        return False
+
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                """
+                UPDATE tasks
+                SET status = %s,
+                    progress = %s,
+                    error = %s,
+                    total_dtp = %s,
+                    total_dead = %s,
+                    total_injured = %s,
+                    files = COALESCE(%s, files),
+                    analytics = COALESCE(%s, analytics),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                params=[
+                    status,
+                    progress,
+                    error,
+                    int(total_dtp or 0),
+                    int(total_dead or 0),
+                    int(total_injured or 0),
+                    Json(files) if files is not None else None,
+                    Json(analytics) if analytics is not None else None,
+                    task_id,
+                ],
+            )
+            await conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning(
+            f"save_task_final_state_from_snapshot({task_id}) failed: {exc}"
+        )
+        return False
+
+
+def save_task_final_state_from_snapshot_sync(
+    task_id: str,
+    *,
+    status: str,
+    progress: int,
+    error: Optional[str] = None,
+    total_dtp: int = 0,
+    total_dead: int = 0,
+    total_injured: int = 0,
+    files: Optional[List[Dict[str, Any]]] = None,
+    analytics: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Синхронная версия save_task_final_state_from_snapshot для Celery-воркера.
+
+    Celery-воркер работает в синхронном контексте и не имеет доступа к
+    async-пулу FastAPI процесса. Эта функция открывает свежее sync-соединение
+    напрямую через DATABASE_URL, выполняет UPDATE, закрывает соединение.
+
+    Используется редко (1 раз на завершение pipeline), так что отсутствие
+    пула ок — overhead на conn-open пренебрежимо мал по сравнению с
+    временем pipeline (10-60 сек).
+
+    Если DATABASE_URL не задан или БД недоступна — возвращает False
+    (silent fallback, как и в остальных repository-функциях).
+
+    Returns:
+        True если обновление прошло успешно, False иначе.
+    """
+    try:
+        from ..config import settings
+    except Exception:
+        return False
+    if not settings.db_enabled or not settings.database_url:
+        return False
+
+    try:
+        import psycopg
+    except Exception as exc:
+        logger.debug(
+            f"save_task_final_state_from_snapshot_sync({task_id}): "
+            f"psycopg not available: {exc}"
+        )
+        return False
+
+    try:
+        with psycopg.connect(settings.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tasks
+                    SET status = %s,
+                        progress = %s,
+                        error = %s,
+                        total_dtp = %s,
+                        total_dead = %s,
+                        total_injured = %s,
+                        files = COALESCE(%s, files),
+                        analytics = COALESCE(%s, analytics),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        status,
+                        progress,
+                        error,
+                        int(total_dtp or 0),
+                        int(total_dead or 0),
+                        int(total_injured or 0),
+                        Json(files) if files is not None else None,
+                        Json(analytics) if analytics is not None else None,
+                        task_id,
+                    ),
+                )
+            conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning(
+            f"save_task_final_state_from_snapshot_sync({task_id}) failed: {exc}"
+        )
+        return False
 
 
 # ====================================================================
