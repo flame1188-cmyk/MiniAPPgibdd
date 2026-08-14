@@ -180,26 +180,60 @@ def _maybe_merge_redis_snapshot(task: Task) -> None:
         return
 
     if not snapshot or not isinstance(snapshot, dict):
+        # Snapshot в Redis нет — это нормально в первые секунды после dispatch,
+        # пока воркер не вызвал _init_snapshot. Логируем на INFO для диагностики.
+        logger.info(
+            f"_maybe_merge_redis_snapshot({task.id}): no snapshot in Redis "
+            f"(task.status={task.status}, task.progress={task.progress}, "
+            f"task.updated_at={task.updated_at})"
+        )
         return
 
     # Проверяем свежесть: snapshot.updated_at должен быть новее task.updated_at
     snap_updated_str = snapshot.get("updated_at")
     if not snap_updated_str:
+        logger.info(
+            f"_maybe_merge_redis_snapshot({task.id}): snapshot has no updated_at "
+            f"(snapshot keys: {sorted(snapshot.keys())})"
+        )
         return
     try:
         from datetime import datetime
         snap_updated = datetime.fromisoformat(str(snap_updated_str).replace("Z", "+00:00"))
-    except Exception:
+    except Exception as exc:
+        logger.info(
+            f"_maybe_merge_redis_snapshot({task.id}): cannot parse updated_at "
+            f"'{snap_updated_str}': {exc}"
+        )
         return
 
-    if task.updated_at and snap_updated <= task.updated_at:
-        # Task in-memory новее или равен — не трогаем (in-memory path уже
+    # Логируем сравнение timestamps для диагностики
+    task_updated_str = task.updated_at.isoformat() if task.updated_at else "None"
+    snap_status = snapshot.get("status", "?")
+    snap_progress = snapshot.get("progress", "?")
+    logger.info(
+        f"_maybe_merge_redis_snapshot({task.id}): "
+        f"snap(updated={snap_updated_str}, status={snap_status}, progress={snap_progress}) "
+        f"vs task(updated={task_updated_str}, status={task.status}, progress={task.progress})"
+    )
+
+    # Ослаблено с <= на <: если timestamps равны (миллисекунды совпали) —
+    # всё равно мерджим, потому что snapshot от воркера содержит актуальные
+    # поля (status, progress, files), а task.updated_at мог быть обновлён
+    # в in-memory без реального изменения статуса.
+    if task.updated_at and snap_updated < task.updated_at:
+        # Task in-memory строго новее — не трогаем (in-memory path уже
         # выполнился, либо Celery snapshot устарел)
+        logger.info(
+            f"_maybe_merge_redis_snapshot({task.id}): SKIP — task.updated_at "
+            f"({task_updated_str}) строго новее snap.updated_at ({snap_updated_str})"
+        )
         return
 
     # Применяем поля snapshot к task
     updates = snapshot_to_task_updates(snapshot)
     if not updates:
+        logger.info(f"_maybe_merge_redis_snapshot({task.id}): no updates to apply")
         return
 
     # Status — преобразуем строку в TaskStatus Enum
@@ -262,9 +296,10 @@ def _maybe_merge_redis_snapshot(task: Task) -> None:
                     f"{state_field} merge failed: {exc}"
                 )
 
-    logger.debug(
-        f"_maybe_merge_redis_snapshot({task.id}): merged "
-        f"status={task.status} progress={task.progress}"
+    logger.info(
+        f"_maybe_merge_redis_snapshot({task.id}): MERGED "
+        f"status={task.status} progress={task.progress} "
+        f"files={len(task.files) if task.files else 0}"
     )
 
 

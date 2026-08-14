@@ -134,6 +134,22 @@ def create_task(
     except Exception:
         pass
 
+    # Sprint 7 / Phase C.3: сохраняем начальный snapshot в Redis.
+    # Это закрывает окно между dispatch (отправкой в Celery) и моментом,
+    # когда воркер вызовет _init_snapshot. Без этого в первые секунды
+    # после dispatch в Redis нет snapshot, и _maybe_merge_redis_snapshot
+    # возвращает None — фронтенд видит 0%.
+    # save_task_state ожидает ПОЛНЫЙ Task-объект (с user_id, region_code, ...)
+    # — у нас как раз такой.
+    try:
+        from worker.task_state import save_task_state
+        if save_task_state(task):
+            logger.debug(f"create_task({task_id}): initial snapshot saved to Redis")
+    except Exception as exc:
+        # Не роняем создание задачи — fallback на in-memory + воркер сам
+        # создаст snapshot через _init_snapshot.
+        logger.debug(f"create_task({task_id}): Redis snapshot save skipped: {exc}")
+
     # Асинхронно сохраняем в БД (если доступна).
     # Fire-and-forget — задача уже в in-memory и доступна сразу.
     # Hotfix: добавлен done-callback для логирования ошибок. Раньше
