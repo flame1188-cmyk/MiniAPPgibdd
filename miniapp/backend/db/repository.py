@@ -940,8 +940,8 @@ async def recover_stale_pending_tasks() -> int:
                         int(snap.get("total_dtp") or 0),
                         int(snap.get("total_dead") or 0),
                         int(snap.get("total_injured") or 0),
-                        Json(files_json),
-                        Json(analytics_val) if analytics_val else None,
+                        Jsonb(files_json),
+                        Jsonb(analytics_val) if analytics_val else None,
                         tid,
                     ],
                 )
@@ -958,7 +958,7 @@ async def recover_stale_pending_tasks() -> int:
                         updated_at = NOW()
                     WHERE id = %s
                     """,
-                    params=[Json(files_meta), tid],
+                    params=[Jsonb(files_meta), tid],
                 )
                 recovered_count += 1
 
@@ -1075,8 +1075,8 @@ async def save_task_final_state_from_snapshot(
                     int(total_dtp or 0),
                     int(total_dead or 0),
                     int(total_injured or 0),
-                    Json(files) if files is not None else None,
-                    Json(analytics) if analytics is not None else None,
+                    Jsonb(files) if files is not None else None,
+                    Jsonb(analytics) if analytics is not None else None,
                     task_id,
                 ],
             )
@@ -1157,8 +1157,8 @@ def save_task_final_state_from_snapshot_sync(
                         int(total_dtp or 0),
                         int(total_dead or 0),
                         int(total_injured or 0),
-                        Json(files) if files is not None else None,
-                        Json(analytics) if analytics is not None else None,
+                        Jsonb(files) if files is not None else None,
+                        Jsonb(analytics) if analytics is not None else None,
                         task_id,
                     ),
                 )
