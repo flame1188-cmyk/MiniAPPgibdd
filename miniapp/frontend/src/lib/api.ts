@@ -636,6 +636,12 @@ export const api = {
   listTasks: (limit = 20) =>
     request<TaskStatusResponse[]>(`/api/dtp/tasks?limit=${limit}`),
 
+  deleteTask: (taskId: string) =>
+    request<{ ok: boolean; task_id: string; deleted: boolean }>(
+      `/api/dtp/tasks/${taskId}`,
+      { method: 'DELETE' }
+    ),
+
   getTaskFiles: (taskId: string) =>
     request<TaskFile[]>(`/api/dtp/tasks/${taskId}/files`),
 
