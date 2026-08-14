@@ -482,6 +482,111 @@ async def delete_old_tasks(
     return total
 
 
+async def delete_task(
+    task_id: str,
+    user_id: int,
+    project_root: Optional[Path] = None,
+) -> bool:
+    """Удаляет одну задачу пользователя (по требованию пользователя).
+
+    Удаляет из:
+    - БД (только если task.user_id == user_id — защита от удаления чужих задач)
+    - in-memory кэша (_TASKS_MEMORY и _TASKS_HEAVY_STATE)
+    - диска (data/tasks/{task_id}/ и все файлы задачи из task.files[].path)
+
+    Args:
+        task_id: id задачи для удаления.
+        user_id: id пользователя, инициатора удаления. Если не совпадает
+            с task.user_id в БД — удаление отменяется, возвращается False.
+        project_root: корень проекта (для поиска data/tasks/). Если None —
+            ищётся относительно текущего файла (../../..).
+
+    Returns:
+        True если задача была найдена и удалена,
+        False если не найдена или user_id не совпал.
+    """
+    if project_root is None:
+        # repository.py → miniapp/backend/db/ → miniapp/backend/ → miniapp/ → project_root
+        project_root = Path(__file__).resolve().parents[3]
+
+    deleted = False
+
+    # 1. БД: SELECT for ownership check + получаем files для удаления с диска
+    if is_db_ready():
+        pool = get_pool()
+        if pool is not None:
+            try:
+                async with pool.connection() as conn:
+                    # Сначала проверяем ownership и собираем files
+                    cur = await conn.execute(
+                        """
+                        SELECT id, files FROM tasks
+                        WHERE id = %s AND user_id = %s
+                        """,
+                        params=(task_id, user_id),
+                    )
+                    row = await cur.fetchone()
+
+                    if row is None:
+                        # Либо задачи нет, либо чужая — возвращаем False
+                        # без раскрытия, какая именно (безопасность).
+                        return False
+
+                    files = row["files"] or []
+
+                    # Удаляем файлы с диска для найденной задачи
+                    for f in files:
+                        try:
+                            Path(f.get("path", "")).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    # Удаляем директорию задачи
+                    try:
+                        task_dir = project_root / "data" / "tasks" / task_id
+                        if task_dir.exists():
+                            task_dir.rmdir()
+                    except Exception:
+                        pass
+
+                    # Удаляем строку из БД
+                    await conn.execute(
+                        "DELETE FROM tasks WHERE id = %s AND user_id = %s",
+                        params=(task_id, user_id),
+                    )
+                    await conn.commit()
+                    deleted = True
+            except Exception as exc:
+                logger.warning(f"delete_task({task_id}) DB failed: {exc}")
+                # Не возвращаемся — пробуем хотя бы почистить in-memory
+
+    # 2. In-memory cleanup — даже если БД недоступна или задачи в БД не было,
+    # в памяти она могла быть (например, только что создана, save_task ещё
+    # не завершился). Чистим по user_id-проверке.
+    task = _TASKS_MEMORY.get(task_id)
+    if task is not None and task.user_id == user_id:
+        for f in task.files:
+            try:
+                Path(f.get("path", "")).unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            task_dir = project_root / "data" / "tasks" / task_id
+            if task_dir.exists():
+                task_dir.rmdir()
+        except Exception:
+            pass
+        _TASKS_MEMORY.pop(task_id, None)
+        drop_heavy_state(task_id)
+        deleted = True
+
+    if deleted:
+        logger.info(
+            f"delete_task: task={task_id} user={user_id} — удалена "
+            f"(db={'да' if is_db_ready() else 'нет'})"
+        )
+    return deleted
+
+
 # ====================================================================
 # Аудит-лог обращений к ПДн (152-ФЗ)
 # ====================================================================
