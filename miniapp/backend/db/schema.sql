@@ -403,9 +403,19 @@ CREATE TRIGGER trg_llm_sessions_updated_at
 -- ─────────────────────────────────────────────────────────────────────────
 -- 1. КАРТОЧКИ ДТП (1 строка = 1 ДТП, уникальный kart_id)
 -- ─────────────────────────────────────────────────────────────────────────
+-- kart_id (9 цифр): region(2) + year(2) + seq(5)
+--   region — последние 2 цифры reg_code (46 = Московская обл.)
+--   year   — последние 2 цифры года из date_dtp (26 для 2026)
+--   seq    — последние 5 цифр empt_number (внутренний номер ГИБДД)
+-- Пример: reg=1146, date_dtp=2026-01-12, empt_number=460100875
+--         → kart_id = "46" + "26" + "00875" = "462600875"
+-- empt_number хранится ОТДЕЛЬНО для аудита (внутренний номер ГИБДД).
+-- Коллизии kart_id (разные ДТП, одинаковые last-5 empt_number в одном регионе-годе)
+-- логируются в gibdd_cards_collisions.
 CREATE TABLE IF NOT EXISTS gibdd_cards (
     id              BIGSERIAL    PRIMARY KEY,
-    kart_id         VARCHAR(32)  NOT NULL,            -- empt_number (уникальный ID ДТП)
+    kart_id         VARCHAR(32)  NOT NULL,            -- 9 цифр: region(2)+year(2)+seq(5)
+    empt_number     VARCHAR(32),                      -- оригинальный empt_number (внутр. номер ГИБДД)
     reg_code        VARCHAR(16)  NOT NULL,            -- "1146" Московская обл.
     dat_period      VARCHAR(8)   NOT NULL,            -- "7.2026" (месяц публикации)
     date_dtp        DATE         NOT NULL,            -- дата ДТП
@@ -469,6 +479,10 @@ CREATE INDEX IF NOT EXISTS idx_cards_coord_w
 
 CREATE INDEX IF NOT EXISTS idx_cards_coord_l
     ON gibdd_cards (coord_l);
+
+-- Индекс на empt_number для аудита и поиска по внутреннему номеру ГИБДД
+CREATE INDEX IF NOT EXISTS idx_cards_empt_number
+    ON gibdd_cards (empt_number);
 
 -- ─────────────────────────────────────────────────────────────────────────
 -- 2. ТРАНСПОРТНЫЕ СРЕДСТВА (1 строка = 1 ТС в ДТП)
@@ -577,3 +591,32 @@ CREATE TABLE IF NOT EXISTS gibdd_indicators (
     finish_date     DATE,
     updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- 7. КОЛЛИЗИИ kart_id (для ручного разбора)
+-- ─────────────────────────────────────────────────────────────────────────
+-- Когда две разные карточки дают одинаковый kart_id (т.е. одинаковые
+-- last-5 empt_number в одном регионе-годе), первая попадает в gibdd_cards,
+-- а вторая — сюда. По этим записям можно найти ДТП, которые ГИБДД
+-- нумерует одинаковыми empt_number, и разобраться с ними вручную.
+CREATE TABLE IF NOT EXISTS gibdd_cards_collisions (
+    id              BIGSERIAL    PRIMARY KEY,
+    kart_id         VARCHAR(32)  NOT NULL,                -- kart_id, который коллизировал
+    reg_code        VARCHAR(16)  NOT NULL,
+    dat_period      VARCHAR(8)   NOT NULL,
+    date_dtp        DATE,
+    empt_number     VARCHAR(32),                          -- оригинальный empt_number
+    coord_w         NUMERIC(9,6),
+    coord_l         NUMERIC(9,6),
+    pog             SMALLINT,
+    ran             SMALLINT,
+    raw_payload     JSONB,                                -- полная карточка для разбора
+    conflict_with   BIGINT,                               -- id карты в gibdd_cards, занявшей kart_id
+    detected_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_collisions_kart_id
+    ON gibdd_cards_collisions (kart_id);
+
+CREATE INDEX IF NOT EXISTS idx_collisions_reg_date
+    ON gibdd_cards_collisions (reg_code, date_dtp);
