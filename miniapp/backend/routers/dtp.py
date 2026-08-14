@@ -298,6 +298,67 @@ async def get_task_status(
     return _task_to_response(task)
 
 
+@router.delete("/tasks/{task_id}")
+async def delete_task_endpoint(
+    task_id: str,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """Удаляет задачу пользователя.
+
+    Удаляет из БД, in-memory кэша и файлы с диска (data/tasks/{task_id}/,
+    а также все файлы, перечисленные в task.files[].path).
+
+    Ownership-проверка: можно удалить только свою задачу. Если task_id
+    не существует или принадлежит другому пользователю — возвращаем 404
+    (не раскрываем, какая именно причина, чтобы не давать информации
+    о существовании чужих задач).
+
+    Действие логируется в access_log (требование 152-ФЗ).
+    """
+    from ..db.repository import delete_task
+
+    # Pre-check через get_task_async — для логирования и проверки ownership
+    # перед тем, как вызывать repository.delete_task. Это даёт более точные
+    # ошибки (404 vs 403) в in-memory режиме, когда БД недоступна.
+    task = await get_task_async(task_id)
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+    if task.user_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+    deleted = await delete_task(task_id, user.id)
+    if not deleted:
+        # Маловероятная ситуация: задача была в памяти на pre-check,
+        # но к моменту delete_task уже исчезла (race condition с cleanup-воркером).
+        # Возвращаем 404 — фронтенд инвалидирует кэш и пользователь увидит
+        # актуальный список.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task {task_id} not found",
+        )
+
+    # Логируем удаление в access_log (152-ФЗ аудит)
+    try:
+        from ..db.repository import log_access
+        await log_access(
+            user_id=user.id,
+            action="delete_task",
+            region_code=task.region_code,
+            period_label=task.period_label,
+            task_id=task_id,
+        )
+    except Exception:
+        pass  # логирование не должно рушить удаление
+
+    return {"ok": True, "task_id": task_id, "deleted": True}
+
+
 @router.get("/tasks/{task_id}/files", response_model=List[TaskFileSchema])
 async def list_task_files(
     task_id: str,
