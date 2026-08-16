@@ -448,12 +448,24 @@ async def check_api_availability() -> tuple[bool, str]:
         return False, msg
 
 
-def extract_accident_cards(api_response: dict) -> list[dict[str, Any]]:
+def extract_accident_cards(
+    api_response: dict,
+    reg_code: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Извлекает список карточек ДТП из ответа API.
 
     Реальная структура ответа API stat.gibdd.ru:
       response["results"]["region_list"][0]["pok_list"][0]["result"][0]["dtpcardlist"]["info_dtp"]
+
+    Args:
+        api_response: ответ API ГИБДД
+        reg_code: код региона (например "1146" для МО). Если передан —
+                  к каждой карточке добавляется вычисленный kart_id
+                  (region(2)+year(2)+month(2)+day(2)+empt_number(9) = 17 цифр).
+                  Это нужно, чтобы Excel-генератор заполнил столбцы
+                  «Номер» и «Номер ДТП» при прямом API-запросе (минуя архив).
+                  Если None — kart_id не вычисляется (поведение по умолчанию).
 
     Returns:
         Список словарей — карточек ДТП
@@ -480,6 +492,37 @@ def extract_accident_cards(api_response: dict) -> list[dict[str, Any]]:
     except (KeyError, TypeError, AttributeError) as e:
         logger.error(f"Ошибка парсинга структуры ответа API: {e}")
         raise ValueError(f"Неожиданная структура ответа API: {e}")
+
+    # Если передан reg_code — вычисляем kart_id для каждой карточки.
+    # В API-ответе kart_id отсутствует (это наше внутреннее поле).
+    # Без этого столбцы «Номер» / «Номер ДТП» в Excel будут пустыми.
+    if reg_code and cards:
+        try:
+            # Локальный импорт — kart_id_utils лежит в miniapp/backend/db/.
+            # Если запуск из репо (api_client в корне), добавим путь.
+            import sys
+            from pathlib import Path
+            _kart_id_path = Path(__file__).resolve().parent / "miniapp" / "backend" / "db"
+            if str(_kart_id_path) not in sys.path:
+                sys.path.insert(0, str(_kart_id_path))
+            from kart_id_utils import build_kart_id
+        except ImportError:
+            # Старый путь — kart_id_utils рядом (бот-окружение)
+            try:
+                from kart_id_utils import build_kart_id
+            except ImportError as e:
+                logger.warning(f"kart_id_utils недоступен, kart_id не вычисляется: {e}")
+                build_kart_id = None
+
+        if build_kart_id:
+            enriched = 0
+            for card in cards:
+                kart_id, _ = build_kart_id(card, reg_code)
+                if kart_id:
+                    card["kart_id"] = kart_id
+                    enriched += 1
+            logger.info(f"Извлечено {len(cards)} карточек ДТП (kart_id вычислен для {enriched})")
+            return cards
 
     logger.info(f"Извлечено {len(cards)} карточек ДТП")
     return cards

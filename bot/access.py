@@ -123,7 +123,9 @@ async def _fetch_cards_for_period(
                 # --- Основной метод: API ГИБДД ---
                 try:
                     api_response = await fetch_dtp_data(dat=dat, reg=reg_code, pok="1")
-                    extracted = extract_accident_cards(api_response)
+                    # Передаём reg_code, чтобы extract_accident_cards вычислил kart_id
+                    # для каждой карточки (нужно для столбцов «Номер»/«Номер ДТП» в Excel).
+                    extracted = extract_accident_cards(api_response, reg_code=reg_code)
                     cards.extend(extracted)
                     logger.info(f"  {log_prefix}: {dat} -> {len(extracted)} ДТП")
                 except _httpx.HTTPStatusError as e:

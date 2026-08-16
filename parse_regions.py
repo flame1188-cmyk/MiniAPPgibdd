@@ -1,151 +1,149 @@
 """
-Скрипт для парсинга регионов с сайта stat.gibdd.ru и генерации
-хардкод-файла regions_builtin.py с полным справочником.
+Скрипт для синхронизации справочника регионов с официальным API ГИБДД.
+
+Источник: http://стат.гибдд.рф/opendataapi/v1/dictionary/rows?code=1
+  (кириллический домен в punycode: xn--80a7adb.xn--90adear.xn--p1ai)
+
+Генерирует:
+  - regions_builtin.py  — Python-модуль со списком регионов
+  - regions_builtin.json — то же в JSON
+
+Исключает код 1100 (Российская Федерация целиком) — это не регион.
 
 Запуск: python parse_regions.py
 """
 
 import json
-import os
-import re
 import urllib.request
+from datetime import datetime
+from pathlib import Path
 
-GIBDD_URL = "http://stat.gibdd.ru"
+# Официальный API-эндпоинт словаря регионов (code=1)
+# Кириллический домен переведён в punycode — urllib.request не умеет сам.
+API_URL = "http://xn--80a7adb.xn--90adear.xn--p1ai/opendataapi/v1/dictionary/rows?code=1"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-
-def fetch_page():
-    req = urllib.request.Request(GIBDD_URL, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return resp.read().decode("utf-8", errors="replace")
+# Коды, которые надо исключить из справочника
+EXCLUDE_CODES = {"1100"}  # Российская Федерация целиком — не регион
 
 
-def extract_regions(html):
-    """Извлекает regions[] и regId2MiasId из HTML."""
-    # Ищем var regions = [...];
-    m = re.search(r'var regions = (\[.*?\]);', html, re.DOTALL)
-    if not m:
-        raise ValueError("Не удалось найти var regions в HTML")
-    regions = json.loads(m.group(1))
+def fetch_regions_from_api():
+    """Загружает справочник регионов из официального API ГИБДД."""
+    print(f"Загружаю {API_URL} ...")
+    req = urllib.request.Request(API_URL, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
 
-    # Ищем var regId2MiasId = {...};
-    m = re.search(r'var regId2MiasId = (\{.*?\});', html, re.DOTALL)
-    if not m:
-        raise ValueError("Не удалось найти var regId2MiasId в HTML")
-    id_map = json.loads(m.group(1))
-
-    return regions, id_map
+    rows = data["results"][0]["dict_rows"]
+    print(f"Получено {len(rows)} записей от API")
+    print(f"  dict_name: {data['results'][0]['dict_name']}")
+    print(f"  dict_status: {data['results'][0]['dict_status']}")
+    return rows
 
 
-def build_api_regions(regions, id_map):
-    """
-    Конвертирует в формат API: [{"code": "1119", "name": "..."}, ...]
+def filter_regions(rows):
+    """Фильтрует регионы: исключает 1100 (РФ) и расформированные."""
+    regions = []
+    today = datetime.now()
 
-    Правило: API-код = "11" + MiasId (с ведущим нулём до 2 цифр)
-    Для MiasId > 99 (автономные округа, новые территории) —
-    пропускаем, т.к. их API-коды неизвестны (отличаются от веб-кодов).
-    Они будут доступны после восстановления API через файловый кэш.
-    """
-    api_regions = []
-    skipped = []
+    for r in rows:
+        code = r["rows_code"]
+        name = r["rows_name"]
+        finish_str = r.get("finish_date", "31.12.2500")
 
+        if code in EXCLUDE_CODES:
+            print(f"  Исключён {code}: {name}")
+            continue
+
+        # Если finish_date в прошлом — регион расформирован, пропускаем
+        try:
+            finish_dt = datetime.strptime(finish_str, "%d.%m.%Y")
+            if finish_dt < today:
+                print(f"  Пропущен {code}: {name} (расформирован {finish_str})")
+                continue
+        except ValueError:
+            pass
+
+        regions.append({"code": code, "name": name})
+
+    # Сортировка по коду
+    regions.sort(key=lambda r: r["code"])
+    return regions
+
+
+def generate_files(regions, output_dir):
+    """Генерирует regions_builtin.py и regions_builtin.json."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # ─── regions_builtin.py ───
+    py_path = output_dir / "regions_builtin.py"
+    py_content = f'''"""
+Встроенный (builtin) справочник регионов Российской Федерации.
+
+Извлечён из stat.gibdd.ru: http://стат.гибдд.рф/opendataapi/v1/dictionary/rows?code=1
+Дата обновления: {today_str}
+
+Используется как fallback, когда API ГИБДД недоступен и файловый кэш пуст.
+
+Коды в формате API: "11" + двухзначный код региона.
+Исключён код 1100 (Российская Федерация целиком) — это не регион.
+
+Всего: {len(regions)} регионов.
+"""
+
+BUILTIN_REGIONS: list[dict[str, str]] = [
+'''
     for r in regions:
-        reg_id = str(r["regId"])
-        name = r["name"]
+        py_content += f'    {{"code": "{r["code"]}", "name": "{r["name"]}"}},\n'
+    py_content += "]\n"
 
-        # Пропускаем "Российская Федерация" (877)
-        if reg_id == "877":
-            continue
+    with open(py_path, "w", encoding="utf-8") as f:
+        f.write(py_content)
+    print(f"✓ Сгенерирован {py_path}: {len(regions)} регионов")
 
-        mias_id = id_map.get(reg_id)
-        if mias_id is None:
-            print(f"  ⚠ Нет miasId для {name} (regId={reg_id})")
-            continue
-
-        # Только стандартные коды (1-99) → API-код "11XX"
-        if mias_id < 1 or mias_id > 99:
-            skipped.append((mias_id, name))
-            continue
-
-        api_code = f"11{mias_id:02d}"
-        api_regions.append({"code": api_code, "name": name})
-
-    # Сортируем по коду
-    api_regions.sort(key=lambda x: x["code"])
-
-    if skipped:
-        print(f"\n  Пропущено {len(skipped)} регионов (miasId вне 1-99):")
-        for mid, name in skipped:
-            print(f"    miasId={mid} — {name}")
-
-    return api_regions
-
-
-def generate_python_file(api_regions, output_path):
-    """Генерирует Python-файл с хардкод-списком регионов."""
-    lines = [
-        '"""',
-        'Встроенный (builtin) справочник регионов Российской Федерации.',
-        '',
-        'Извлечён из stat.gibdd.ru. Используется как fallback,',
-        'когда API ГИБДД недоступен и файловый кэш пуст.',
-        '',
-        'Коды в формате API: "11" + двухзначный код региона.',
-        '"""',
-        '',
-        'BUILTIN_REGIONS: list[dict[str, str]] = [',
-    ]
-
-    for r in api_regions:
-        lines.append(f'    {{"code": "{r["code"]}", "name": "{r["name"]}"}},')
-
-    lines.append(']')
-    lines.append('')
-    lines.append(f'# Всего регионов: {len(api_regions)}')
-    lines.append('')
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    print(f"✓ Сгенерирован {output_path}: {len(api_regions)} регионов")
+    # ─── regions_builtin.json ───
+    json_path = output_dir / "regions_builtin.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(regions, f, ensure_ascii=False, indent=2)
+    print(f"✓ Сохранён {json_path}")
 
 
 def main():
-    print("Загрузка stat.gibdd.ru...")
-    html = fetch_page()
-    print(f"  HTML: {len(html)} символов")
+    rows = fetch_regions_from_api()
+    regions = filter_regions(rows)
+    print(f"\nИтого актуальных регионов: {len(regions)}")
 
-    print("Извлечение данных...")
-    regions, id_map = extract_regions(html)
-    print(f"  regions: {len(regions)} записей")
-    print(f"  regId2MiasId: {len(id_map)} записей")
+    # Путь к директории скрипта
+    output_dir = Path(__file__).resolve().parent
+    generate_files(regions, output_dir)
 
-    print("Конвертация в API-формат...")
-    api_regions = build_api_regions(regions, id_map)
-    print(f"  API регионов: {len(api_regions)}")
-
-    # Выводим первые 10 для проверки
-    print("\nПервые 10 регионов:")
-    for r in api_regions[:10]:
+    # Выводим первые/последние для проверки
+    print("\nПервые 5 регионов:")
+    for r in regions[:5]:
+        print(f"  {r['code']} — {r['name']}")
+    print("Последние 5 регионов:")
+    for r in regions[-5:]:
         print(f"  {r['code']} — {r['name']}")
 
-    print("\nАвтономные округа (miasId > 99):")
-    for r in api_regions:
-        code_num = r["code"][2:]
-        if len(code_num) > 2:
-            print(f"  {r['code']} — {r['name']}")
+    # Проверка наличия новых регионов (добавлены в 2022-2024)
+    new_codes = ["1102", "1106", "1109", "1113", "1121", "1123", "1174", "1255"]
+    print("\nНовые регионы (добавлены в 2022-2024):")
+    for code in new_codes:
+        found = next((r for r in regions if r["code"] == code), None)
+        if found:
+            print(f"  ✓ {code}: {found['name']}")
+        else:
+            print(f"  ✗ {code}: ОТСУТСТВУЕТ!")
 
-    # Путь к директории скрипта (файлы рядом с parse_regions.py)
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    py_path = os.path.join(script_dir, "regions_builtin.py")
-    generate_python_file(api_regions, py_path)
-
-    # Также выводим JSON для проверки
-    json_path = os.path.join(script_dir, "regions_builtin.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(api_regions, f, ensure_ascii=False, indent=2)
-    print(f"✓ Сохранён {json_path}")
+    # Проверка отсутствия старых кодов
+    old_codes = ["1126", "1135", "1167"]
+    print("\nСтарые коды (должны быть удалены):")
+    for code in old_codes:
+        found = next((r for r in regions if r["code"] == code), None)
+        if found:
+            print(f"  ✗ {code}: {found['name']} — ДОЛЖЕН БЫТЬ УДАЛЁН!")
+        else:
+            print(f"  ✓ {code}: удалён")
 
 
 if __name__ == "__main__":

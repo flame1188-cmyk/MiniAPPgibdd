@@ -78,10 +78,15 @@ async def get_cards_from_archive(
         return None
 
     # 3. Все месяцы есть — читаем карточки
+    # Возвращаем kart_id и empt_number из БД — это важно, чтобы в Excel
+    # столбцы «Номер» и «Номер ДТП» были заполнены (см. gibdd_parser.py).
+    # raw_payload содержит оригинальный ответ ГИБДД, но без kart_id
+    # (он вычисляется только в ETL). Добавляем kart_id/empt_number в карточку
+    # после распаковки raw_payload.
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
-                SELECT id, raw_payload
+                SELECT id, kart_id, empt_number, raw_payload
                 FROM gibdd_cards
                 WHERE reg_code = %(reg)s
                   AND dat_period = ANY(%(dats)s)
@@ -99,6 +104,13 @@ async def get_cards_from_archive(
                     import json
                     payload = json.loads(payload)
                 if isinstance(payload, dict):
+                    # Добавляем kart_id и empt_number из БД (если их нет в raw_payload)
+                    # — это вычисленные при ETL значения, оригинальный raw_payload
+                    #   из API ГИБДД их не содержит.
+                    if row.get("kart_id") and not payload.get("kart_id"):
+                        payload["kart_id"] = row["kart_id"]
+                    if row.get("empt_number") and not payload.get("empt_number"):
+                        payload["empt_number"] = row["empt_number"]
                     cards.append(payload)
 
             logger.info(

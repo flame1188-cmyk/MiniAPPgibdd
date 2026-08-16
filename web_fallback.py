@@ -522,6 +522,35 @@ async def fetch_dtp_via_web(
         f"за {dat}, рег={reg_api} (web_reg={reg_web})"
     )
 
+    # Вычисляем kart_id для каждой карточки — это нужно для столбцов
+    # «Номер» / «Номер ДТП» в Excel. В web-fallback ответе kart_id нет,
+    # он нашёлся только в API. См. kart_id_utils.py для формулы (17 цифр).
+    if all_cards:
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _kart_id_path = _Path(__file__).resolve().parent / "miniapp" / "backend" / "db"
+            if str(_kart_id_path) not in _sys.path:
+                _sys.path.insert(0, str(_kart_id_path))
+            from kart_id_utils import build_kart_id
+        except ImportError:
+            try:
+                from kart_id_utils import build_kart_id
+            except ImportError as e:
+                logger.warning(f"kart_id_utils недоступен, kart_id не вычисляется: {e}")
+                build_kart_id = None
+
+        if build_kart_id:
+            enriched = 0
+            for card in all_cards:
+                kart_id, _ = build_kart_id(card, reg_api)
+                if kart_id:
+                    card["kart_id"] = kart_id
+                    enriched += 1
+            logger.info(
+                f"Web fallback: kart_id вычислен для {enriched}/{len(all_cards)} карт"
+            )
+
     return all_cards
 
 
