@@ -39,9 +39,16 @@ for line in ENV_PATH.read_text().splitlines():
         os.environ[k.strip()] = v.strip()
 
 # Импорты проекта
+# SCRIPT_DIR позволяет импортировать kart_id_utils.py рядом с этим скриптом
+# (там же, где он лежит в репозитории MiniAPPgibdd/scripts/).
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+# Совместимость со старой раскладкой /home/z/my-project/gibdd-bot/ — если репозиторий
+# лежит именно там, оставляем PROJECT_ROOT для доступа к api_client/config бота.
 PROJECT_ROOT = Path("/home/z/my-project/gibdd-bot")
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / "miniapp" / "backend"))
+if PROJECT_ROOT.is_dir():
+    sys.path.insert(0, str(PROJECT_ROOT))
+    sys.path.insert(0, str(PROJECT_ROOT / "miniapp" / "backend"))
 
 import httpx
 import psycopg
@@ -274,9 +281,11 @@ def parse_float(s: Any) -> float | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Формирование kart_id (9 цифр): region(2) + year(2) + last5(5)
+# Формирование kart_id (17 цифр): region(2) + year(2) + month(2) + day(2) + empt_number(9)
 # ─────────────────────────────────────────────────────────────────────────
 # Реализация в kart_id_utils.py — там же, где dry-run тесты и док.
+# kart_id_utils.py лежит рядом (scripts/) — это же модуль использует и
+# miniapp/backend/db/kart_id_utils.py в рантайме (archive.py, api_client.py).
 from kart_id_utils import build_kart_id
 
 
@@ -321,7 +330,7 @@ async def batch_insert_cards(
     cur, cards: list[dict], reg_code: str, dat: str
 ) -> tuple[dict[str, int], dict[int, tuple[str, int]], int]:
     """
-    Batch INSERT карточек с новой логикой kart_id = region(2)+year(2)+seq(5).
+    Batch INSERT карточек с новой логикой kart_id = region(2)+year(2)+month(2)+day(2)+empt_number(9) = 17 цифр.
 
     Returns:
         (kart_to_id, index_to_info, collisions_count)
