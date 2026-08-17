@@ -403,18 +403,21 @@ CREATE TRIGGER trg_llm_sessions_updated_at
 -- ─────────────────────────────────────────────────────────────────────────
 -- 1. КАРТОЧКИ ДТП (1 строка = 1 ДТП, уникальный kart_id)
 -- ─────────────────────────────────────────────────────────────────────────
--- kart_id (9 цифр): region(2) + year(2) + seq(5)
+-- kart_id (17 цифр): region(2) + year(2) + month(2) + day(2) + empt_number(9)
 --   region — последние 2 цифры reg_code (46 = Московская обл.)
 --   year   — последние 2 цифры года из date_dtp (26 для 2026)
---   seq    — последние 5 цифр empt_number (внутренний номер ГИБДД)
--- Пример: reg=1146, date_dtp=2026-01-12, empt_number=460100875
---         → kart_id = "46" + "26" + "00875" = "462600875"
+--   month  — месяц ДТП из date_dtp (01-12)
+--   day    — день ДТП из date_dtp (01-31)
+--   empt   — оригинальный empt_number, дополненный нулями слева до 9 цифр
+-- Пример: reg=1103, date_dtp=28.11.2021, empt_number=030000011
+--         → kart_id = "11" + "21" + "11" + "28" + "030000011" = "11211128030000011"
 -- empt_number хранится ОТДЕЛЬНО для аудита (внутренний номер ГИБДД).
--- Коллизии kart_id (разные ДТП, одинаковые last-5 empt_number в одном регионе-годе)
--- логируются в gibdd_cards_collisions.
+-- Коллизии kart_id (разные ДТП, одинаковые region+year+month+day+empt_number)
+-- логируются в gibdd_cards_collisions. С добавлением даты коллизии практически
+-- невозможны (только если ГИБДД выпустит две карты с одинаковым empt в один день).
 CREATE TABLE IF NOT EXISTS gibdd_cards (
     id              BIGSERIAL    PRIMARY KEY,
-    kart_id         VARCHAR(32)  NOT NULL,            -- 9 цифр: region(2)+year(2)+seq(5)
+    kart_id         VARCHAR(32)  NOT NULL,            -- 17 цифр: region(2)+year(2)+month(2)+day(2)+empt_number(9)
     empt_number     VARCHAR(32),                      -- оригинальный empt_number (внутр. номер ГИБДД)
     reg_code        VARCHAR(16)  NOT NULL,            -- "1146" Московская обл.
     dat_period      VARCHAR(8)   NOT NULL,            -- "7.2026" (месяц публикации)
