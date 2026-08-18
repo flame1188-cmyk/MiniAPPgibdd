@@ -144,20 +144,22 @@ _last_llm_call_time: float = 0.0
 _MIN_LLM_INTERVAL: float = 5.0  # секунды между запросами (для glm-4.7-flash достаточно)
 
 # ============================================================
-# Sprint 5: Глобальный 429-cooldown — защита от каскада 429 от ZhipuAI
+# Sprint 5: 429-cooldown — защита от каскада 429 от LLM-провайдера
 # ============================================================
-# После получения 429 от ZhipuAI (код 1305: "该模型当前访问量过大")
-# устанавливаем «чёрный период» длительностью _LLM_429_COOLDOWN_SEC,
-# в течение которого любые новые запросы ждут его истечения.
-# Это решает проблему: пользователь читает ответ 20-30 сек, потом
-# задаёт новый вопрос — а ZhipuAI всё ещё throttling (его rate window
-# может быть 60+ сек). Без этого cooldown'а каждый новый запрос
-# мгновенно возвращает 429.
+# После получения 429 от LLM-провайдера (например, ZhipuAI код 1305:
+# "该模型当前访问量过大") устанавливаем «чёрный период» длительностью
+# _LLM_429_COOLDOWN_SEC, в течение которого любые новые запросы К ТОМУ
+# ЖЕ провайдеру ждут его истечения.
+#
+# ВАЖНО: cooldown — PER-PROVIDER, не глобальный. Если free (ZhipuAI)
+# вернул 429, это НЕ блокирует платный провайдер (DeepSeek). Это
+# критично: пользователь при 429 от free может сразу переключиться на
+# paid и получить ответ, не ожидая 60 сек.
 #
 # Атомарность: обновление через asyncio.Lock, чтобы 2 параллельных
 # coroutine не перетёрли значение.
 _LLM_429_COOLDOWN_SEC: float = 60.0  # длительность чёрного периода после 429
-_llm_429_until: float = 0.0  # monotonic-время до которого действуют ограничения
+_llm_429_until: dict[str, float] = {"free": 0.0, "paid": 0.0}  # per-provider
 _llm_429_lock: asyncio.Lock | None = None  # lazy-init (нужен running loop)
 
 
@@ -169,11 +171,17 @@ def _get_429_lock() -> asyncio.Lock:
     return _llm_429_lock
 
 
-async def mark_429(retry_after: float | None = None) -> None:
+async def mark_429(
+    retry_after: float | None = None,
+    provider: str = "free",
+) -> None:
     """
     Помечает, что получен 429 от LLM-провайдера.
-    Устанавливает cooldown на _LLM_429_COOLDOWN_SEC секунд
-    (или на retry_after, если провайдер прислал больше).
+    Устанавливает cooldown ТОЛЬКО для указанного provider — на
+    _LLM_429_COOLDOWN_SEC секунд (или на retry_after, если больше).
+
+    provider: "free" (ZhipuAI) или "paid" (DeepSeek). 429 от free
+    НЕ блокирует paid, и наоборот.
 
     Вызывается из _do_llm_request и _do_llm_stream_request при 429.
     """
@@ -182,28 +190,30 @@ async def mark_429(retry_after: float | None = None) -> None:
     async with _get_429_lock():
         new_until = time.monotonic() + cooldown
         # Берём максимум — если уже есть активный cooldown, продлеваем
-        _llm_429_until = max(_llm_429_until, new_until)
+        prev = _llm_429_until.get(provider, 0.0)
+        _llm_429_until[provider] = max(prev, new_until)
     logger.warning(
-        f"LLM 429 cooldown activated for {cooldown:.0f}s "
-        f"(retry_after={retry_after})"
+        f"LLM 429 cooldown activated for provider={provider}: "
+        f"{cooldown:.0f}s (retry_after={retry_after})"
     )
 
 
-async def wait_429_cooldown() -> float:
+async def wait_429_cooldown(provider: str = "free") -> float:
     """
-    Если действует 429-cooldown — ждёт до его истечения.
-    Возвращает количество секунд, которое пришлось ждать (0 если не ждали).
+    Если действует 429-cooldown для указанного provider — ждёт до
+    его истечения. Возвращает количество секунд ожидания (0 если не ждали).
 
-    Атомарно читает и не сбрасывает значение — cooldown продолжает действовать,
-    пока не истечёт по времени.
+    provider: "free" или "paid". Возвращает 0.0 если cooldown для
+    этого провайдера не активен (даже если активен для другого).
     """
     global _llm_429_until
     async with _get_429_lock():
-        remaining = _llm_429_until - time.monotonic()
+        remaining = _llm_429_until.get(provider, 0.0) - time.monotonic()
     if remaining <= 0:
         return 0.0
     logger.info(
-        f"LLM 429 cooldown active — waiting {remaining:.1f}s before request..."
+        f"LLM 429 cooldown (provider={provider}) active — "
+        f"waiting {remaining:.1f}s before request..."
     )
     # Ждём вне блокировки — иначе другие coroutines повиснут
     await asyncio.sleep(remaining)
@@ -1894,6 +1904,7 @@ async def _ask_free_llm(
         prompt_len=len(user_message),
         max_retries=max_retries,
         client_getter=_get_free_llm_client,
+        provider="free",
     )
 
 
@@ -1949,6 +1960,7 @@ async def _ask_paid_llm(
         prompt_len=len(user_message),
         max_retries=max_retries,
         client_getter=_get_paid_llm_client,
+        provider="paid",
     )
 
 
@@ -1960,16 +1972,20 @@ async def _do_llm_request(
     prompt_len: int,
     max_retries: int,
     client_getter,
+    provider: str = "free",
 ) -> str:
     """
     Универсная функция выполнения HTTP-запроса к LLM API.
     Обрабатывает ретраи при 429, 5xx и таймаутах, парсит ответ.
+
+    provider: "free" или "paid" — нужен для per-provider cooldown.
     """
-    # --- Sprint 5: Глобальный 429-cooldown (если был 429 ранее) ---
-    waited_cooldown = await wait_429_cooldown()
+    # --- Sprint 5: 429-cooldown (per-provider, если был 429 ранее) ---
+    waited_cooldown = await wait_429_cooldown(provider=provider)
     if waited_cooldown > 0:
         logger.info(
-            f"LLM: после 429-cooldown ({waited_cooldown:.0f}s) — продолжаем запрос"
+            f"LLM ({provider}): после 429-cooldown ({waited_cooldown:.0f}s) "
+            f"— продолжаем запрос"
         )
 
     # --- Глобальный rate limiter ---
@@ -2044,8 +2060,9 @@ async def _do_llm_request(
             )
 
             if response.status_code == 429:
-                # Sprint 5: помечаем глобальный 429-cooldown, чтобы
-                # другие coroutine (включая streaming-запросы) тоже ждали.
+                # Sprint 5: помечаем per-provider 429-cooldown, чтобы
+                # другие coroutine ТОГО ЖЕ провайдера тоже ждали.
+                # НЕ блокирует другой провайдер (paid/free независимы).
                 retry_after_val: float | None = None
                 if retry_after_raw := (
                     response.headers.get("Retry-After")
@@ -2055,7 +2072,7 @@ async def _do_llm_request(
                         retry_after_val = float(retry_after_raw)
                     except (ValueError, TypeError):
                         retry_after_val = None
-                await mark_429(retry_after=retry_after_val)
+                await mark_429(retry_after=retry_after_val, provider=provider)
 
                 if attempt < max_retries:
                     retry_after = (
@@ -2349,6 +2366,7 @@ async def _ask_llm_stream_free(
         model_name=LLM_MODEL,
         prompt_len=len(user_message),
         client_getter=_get_free_llm_client,
+        provider="free",
     ):
         yield delta
 
@@ -2390,6 +2408,7 @@ async def _ask_llm_stream_paid(
         model_name=LLM_PAID_MODEL,
         prompt_len=len(user_message),
         client_getter=_get_paid_llm_client,
+        provider="paid",
     ):
         yield delta
 
@@ -2409,7 +2428,9 @@ _LLM_PRICING_USD_PER_1M_TOKENS = {
     "glm-4.7-flash":       {"input": 0.07,  "output": 0.07},
     "glm-4-air":           {"input": 0.14,  "output": 0.14},
     "glm-4-plus":          {"input": 2.8,   "output": 2.8},
-    # DeepSeek
+    # DeepSeek (через AItunnel: https://api.aitunnel.ru)
+    # V4 Flash — упрощённая версия V4 для быстрой генерации, дешевле базовой.
+    "deepseek-v4-flash":   {"input": 0.14,  "output": 0.28},
     "deepseek-chat":       {"input": 0.14,  "output": 0.28},
     "deepseek-reasoner":   {"input": 0.55,  "output": 2.19},
 }
@@ -2469,15 +2490,19 @@ async def _do_llm_stream_request(
     model_name: str,
     prompt_len: int,
     client_getter,
+    provider: str = "free",
 ) -> AsyncIterator[str]:
     """
     Универсальный streaming-вызов LLM API.
     Парсит SSE-ответ OpenAI-совместимого формата.
 
+    provider: "free" или "paid" — нужен для per-provider cooldown.
+    429 от free НЕ блокирует paid, и наоборот.
+
     Sprint 5: ДЕЛАЕТ retry на 429 — в отличие от предыдущей версии,
     которая сразу бросала httpx.HTTPStatusError. Логика:
-      1. Перед запросом ждём 429-cooldown (если активен).
-      2. Делаем запрос. Если 429 — mark_429() (cooldown 60 сек),
+      1. Перед запросом ждём 429-cooldown для этого provider (если активен).
+      2. Делаем запрос. Если 429 — mark_429(provider) (cooldown 60 сек),
          ждём, повторяем (до _STREAM_429_MAX_RETRIES раз).
       3. На 200 — стримим чанки. Retry после начала стрима невозможен
          (commit к этому ответу).
@@ -2492,12 +2517,12 @@ async def _do_llm_stream_request(
     _STREAM_429_BASE_WAIT = 30.0  # первая пауза перед retry
     _STREAM_429_BACKOFF = 1.5  # множитель для последующих пауз
 
-    # --- Sprint 5: Глобальный 429-cooldown (если был 429 ранее) ---
-    waited_cooldown = await wait_429_cooldown()
+    # --- Sprint 5: 429-cooldown (per-provider, если был 429 ранее) ---
+    waited_cooldown = await wait_429_cooldown(provider=provider)
     if waited_cooldown > 0:
         logger.info(
-            f"LLM stream: после 429-cooldown ({waited_cooldown:.0f}s) "
-            f"— продолжаем запрос"
+            f"LLM stream ({provider}): после 429-cooldown "
+            f"({waited_cooldown:.0f}s) — продолжаем запрос"
         )
 
     # --- Глобальный rate limiter (один раз до запроса) ---
@@ -2555,20 +2580,21 @@ async def _do_llm_stream_request(
                                 retry_after = float(retry_after_str)
                             except (ValueError, TypeError):
                                 retry_after = None
-                        # Устанавливаем глобальный cooldown (60 сек)
-                        await mark_429(retry_after=retry_after)
+                        # Устанавливаем per-provider cooldown (60 сек) —
+                        # НЕ блокирует другой провайдер.
+                        await mark_429(retry_after=retry_after, provider=provider)
                         # Локальная пауза перед retry: используем max(retry_after, base_wait)
                         wait_sec = _STREAM_429_BASE_WAIT * (_STREAM_429_BACKOFF ** attempt)
                         if retry_after and retry_after > wait_sec:
                             wait_sec = retry_after
                         attempt += 1
                         logger.warning(
-                            f"LLM stream: 429 Too Many Requests. "
+                            f"LLM stream ({provider}): 429 Too Many Requests. "
                             f"Retry {attempt}/{_STREAM_429_RETRIES} через {wait_sec:.0f}с..."
                         )
                         await asyncio.sleep(wait_sec)
-                        # На следующий retry — снова проверим cooldown
-                        await wait_429_cooldown()
+                        # На следующий retry — снова проверим cooldown для того же provider
+                        await wait_429_cooldown(provider=provider)
                         continue  # повторяем цикл
 
                     # Не 429 или retries закончились — бросаем ошибку
