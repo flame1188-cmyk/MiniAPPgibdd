@@ -52,13 +52,28 @@ async def _configure_connection(conn: AsyncConnection) -> None:
       tcp_keepalives_idle=30     — начать слать keepalive после 30 сек простоя
       tcp_keepalives_interval=10 — интервал между keepalive пакетами (10 сек)
       tcp_keepalives_count=3     — количество неудачных keepalive до закрытия
+
+    ВАЖНО: после SET обязателен conn.commit() (или autocommit=True).
+    psycopg 3 по умолчанию работает в autocommit=False, поэтому
+    conn.execute("SET ...") открывает неявную транзакцию и оставляет
+    соединение в статусе INTRANS. Пул с check=check_connection увидит
+    INTRANS-соединение, сочтёт его «грязным» и отбросит. В итоге пул
+    не набирает min_size за timeout — приложение падает в in-memory fallback.
+    См. лог: "connection left in status INTRANS by configure function: discarded".
     """
     try:
-        await conn.execute(
-            "SET tcp_keepalives_idle = 30; "
-            "SET tcp_keepalives_interval = 10; "
-            "SET tcp_keepalives_count = 3;"
-        )
+        # SET-команды — это session-level конфигурация. Используем
+        # autocommit=True, чтобы не оставлять соединение в INTRANS.
+        old_autocommit = conn.autocommit
+        conn.autocommit = True
+        try:
+            await conn.execute(
+                "SET tcp_keepalives_idle = 30; "
+                "SET tcp_keepalives_interval = 10; "
+                "SET tcp_keepalives_count = 3;"
+            )
+        finally:
+            conn.autocommit = old_autocommit
     except Exception as exc:
         # Не роняем пул, если параметры недоступны (например, старая PG)
         logger.debug(f"_configure_connection: tcp_keepalives set failed: {exc}")
