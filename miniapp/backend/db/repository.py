@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from psycopg import OperationalError
 from psycopg.types.json import Json, Jsonb
 from psycopg.rows import dict_row
 
@@ -50,6 +51,44 @@ _TASKS_HEAVY_STATE: Dict[str, Dict[str, Any]] = {}
 # При наличии БД — используется только как кэш поверх SQL (чтобы не
 # дёргать БД на каждый get_task).
 _TASKS_MEMORY: Dict[str, "Task"] = {}  # type: ignore[name-defined]
+
+
+# ====================================================================
+# Retry-обёртка для операций с пулом PostgreSQL.
+# ====================================================================
+# Проблема: даже с check= и check_interval= в пуле иногда остаются
+# BAD-соединения (гонка: соединение умерло после последнего
+# check_connection, но до выдачи из getconn()). В этом случае первый
+# запрос падает с OperationalError / "SSL error: unexpected eof".
+#
+# Решение: одна попытка retry. При возврате соединения через __exit__
+# пул сам его выбросит (BAD), поэтому повторный вызов получит свежее.
+#
+# Обёртка применяется только к read-only функциям, которые фигурируют
+# в логах WARNING (list_user_tasks_from_db, recover_stale_pending).
+# Write-функции (save_task) ретраятся на уровне router'а.
+async def _with_pool_retry(coro_fn, *args, **kwargs):
+    """
+    Вызывает async-функцию coro_fn(*args, **kwargs) с одним retry
+    при OperationalError. Используется только для read-only операций
+    (для write нужна идемпотентность — см. routers/dtp.py).
+
+    Возвращает (success: bool, result_or_exception).
+    """
+    try:
+        return True, await coro_fn(*args, **kwargs)
+    except OperationalError as exc:
+        # Пул выбросит BAD-соединение при возврате через __exit__,
+        # поэтому повторный вызов получит свежее.
+        logger.warning(
+            f"_with_pool_retry: DB op failed with OperationalError, "
+            f"retrying once: {exc}"
+        )
+    try:
+        return True, await coro_fn(*args, **kwargs)
+    except OperationalError as exc:
+        logger.warning(f"_with_pool_retry: retry also failed: {exc}")
+        return False, exc
 
 
 def set_heavy_state(task_id: str, key: str, value: Any) -> None:
@@ -313,69 +352,87 @@ async def list_user_tasks_from_db(
     if pool is None:
         return []
 
-    try:
-        async with pool.connection() as conn:
-            cur = await conn.execute(
-                """
-                SELECT id, user_id, region_code, region_name, period_label,
-                       dat_list, raw_query, status, progress, error,
-                       total_dtp, total_dead, total_injured, files,
-                       analytics, clusters_result,
-                       created_at, updated_at
-                FROM tasks
-                WHERE user_id = %(uid)s
-                ORDER BY created_at DESC
-                LIMIT %(limit)s
-                """,
-                params={"uid": user_id, "limit": limit},
-                prepare=False,
-            )
-            rows = await cur.fetchall()
+    # Inline retry по OperationalError. Пул может выдать BAD-соединение
+    # (гонка между check_connection и getconn), в этом случае первый
+    # вызов падает с OperationalError/"SSL eof". При возврате через
+    # __exit__ пул выбросит BAD, и повторная попытка получит свежее.
+    last_exc: Optional[Exception] = None
+    for attempt in (1, 2):
+        try:
+            async with pool.connection() as conn:
+                cur = await conn.execute(
+                    """
+                    SELECT id, user_id, region_code, region_name, period_label,
+                           dat_list, raw_query, status, progress, error,
+                           total_dtp, total_dead, total_injured, files,
+                           analytics, clusters_result,
+                           created_at, updated_at
+                    FROM tasks
+                    WHERE user_id = %(uid)s
+                    ORDER BY created_at DESC
+                    LIMIT %(limit)s
+                    """,
+                    params={"uid": user_id, "limit": limit},
+                    prepare=False,
+                )
+                rows = await cur.fetchall()
 
-        tasks: List[Any] = []
-        for row in rows:
-            # Проверяем in-memory кэш (чтобы вернуть тяжёлые поля, если они есть)
-            if row["id"] in _TASKS_MEMORY:
-                tasks.append(_TASKS_MEMORY[row["id"]])
+            tasks: List[Any] = []
+            for row in rows:
+                # Проверяем in-memory кэш (чтобы вернуть тяжёлые поля, если они есть)
+                if row["id"] in _TASKS_MEMORY:
+                    tasks.append(_TASKS_MEMORY[row["id"]])
+                    continue
+
+                task = task_factory(
+                    id=row["id"],
+                    user_id=row["user_id"],
+                    region_code=row["region_code"],
+                    region_name=row["region_name"],
+                    period_label=row["period_label"],
+                    dat_list=list(row["dat_list"]) if row["dat_list"] else [],
+                    raw_query=row["raw_query"] or "",
+                )
+                _restore_status(task, row["status"], row["progress"], row["error"])
+                task.total_dtp = row["total_dtp"] or 0
+                task.total_dead = row["total_dead"] or 0
+                task.total_injured = row["total_injured"] or 0
+                task.files = list(row["files"]) if row["files"] else []
+                task.analytics = row["analytics"]
+                if row["clusters_result"] and task.clusters_state:
+                    task.clusters_state.result = row["clusters_result"]
+                    task.clusters_state.status = _make_analysis_status("done")
+                    task.clusters_state.progress = 100
+                    task.clusters_state.stage = "Готово (восстановлено из БД)"
+
+                if row["created_at"]:
+                    task.created_at = row["created_at"]
+                if row["updated_at"]:
+                    task.updated_at = row["updated_at"]
+
+                _TASKS_MEMORY[task.id] = task
+                tasks.append(task)
+
+            return tasks
+
+        except OperationalError as exc:
+            last_exc = exc
+            if attempt == 1:
+                logger.warning(
+                    f"list_user_tasks_from_db: OperationalError on attempt 1, "
+                    f"retrying: {exc}"
+                )
                 continue
+            logger.warning(f"list_user_tasks_from_db: retry also failed: {exc}")
+            break
+        except Exception as exc:
+            logger.warning(f"list_user_tasks_from_db failed: {exc}")
+            break
 
-            task = task_factory(
-                id=row["id"],
-                user_id=row["user_id"],
-                region_code=row["region_code"],
-                region_name=row["region_name"],
-                period_label=row["period_label"],
-                dat_list=list(row["dat_list"]) if row["dat_list"] else [],
-                raw_query=row["raw_query"] or "",
-            )
-            _restore_status(task, row["status"], row["progress"], row["error"])
-            task.total_dtp = row["total_dtp"] or 0
-            task.total_dead = row["total_dead"] or 0
-            task.total_injured = row["total_injured"] or 0
-            task.files = list(row["files"]) if row["files"] else []
-            task.analytics = row["analytics"]
-            if row["clusters_result"] and task.clusters_state:
-                task.clusters_state.result = row["clusters_result"]
-                task.clusters_state.status = _make_analysis_status("done")
-                task.clusters_state.progress = 100
-                task.clusters_state.stage = "Готово (восстановлено из БД)"
-
-            if row["created_at"]:
-                task.created_at = row["created_at"]
-            if row["updated_at"]:
-                task.updated_at = row["updated_at"]
-
-            _TASKS_MEMORY[task.id] = task
-            tasks.append(task)
-
-        return tasks
-
-    except Exception as exc:
-        logger.warning(f"list_user_tasks_from_db failed: {exc}")
-        # In-memory fallback
-        user_tasks = [t for t in _TASKS_MEMORY.values() if t.user_id == user_id]
-        user_tasks.sort(key=lambda t: t.created_at, reverse=True)
-        return user_tasks[:limit]
+    # In-memory fallback (после retry-exhaustion или не-DB ошибки)
+    user_tasks = [t for t in _TASKS_MEMORY.values() if t.user_id == user_id]
+    user_tasks.sort(key=lambda t: t.created_at, reverse=True)
+    return user_tasks[:limit]
 
 
 # ====================================================================
@@ -937,6 +994,27 @@ async def recover_stale_pending_tasks() -> int:
     if pool is None:
         return 0
 
+    # Retry по OperationalError через _with_pool_retry. Пул может
+    # выдать BAD-соединение (гонка между check_connection и getconn),
+    # тогда первый вызов падает с "SSL eof". При возврате через __exit__
+    # пул выбросит BAD, и повторная попытка получит свежее. Функция
+    # идемпотентна: повторный SELECT найдёт уже помеченные задачи
+    # и пропустит их (UPDATE WHERE status='pending' не заденет failed/done).
+    success, result = await _with_pool_retry(
+        _recover_stale_pending_tasks_impl, pool
+    )
+    if success:
+        return result  # int (recovered_count)
+    return 0  # fallback после retry-exhaustion
+
+
+async def _recover_stale_pending_tasks_impl(pool) -> int:
+    """Реализация recover_stale_pending_tasks с одним соединением.
+
+    Вызывается через _with_pool_retry для retry по OperationalError.
+    Идемпотентна: повторный запуск найдёт уже помеченные задачи
+    и пропустит их (UPDATE WHERE status='pending' не заденет failed/done).
+    """
     recovered_count = 0
     try:
         async with pool.connection() as conn:
@@ -1113,8 +1191,11 @@ async def recover_stale_pending_tasks() -> int:
                 except Exception:
                     pass
 
+    except OperationalError:
+        # Re-raise для _with_pool_retry — чтобы retry отработал
+        raise
     except Exception as exc:
-        logger.warning(f"recover_stale_pending failed: {exc}")
+        logger.warning(f"_recover_stale_pending_tasks_impl failed: {exc}")
 
     return recovered_count
 

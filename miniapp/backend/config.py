@@ -109,6 +109,29 @@ class Settings(BaseSettings):
     db_connect_timeout: int = Field(
         default=30, description="Таймаут подключения (сек)"
     )
+    db_pool_max_idle: int = Field(
+        default=120,
+        description=(
+            "Сколько секунд соединение может быть idle в пуле, прежде чем "
+            "пул его закроет. Дефолт psycopg — 600 (10 мин) — слишком долго "
+            "для VPS с NAT idle timeout 60-300 сек. 120 сек безопасно."
+        ),
+    )
+    db_pool_max_lifetime: int = Field(
+        default=600,
+        description=(
+            "Максимальное время жизни соединения (сек), даже активного. "
+            "Дефолт psycopg — 3600 (1 час) — слишком долго. 600 сек "
+            "ре-циклит соединения за 10 мин."
+        ),
+    )
+    db_pool_reconnect_timeout: int = Field(
+        default=60,
+        description=(
+            "Сколько секунд ждать реконнект при total outage БД. "
+            "Дефолт psycopg — 300 (5 мин) — слишком долго."
+        ),
+    )
 
     @property
     def db_enabled(self) -> bool:

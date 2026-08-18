@@ -19,7 +19,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from psycopg import OperationalError
+from psycopg import AsyncConnection, OperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -36,6 +36,32 @@ _DB_READY: bool = False
 
 # Путь к schema.sql (рядом с этим файлом)
 SCHEMA_SQL_PATH = Path(__file__).parent / "schema.sql"
+
+
+async def _configure_connection(conn: AsyncConnection) -> None:
+    """
+    Применяется к каждому новому соединению в пуле.
+
+    Включает TCP keepalive на стороне PostgreSQL-клиента (libpq через
+    server-side параметры tcp_keepalives_*), чтобы соединения не "зависали"
+    после простоя. На VPS с NAT/iptables conntrack типичный idle timeout
+    60-300 сек — без keepalive соединения становятся BAD и первый
+    запрос после простоя падает с "SSL error: unexpected eof while reading".
+
+    Параметры:
+      tcp_keepalives_idle=30     — начать слать keepalive после 30 сек простоя
+      tcp_keepalives_interval=10 — интервал между keepalive пакетами (10 сек)
+      tcp_keepalives_count=3     — количество неудачных keepalive до закрытия
+    """
+    try:
+        await conn.execute(
+            "SET tcp_keepalives_idle = 30; "
+            "SET tcp_keepalives_interval = 10; "
+            "SET tcp_keepalives_count = 3;"
+        )
+    except Exception as exc:
+        # Не роняем пул, если параметры недоступны (например, старая PG)
+        logger.debug(f"_configure_connection: tcp_keepalives set failed: {exc}")
 
 
 def is_db_ready() -> bool:
@@ -70,6 +96,19 @@ async def init_pool() -> bool:
         #   - hits/misses кэшей — кратковременные соединения
         # При росте до 30 пользователей — увеличьте DB_POOL_MAX до 30-40.
         # timeout: на shared-хостинге PG может тормозить — даём 30 сек.
+        #
+        # check: пул вызывает этот callback перед выдачей соединения
+        # из getconn(). AsyncConnectionPool.check_connection делает
+        # SELECT 1 — ловит BAD-соединения, которые умерли по idle TCP
+        # timeout (NAT/iptables conntrack). Без этого первый запрос
+        # после простоя падает с "SSL error: unexpected eof while reading".
+        # Оверхед ~1-2 мс на запрос.
+        #
+        # max_idle / max_lifetime: пул сам ре-циклирует соединения раньше,
+        # чем сервер/NAT их закроет. Дефолты psycopg 600/3600 — слишком
+        # долго для VPS-деплоя с NAT idle timeout 60-300 сек.
+        #
+        # configure: включает TCP keepalive на стороне клиента.
         _pool = AsyncConnectionPool(
             conninfo=settings.database_url,
             min_size=settings.db_pool_min,
@@ -78,6 +117,19 @@ async def init_pool() -> bool:
             # dict_row — чтобы fetchone() возвращал dict, удобнее для
             # сериализации в JSON.
             kwargs={"row_factory": dict_row},
+            # Проверять соединения перед выдачей (SELECT 1). Полностью
+            # убирает "SSL eof" ошибки, добавляет ~1-2 мс на запрос.
+            check=AsyncConnectionPool.check_connection,
+            # Ре-цикл соединений. На VPS с NAT idle timeout 60-300 сек,
+            # поэтому 120 сек max_idle — безопасно. max_lifetime 600 сек
+            # ре-циклит даже активные соединения (защита от накопления
+            # плохих TCP-сессий).
+            max_idle=settings.db_pool_max_idle,
+            max_lifetime=settings.db_pool_max_lifetime,
+            # Сколько ждать реконнект при total outage (1 мин).
+            reconnect_timeout=settings.db_pool_reconnect_timeout,
+            # TCP keepalive на каждом новом соединении
+            configure=_configure_connection,
             # Не открывать соединения синхронно при создании —
             # пусть пул открывает их по требованию.
             open=False,
