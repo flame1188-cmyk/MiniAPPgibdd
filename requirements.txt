@@ -56,9 +56,6 @@ python-multipart==0.0.20
 pydantic==2.10.4
 pydantic-settings==2.7.1
 
-# --- Logging ---
-loguru==0.7.3
-
 # --- SSE streaming (Sprint 4) ---
 # sse-starlette — Server-Sent Events для FastAPI.
 # Используется в routers/llm.py для /llm/ask/stream и /llm/summary/stream.
