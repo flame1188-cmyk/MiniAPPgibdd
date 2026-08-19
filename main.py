@@ -25,6 +25,8 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from fastapi import status
+from fastapi.responses import JSONResponse
 
 # Убеждаемся, что корень gibdd-bot в sys.path
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -812,6 +814,96 @@ async def health_celery():
 
     return result
 
+@app.get("/health/all")
+async def health_all():
+    """
+    Агрегированный health-check всех компонентов системы.
+
+    Возвращает 200 OK если все критичные компоненты живы.
+    Возвращает 503 Service Unavailable если хотя бы один组件 упал.
+
+    Используется как Docker HEALTHCHECK.
+
+    Компоненты для проверки:
+    - API (всегда — это сам процесс)
+    - PostgreSQL (если DATABASE_URL задан)
+    - Redis (если USE_CELERY=true)
+    - Celery worker (если USE_CELERY=true)
+    """
+    import config
+
+    checks = {}
+    overall_ok = True
+
+    # 1. API health — всегда
+    checks["api"] = {"status": "ok", "telegram_bot": "running" if tg_app else "stopped"}
+    if not tg_app:
+        # Telegram bot не работает — это критично
+        checks["api"]["status"] = "degraded"
+        overall_ok = False
+
+    # 2. PostgreSQL — если настроен
+    try:
+        if db_is_ready():
+            checks["database"] = {"status": "ok"}
+        else:
+            # В single-режиме без БД — это acceptable (in-memory fallback)
+            if config.DATABASE_URL:
+                checks["database"] = {"status": "down", "error": "configured but not ready"}
+                overall_ok = False
+            else:
+                checks["database"] = {"status": "not_configured"}
+    except Exception as exc:
+        checks["database"] = {"status": "error", "error": str(exc)}
+        if config.DATABASE_URL:
+            overall_ok = False
+
+    # 3. Redis — если multi-режим
+    if config.USE_CELERY:
+        try:
+            # Reuse health_redis logic
+            redis_health = await health_redis()
+            redis_ok = redis_health.get("connected", False)
+            checks["redis"] = {
+                "status": "ok" if redis_ok else "down",
+                "latency_ms": redis_health.get("latency_ms"),
+                "memory_used_mb": redis_health.get("memory_used_mb"),
+                "memory_max_mb": redis_health.get("memory_max_mb"),
+            }
+            if not redis_ok:
+                overall_ok = False
+
+            # 4. Celery worker — если multi-режим
+            celery_health = await health_celery()
+            celery_ok = celery_health.get("ping_count", 0) > 0
+            checks["celery"] = {
+                "status": "ok" if celery_ok else "down",
+                "ping_count": celery_health.get("ping_count", 0),
+                "active_tasks": celery_health.get("active_tasks", 0),
+                "queued_tasks": celery_health.get("queued_tasks", {}),
+            }
+            if not celery_ok:
+                overall_ok = False
+        except Exception as exc:
+            checks["redis"] = {"status": "error", "error": str(exc)}
+            checks["celery"] = {"status": "error", "error": str(exc)}
+            overall_ok = False
+    else:
+        checks["redis"] = {"status": "not_configured"}
+        checks["celery"] = {"status": "not_configured"}
+
+    response_body = {
+        "status": "ok" if overall_ok else "down",
+        "deployment_mode": config.DEPLOYMENT_MODE if hasattr(config, "DEPLOYMENT_MODE") else "single",
+        "checks": checks,
+    }
+
+    if not overall_ok:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=response_body,
+        )
+    return response_body
 
 # ============================================================
 # /debug/supervisor-logs — чтение логов supervisord из контейнера
