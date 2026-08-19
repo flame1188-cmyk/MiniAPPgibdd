@@ -134,11 +134,14 @@ ENV PYTHONUNBUFFERED=1
 # Режим деплоя: single (по умолчанию, только API) или multi (supervisord с 4 процессами)
 ENV DEPLOYMENT_MODE=single
 
-# Healthcheck: берём порт из $PORT, чтобы он работал и на bothost (3000), и локально (8080).
-# В multi-режиме supervisord запускает Redis/api/worker/beat, но /health проверяет только API.
-# Дополнительные проверки: /health/redis, /health/celery (см. main.py Sprint 7).
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -f "http://localhost:${PORT:-8080}/health" || exit 1
+# Стало:
+# Stabilization A6: используем /health/all вместо /health.
+# /health/all проверяет API + DB + Redis + Celery worker и возвращает 503
+# если хотя бы один критичный компонент упал. Это позволяет bothost
+# перезапустить контейнер при падении worker/redis (а не только API).
+# В single-режиме проверяет только API + DB — Redis/Celery не нужны.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f "http://localhost:${PORT:-8080}/health/all" || exit 1
 
 # Открываем оба порта: 3000 (bothost) и 8080 (локальный дефолт main.py).
 # EXPOSE — это метаданные, bothost всё равно использует поле «Порт» из дашборда.
