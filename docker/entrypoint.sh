@@ -13,7 +13,7 @@
 #    Запускает supervisord с 4 процессами:
 #      - redis-server (брокер + result backend + pub/sub)
 #      - uvicorn main:app (FastAPI + webhook)
-#      - celery worker (4 очереди, concurrency=4)
+#      - celery worker (4 очереди, concurrency=2 по умолчанию)
 #      - celery beat (периодические задачи)
 #    Используется после Фазы C.3, когда задачи переводятся на Celery.
 #
@@ -21,6 +21,12 @@
 #   - $PORT передаётся bothost (обычно 3000 или 8080)
 #   - /app/data — персистентный volume (кэш камер, регионов, OSM)
 #   - /data/redis — персистентный volume для Redis (если включён)
+#
+# Stabilization A6 fix:
+#   - Задаёт default для CELERY_MAX_TASKS_PER_CHILD (=10) и
+#     CELERY_WORKER_CONCURRENCY (=2) если они не заданы в env.
+#     supervisord требует, чтобы переменные %(ENV_*)s существовали,
+#     иначе падает с ошибкой подстановки.
 # ============================================================
 set -e
 
@@ -30,25 +36,46 @@ mkdir -p /app/data/osm_cache /app/data/cameras
 mkdir -p /data/redis
 mkdir -p /var/log/supervisor
 
+# Stabilization A6: defaults для supervisord-подстановок.
+# Если не задать — supervisord упадёт с "subject not defined" при парсинге
+# %(ENV_CELERY_MAX_TASKS_PER_CHILD)s в supervisord.conf.
+if [ -z "${CELERY_MAX_TASKS_PER_CHILD}" ]; then
+    CELERY_MAX_TASKS_PER_CHILD=10
+    export CELERY_MAX_TASKS_PER_CHILD
+    echo "[entrypoint] CELERY_MAX_TASKS_PER_CHILD not set, defaulting to ${CELERY_MAX_TASKS_PER_CHILD}"
+fi
+if [ -z "${CELERY_WORKER_CONCURRENCY}" ]; then
+    CELERY_WORKER_CONCURRENCY=2
+    export CELERY_WORKER_CONCURRENCY
+    echo "[entrypoint] CELERY_WORKER_CONCURRENCY not set, defaulting to ${CELERY_WORKER_CONCURRENCY} (optimized for 2GB RAM)"
+fi
+if [ -z "${PORT}" ]; then
+    PORT=8080
+    export PORT
+fi
+
 # Режим деплоя: single (по умолчанию) или multi
 DEPLOYMENT_MODE="${DEPLOYMENT_MODE:-single}"
 
 case "$DEPLOYMENT_MODE" in
     single)
         echo "[entrypoint] DEPLOYMENT_MODE=single — запуск python main.py"
-        echo "[entrypoint] PORT=${PORT:-8080}, BOTHOST_DOMAIN=${BOTHOST_DOMAIN:-<не задан>}"
+        echo "[entrypoint] PORT=${PORT}, BOTHOST_DOMAIN=${BOTHOST_DOMAIN:-<не задан>}"
         exec python main.py
         ;;
 
     multi)
         echo "[entrypoint] DEPLOYMENT_MODE=multi — запуск supervisord"
-        echo "[entrypoint] PORT=${PORT:-8080}, BOTHOST_DOMAIN=${BOTHOST_DOMAIN:-<не задан>}"
+        echo "[entrypoint] PORT=${PORT}, BOTHOST_DOMAIN=${BOTHOST_DOMAIN:-<не задан>}"
+        echo "[entrypoint] Конфигурация:"
+        echo "[entrypoint]   CELERY_WORKER_CONCURRENCY=${CELERY_WORKER_CONCURRENCY} (по умолчанию 2)"
+        echo "[entrypoint]   CELERY_MAX_TASKS_PER_CHILD=${CELERY_MAX_TASKS_PER_CHILD} (по умолчанию 10)"
         echo "[entrypoint] Запускаемые процессы:"
         echo "[entrypoint]   1. redis-server (maxmemory 128mb, без AOF)"
-        echo "[entrypoint]   2. uvicorn main:app --workers 1 --port ${PORT:-8080}"
-        echo "[entrypoint]   3. celery worker --concurrency=4 -Q gibdd,llm,clusters,exports,celery"
+        echo "[entrypoint]   2. uvicorn main:app --workers 1 --port ${PORT}"
+        echo "[entrypoint]   3. celery worker --concurrency=${CELERY_WORKER_CONCURRENCY} -Q gibdd,llm,clusters,exports,celery"
         echo "[entrypoint]   4. celery beat --max-interval=60"
-        echo "[entrypoint] Ожидаемое потребление RAM: ~700MB базовое, ~1.3GB пиковое"
+        echo "[entrypoint] Логи всех процессов в docker logs (stdout/stderr)"
         exec supervisord -n -c /etc/supervisord.conf
         ;;
 
