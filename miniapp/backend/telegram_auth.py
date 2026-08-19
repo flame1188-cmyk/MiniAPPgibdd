@@ -9,6 +9,14 @@ Sprint 7 fix:
   security и UX (пользователь не получает 401 при длительной сессии).
 - Логирование 401 — только WARNING с причиной (без [AUTH_DIAG] INFO-шума).
 
+Stabilization A3 fix:
+- Строгая проверка auth_date: если поле отсутствует или не числовое —
+  возвращаем None (defence-in-depth). Раньше TTL-проверка молча
+  пропускалась при отсутствии auth_date, что позволяло обойти
+  контроль срока действия подписи. HMAC всё равно проверяется, но
+  по Telegram-спецификации auth_date обязателен — его отсутствие
+  означает нестандартный клиент или попытку обхода.
+
 Документация:
 https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
 """
@@ -65,12 +73,23 @@ def _verify_init_data(init_data: str, bot_token: str) -> Optional[dict]:
     if not hash_value:
         return None
 
-    # Проверяем срок действия (TG_INITDATA_TTL_HOURS, по умолчанию 48ч)
+    # Проверяем срок действия (TG_INITDATA_TTL_HOURS, по умолчанию 48ч).
+    #
+    # Stabilization A3: строго требуем presence и валидность auth_date.
+    # По Telegram-спецификации это обязательное поле initData. Если оно
+    # отсутствует или не числовое — отклоняем подпись как невалидную
+    # (defence-in-depth: даже если HMAC сошёлся, такое initData нестандартно).
     auth_date_str = parsed.get("auth_date")
-    if auth_date_str and auth_date_str.isdigit():
-        auth_date = int(auth_date_str)
-        if time.time() - auth_date > _TTL_SECONDS:
-            return None
+    if not auth_date_str or not auth_date_str.isdigit():
+        logger.warning(
+            "initData rejected: missing or non-numeric auth_date "
+            f"(has_auth_date={bool(auth_date_str)}, "
+            f"value_type={type(auth_date_str).__name__})"
+        )
+        return None
+    auth_date = int(auth_date_str)
+    if time.time() - auth_date > _TTL_SECONDS:
+        return None
 
     # Строим data_check_string
     data_check_string = "\n".join(
@@ -178,7 +197,11 @@ async def get_current_user(
             has_hash = False
             age_hours = None
 
-        if age_hours is not None and age_hours * 3600 > _TTL_SECONDS:
+        if auth_date_str and not auth_date_str.isdigit():
+            reason = "invalid_auth_date (non-numeric)"
+        elif not auth_date_str:
+            reason = "missing_auth_date"
+        elif age_hours is not None and age_hours * 3600 > _TTL_SECONDS:
             reason = f"expired (age={age_hours}h, ttl={_TTL_HOURS}h)"
         elif not has_hash:
             reason = "no_hash_in_init_data"
