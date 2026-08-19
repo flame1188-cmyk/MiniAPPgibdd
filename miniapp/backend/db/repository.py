@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from psycopg import OperationalError
@@ -32,26 +35,82 @@ from .connection import get_pool, is_db_ready
 
 logger = logging.getLogger(__name__)
 
-# ====================================================================
-# In-memory кэш для тяжёлых полей Task
-# ====================================================================
-# Ключ: task_id, значение: dict с полями {cards, prev_cards, prev_label,
-# prev_cards_loaded, comparison, clusters_state, llm_summary_state,
-# llm_qa_history, last_point_stats, raw_clusters, raw_preclusters,
-# last_point_cards_current, last_point_cards_prev, last_point_params}
+# ============================================================
+# Stabilization A2: _TASKS_HEAVY_STATE — LRU-bounded OrderedDict
+# ============================================================
+# Раньше это был обычный Dict[str, Dict[str, Any]] — рос без ограничений.
+# При 30 пользователях × 10 задач × 8 MB = ~2.4 GB — превышает bothost 2GB RAM.
 #
-# Зачем: эти поля не персистятся в БД на Этапе 2 (слишком большие),
-# но нужны для работы analytics/clusters/point_stats/LLM. При рестарте
-# они теряются — пользователь может либо пере-открыть вкладку (тогда
-# данные перезагружаются лениво через ensure_prev_cards и т.д.),
-# либо пересоздать задачу.
-_TASKS_HEAVY_STATE: Dict[str, Dict[str, Any]] = {}
+# Теперь: OrderedDict с LRU-политикой. Лимит MAX_HEAVY_STATE_TASKS=60
+# (env override через MAX_HEAVY_STATE_TASKS).
+#
+# Лимит выбран чуть больше MAX_INMEMORY_TASKS=50 (из task_registry), потому что:
+#   - В течение короткого времени после eviction из _tasks heavy state
+#     может быть нужен для attach_heavy_state (восстановление)
+#   - 60 × 8 MB = ~480 MB worst case — приемлемо на 2GB RAM
+#   - Это даёт "буфер" в 10 задач поверх LRU _tasks для smooth UX
+_MAX_HEAVY_STATE_TASKS = int(os.getenv("MAX_HEAVY_STATE_TASKS", "60"))
+_TASKS_HEAVY_STATE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_TASKS_HEAVY_STATE_LOCK = Lock()
+
 
 # In-memory хранилище метаданных задач — fallback при отсутствии БД.
-# При наличии БД — используется только как кэш поверх SQL (чтобы не
-# дёргать БД на каждый get_task).
 _TASKS_MEMORY: Dict[str, "Task"] = {}  # type: ignore[name-defined]
 
+
+def _enforce_heavy_state_limit() -> None:
+    """Вытесняет самые старые записи при превышении лимита.
+
+    Stabilization A2: должна вызываться под _TASKS_HEAVY_STATE_LOCK.
+    """
+    while len(_TASKS_HEAVY_STATE) > _MAX_HEAVY_STATE_TASKS:
+        evicted_id, _ = _TASKS_HEAVY_STATE.popitem(last=False)
+        logger.info(
+            f"_TASKS_HEAVY_STATE LRU: вытеснена задача {evicted_id} "
+            f"(размер={len(_TASKS_HEAVY_STATE)}, лимит={_MAX_HEAVY_STATE_TASKS})"
+        )
+
+
+def set_heavy_state(task_id: str, key: str, value: Any) -> None:
+    """Сохраняет тяжёлое поле Task в in-memory LRU-кэше.
+
+    Stabilization A2: обновляет позицию task_id в LRU при каждом обращении.
+    При превышении лимита вытесняет самую старую запись.
+    """
+    with _TASKS_HEAVY_STATE_LOCK:
+        if task_id in _TASKS_HEAVY_STATE:
+            _TASKS_HEAVY_STATE.move_to_end(task_id)
+        else:
+            _TASKS_HEAVY_STATE[task_id] = {}
+            _enforce_heavy_state_limit()
+        _TASKS_HEAVY_STATE[task_id][key] = value
+
+
+def get_heavy_state(task_id: str, key: str, default: Any = None) -> Any:
+    """Достаёт тяжёлое поле Task из in-memory LRU-кэша.
+
+    Stabilization A2: обновляет позицию task_id в LRU (если он есть).
+    """
+    with _TASKS_HEAVY_STATE_LOCK:
+        if task_id not in _TASKS_HEAVY_STATE:
+            return default
+        _TASKS_HEAVY_STATE.move_to_end(task_id)
+        return _TASKS_HEAVY_STATE[task_id].get(key, default)
+
+
+def drop_heavy_state(task_id: str) -> None:
+    """Удаляет весь тяжёлый state задачи (при cleanup).
+
+    Stabilization A2: теперь thread-safe (под lock).
+    """
+    with _TASKS_HEAVY_STATE_LOCK:
+        _TASKS_HEAVY_STATE.pop(task_id, None)
+
+
+def get_heavy_state_size() -> int:
+    """Возвращает текущий размер heavy state кэша (для метрик/тестов)."""
+    with _TASKS_HEAVY_STATE_LOCK:
+        return len(_TASKS_HEAVY_STATE)
 
 # ====================================================================
 # Retry-обёртка для операций с пулом PostgreSQL.
@@ -736,28 +795,41 @@ _HEAVY_FIELDS = (
 
 
 def _cache_heavy_fields(task: Any) -> None:
-    """Копирует тяжёлые поля Task в in-memory кэш."""
-    cache = _TASKS_HEAVY_STATE.setdefault(task.id, {})
-    for field_name in _HEAVY_FIELDS:
-        if hasattr(task, field_name):
-            cache[field_name] = getattr(task, field_name)
+    """Копирует тяжёлые поля Task в in-memory LRU-кэш.
+
+    Stabilization A2: обновляет позицию task.id в LRU при каждом обращении.
+    При превышении лимита вытесняет самую старую запись.
+    """
+    with _TASKS_HEAVY_STATE_LOCK:
+        if task.id in _TASKS_HEAVY_STATE:
+            _TASKS_HEAVY_STATE.move_to_end(task.id)
+        else:
+            _TASKS_HEAVY_STATE[task.id] = {}
+            _enforce_heavy_state_limit()
+        cache = _TASKS_HEAVY_STATE[task.id]
+        for field_name in _HEAVY_FIELDS:
+            if hasattr(task, field_name):
+                cache[field_name] = getattr(task, field_name)
 
 
 def attach_heavy_state(task: Any) -> None:
     """
-    Присоединяет к Task тяжёлые поля из кэша (если они есть).
+    Присоединяет к Task тяжёлые поля из LRU-кэша (если они есть).
     Вызывается после load_task, чтобы восстановить состояние.
+
+    Stabilization A2: обновляет позицию task.id в LRU (если он есть).
+    Thread-safe (под lock).
     """
-    cache = _TASKS_HEAVY_STATE.get(task.id)
-    if not cache:
-        return
-    for field_name in _HEAVY_FIELDS:
-        if field_name in cache and hasattr(task, field_name):
-            # Не затираем поле, если оно уже заполнено
-            # (например, после ensure_prev_cards)
-            current = getattr(task, field_name)
-            if not current and cache[field_name]:
-                setattr(task, field_name, cache[field_name])
+    with _TASKS_HEAVY_STATE_LOCK:
+        cache = _TASKS_HEAVY_STATE.get(task.id)
+        if not cache:
+            return
+        _TASKS_HEAVY_STATE.move_to_end(task.id)
+        for field_name in _HEAVY_FIELDS:
+            if field_name in cache and hasattr(task, field_name):
+                current = getattr(task, field_name)
+                if not current and cache[field_name]:
+                    setattr(task, field_name, cache[field_name])
 
 
 # ====================================================================
