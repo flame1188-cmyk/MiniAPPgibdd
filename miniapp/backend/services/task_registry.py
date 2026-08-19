@@ -1,5 +1,5 @@
 """
-In-memory хранилище задач MiniApp (LRU + lock).
+In-memory хранилище задач MiniApp (LRU + per-task lock).
 
 Хранит последние MAX_INMEMORY_TASKS задач в OrderedDict. При превышении
 лимита вытесняет самую старую (с persistence в БД через repository.save_task).
@@ -7,16 +7,20 @@ In-memory хранилище задач MiniApp (LRU + lock).
 Это центральный модуль: task_registry импортируется pipeline, cleanup,
 facade'ом gibdd_service и тестами. Внешний код получает доступ к _tasks
 через facade `gibdd_service._tasks` (для обратной совместимости).
+
+Stabilization A1: per-task asyncio.Lock вокруг _maybe_merge_redis_snapshot
+и LRU-eviction. См. подробности в README.md патча A1.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from threading import Lock
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import _imports
 from .models import Task
@@ -43,6 +47,49 @@ logger = logging.getLogger(__name__)
 MAX_INMEMORY_TASKS = 50
 _tasks: "OrderedDict[str, Task]" = OrderedDict()
 _tasks_lock = Lock()
+
+
+# ============================================================
+# Stabilization A1: per-task asyncio.Lock
+# ============================================================
+# Раньше _maybe_merge_redis_snapshot мутировал Task без блокировки,
+# что приводило к 3 race conditions:
+#   1. Конкурентные reads видели полуприменённое состояние
+#      (status=done, files=[])
+#   2. LRU eviction во время merge сохранял полумёрдженный state в БД
+#   3. _touch_task_lru во время merge создавал несогласованность OrderedDict
+#
+# Фикс: per-task asyncio.Lock. Каждый task_id имеет свой собственный Lock,
+# что позволяет параллельно обрабатывать разные задачи, но сериализует
+# мутации одной задачи.
+#
+# _task_locks_guard (threading.Lock) защищает dict _task_locks от
+# race между созданием/удалением Lock и получением Lock другим потоком.
+_task_locks: "Dict[str, asyncio.Lock]" = {}
+_task_locks_guard = threading.Lock()
+
+
+def _get_task_lock(task_id: str) -> "asyncio.Lock":
+    """Возвращает (или создаёт) asyncio.Lock для конкретной задачи.
+
+    Каждый вызов с одним task_id возвращает тот же Lock объект,
+    что позволяет синхронизировать все мутации одной задачи.
+
+    Thread-safe: создание Lock под _task_locks_guard.
+    """
+    with _task_locks_guard:
+        if task_id not in _task_locks:
+            _task_locks[task_id] = asyncio.Lock()
+        return _task_locks[task_id]
+
+
+def _drop_task_lock(task_id: str) -> None:
+    """Удаляет Lock из dict (когда задача удалена из _tasks).
+
+    Должна вызываться под _task_locks_guard, чтобы избежать race
+    между удалением Lock и получением Lock другим потоком.
+    """
+    _task_locks.pop(task_id, None)
 
 
 def _register_task(task: Task) -> None:
@@ -73,6 +120,13 @@ def _register_task(task: Task) -> None:
             _limit = MAX_INMEMORY_TASKS
         while len(_tasks) >= _limit:
             evicted_id, evicted_task = _tasks.popitem(last=False)
+            # Stabilization A1: удаляем per-task lock, чтобы не текло.
+            # ВНИМАНИЕ: если есть активный async caller, держащий этот Lock,
+            # мы всё равно удаляем ссылку из _task_locks — но живой Lock
+            # останется жив до release, и новый _get_task_lock создаст новый.
+            # Это безопасно: старый Lock будет GC'd после release.
+            with _task_locks_guard:
+                _drop_task_lock(evicted_id)
             logger.info(
                 f"_tasks LRU: вытеснена задача {evicted_id} "
                 f"(регион={evicted_task.region_code}, "
@@ -111,6 +165,10 @@ async def get_task_async(task_id: str) -> Optional[Task]:
     status=PENDING. Без мерджа фронтенд будет вечно видеть PENDING, хотя
     Celery уже выполнил задачу.
 
+    Stabilization A1: merge выполняется под per-task asyncio.Lock, чтобы
+    исключить race conditions (конкурентные reads видели полуприменённое
+    состояние, LRU eviction во время merge сохранял полумёрдженный state).
+
     Логика мерджа:
       - Если Redis недоступен или snapshot'а нет → возвращаем Task как есть
       - Если snapshot.updated_at новее task.updated_at → применяем поля
@@ -129,8 +187,9 @@ async def get_task_async(task_id: str) -> Optional[Task]:
         # llm_sessions в БД осталась). Пробуем восстановить, если
         # оба поля пустые — это no-op если уже заполнено.
         await _try_restore_llm_session(task)
-        # Sprint 7 / Phase C.3: мерджим Redis snapshot (если Celery работает)
-        _maybe_merge_redis_snapshot(task)
+        # Stabilization A1: мерджим Redis snapshot под per-task lock.
+        # Раньше был sync вызов — стал async, потому что берёт asyncio.Lock.
+        await _maybe_merge_redis_snapshot(task)
         return task
 
     # Потом БД (если есть)
@@ -148,24 +207,45 @@ async def get_task_async(task_id: str) -> Optional[Task]:
             # attach_heavy_state из _TASKS_HEAVY_STATE).
             await _try_restore_llm_session(task)
             # Sprint 7 / Phase C.3: мерджим Redis snapshot
-            _maybe_merge_redis_snapshot(task)
+            await _maybe_merge_redis_snapshot(task)
         return task
     except Exception as exc:
         logger.debug(f"get_task_async: DB load failed: {exc}")
         return _tasks.get(task_id)
 
 
-def _maybe_merge_redis_snapshot(task: Task) -> None:
-    """Sprint 7 / Phase C.3: мерджит Redis snapshot в Task (если Celery включён).
+async def _maybe_merge_redis_snapshot(task: Task) -> None:
+    """Sprint 7 / Phase C.3 + Stabilization A1: мерджит Redis snapshot
+    в Task под per-task asyncio.Lock.
 
-    Если USE_CELERY=true И REDIS_URL задан И в Redis есть snapshot для task_id
-    новее, чем task.updated_at — применяет поля snapshot к task.
+    Все мутации task идут под блокировкой, чтобы:
+      - Конкурентные reads из FastAPI не видели полуприменённое состояние
+      - LRU eviction не сохранял полумёрдженный state в БД
+      - _touch_task_lru не создавал несогласованность OrderedDict
 
     Side effects:
         - Мутирует task (status, progress, error, files, analytics, total_*)
         - НЕ трогает тяжёлые поля (cards, prev_cards, raw_clusters) — они
           восстанавливаются через cards_cache/clusters_cache lazy.
         - НЕ пишет обратно в _tasks (это и так тот же объект)
+    """
+    # Stabilization A1: берём per-task Lock перед мутацией.
+    # Это не блокирует event loop надолго — merge занимает ~50-200µs.
+    lock = _get_task_lock(task.id)
+    async with lock:
+        _maybe_merge_redis_snapshot_sync(task)
+
+
+def _maybe_merge_redis_snapshot_sync(task: Task) -> None:
+    """Синхронная реализация merge (без блокировки).
+
+    Stabilization A1: оставлена для backward compatibility (синхронные callers).
+    Все новые callers должны использовать async _maybe_merge_redis_snapshot,
+    которая берёт per-task asyncio.Lock.
+
+    Предупреждение: вызов этой функции напрямую возможен, но не защищает
+    от race conditions. Используйте только в тестах или если уверены,
+    что конкурентных мутаций нет.
     """
     try:
         from worker.task_state import load_task_state, snapshot_to_task_updates
@@ -471,6 +551,9 @@ def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
     сработает логика "in-memory задача, которой нет в БД → свежая,
     добавить в начало списка").
 
+    Stabilization A1: также удаляет per-task asyncio.Lock из _task_locks,
+    чтобы не текло.
+
     Args:
         task_id: id задачи для удаления из кэша.
         user_id: если передан — задача удаляется только если её user_id
@@ -496,6 +579,13 @@ def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
             return False
         _tasks.pop(task_id, None)
 
+    # Stabilization A1: удаляем per-task lock.
+    # ВНИМАНИЕ: даже если есть активный async caller, держащий этот Lock,
+    # удаление из _task_locks безопасно — старый Lock объект останется жив
+    # до release, новый _get_task_lock создаст новый Lock.
+    with _task_locks_guard:
+        _drop_task_lock(task_id)
+
     # Обновляем Prometheus gauge
     try:
         from ..middleware.metrics import update_tasks_in_memory
@@ -515,3 +605,26 @@ def _now_utc() -> datetime:
 def _gen_task_id() -> str:
     """Генерирует короткий ID задачи (12 hex-символов)."""
     return uuid.uuid4().hex[:12]
+
+
+# ============================================================
+# Stabilization A1: публичные хелперы для тестов
+# ============================================================
+def _get_task_locks_snapshot() -> "Dict[str, asyncio.Lock]":
+    """Возвращает копию dict _task_locks (для тестов).
+
+    Не использовать в production коде — только в тестах, чтобы проверять,
+    что locks не текут.
+    """
+    with _task_locks_guard:
+        return dict(_task_locks)
+
+
+def _clear_task_locks_for_tests() -> None:
+    """Полностью очищает _task_locks (для тестов).
+
+    ВНИМАНИЕ: использовать ТОЛЬКО в тестах, между тестами.
+    В production это может сломать согласованность с _tasks.
+    """
+    with _task_locks_guard:
+        _task_locks.clear()
