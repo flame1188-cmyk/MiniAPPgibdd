@@ -65,6 +65,10 @@ async def _post_init(app) -> None:
     Запускается ВНУТРИ event loop, который создаёт run_polling(),
     поэтому не вызывает «Event loop is closed» при ретраях.
     """
+    # Инициализация сервисов бота
+    from bot.services_container import BotServices
+    BotServices.initialize(app)
+    
     _RETRIES = 5
     _DELAYS = [5, 10, 15, 30, 60]
     for attempt in range(1, _RETRIES + 1):
