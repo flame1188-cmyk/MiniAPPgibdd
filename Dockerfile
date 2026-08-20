@@ -90,6 +90,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     supervisor \
     redis-server \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Sanity check: убеждаемся, что redis-server доступен по ожидаемому пути.
