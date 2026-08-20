@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import App from './App'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import './index.css'
 import { initTelegram } from './lib/telegram'
 
@@ -18,10 +19,16 @@ const queryClient = new QueryClient({
   },
 })
 
+// Stabilization A10 (P1 #5): ErrorBoundary оборачивает всё приложение.
+// Ловит ошибки в render-дереве и показывает fallback UI вместо белого экрана.
+// resetKey = текущий URL, чтобы при смене URL (back/forward) state
+// error boundary сбрасывался — приложение пробует отрендерить заново.
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <App />
-    </QueryClientProvider>
+    <ErrorBoundary resetKey={typeof window !== 'undefined' ? window.location.href : ''}>
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>
+    </ErrorBoundary>
   </React.StrictMode>,
 )

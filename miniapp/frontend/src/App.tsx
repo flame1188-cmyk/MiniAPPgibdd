@@ -11,16 +11,16 @@
  *  - Вкладка «НП БДД»:
  *      - NpBddView (KPI + 2 графика + заморозка)
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { StructuredForm } from '@/components/StructuredForm'
 import { CamerasWidget } from '@/components/CamerasWidget'
 import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
-import { NpBddView } from '@/components/NpBddView'
 import { VersionBanner } from '@/components/VersionBanner'
 import { useTaskPolling } from '@/hooks/useTaskPolling'
 import { useVersionCheck } from '@/hooks/useVersionCheck'
+import { useUrlState } from '@/hooks/useUrlState'
 import { haptic } from '@/lib/telegram'
 import {
   getCurrentUser,
@@ -34,11 +34,26 @@ import {
   onFullscreenChange,
 } from '@/lib/telegram'
 
+// Stabilization P1 #3 (2026-08-20): NpBddView — lazy-loaded.
+// NpBddView содержит recharts (графики Квартал/Год), что ~150 КБ gzip.
+// Грузить его только когда пользователь первый раз открывает вкладку
+// «НП БДД» — снижает initial bundle на ~150 КБ.
+const NpBddView = lazy(() =>
+  import('@/components/NpBddView').then((m) => ({ default: m.NpBddView })),
+)
+
 type Tab = 'dtp' | 'np-bdd'
 
 export default function App() {
-  const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
-  const [tab, setTab] = useState<Tab>('dtp')
+  // Stabilization A10 (P1 #5): URL-state для activeTaskId и tab.
+  // Раньше: useState — при F5 состояние терялось, пользователь видел
+  // пустую форму вместо результатов. Ссылку нельзя было поделиться.
+  // Теперь: ?task=abc123&tab=np-bdd — survives reload + шарится.
+  const [activeTaskId, setActiveTaskId] = useUrlState<string | null>(
+    'task',
+    null,
+  )
+  const [tab, setTab] = useUrlState<Tab>('tab', 'dtp')
   const [fullscreen, setFullscreen] = useState<boolean>(isFullscreenActive())
 
   const { data: task, isError } = useTaskPolling(activeTaskId)
@@ -230,7 +245,29 @@ export default function App() {
         )}
 
         {/* --- Вкладка «НП БДД» --- */}
-        {tab === 'np-bdd' && <NpBddView />}
+        {tab === 'np-bdd' && (
+          <Suspense
+            fallback={
+              <div
+                className="flex flex-col items-center justify-center py-12 space-y-2"
+                style={{
+                  backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+                }}
+              >
+                <div
+                  className="w-8 h-8 rounded-full border-2 border-t-transparent animate-spin"
+                  style={{
+                    borderColor: 'var(--tg-color-button, #2481cc)',
+                    borderTopColor: 'transparent',
+                  }}
+                />
+                <div className="text-xs opacity-60">Загрузка модуля НП БДД…</div>
+              </div>
+            }
+          >
+            <NpBddView />
+          </Suspense>
+        )}
 
         {/* Подвал */}
         <footer className="text-center text-xs opacity-40 pt-4">
