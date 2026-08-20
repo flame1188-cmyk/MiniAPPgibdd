@@ -10,7 +10,8 @@
 Выделено из единого bot.py (Phase 3-2). 100% pure.
 """
 from bot._state import *
-from bot.infra import _tg_retry, _safe_edit, _send_long_message, _get_user_lock, _sanitize_error
+from bot.infra import _tg_retry, _safe_edit, _send_long_message, _sanitize_error
+from bot.services import lock_manager  # Новый импорт
 from bot.access import _fetch_cards_for_period
 from bot.analysis import _get_current_cards, _build_menu_keyboard
 
