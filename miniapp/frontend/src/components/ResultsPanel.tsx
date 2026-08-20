@@ -1,15 +1,42 @@
 /**
  * Панель результатов: показывает готовые файлы, HTML-карту и аналитику.
+ *
+ * Stabilization P1 #3 (2026-08-20): Code splitting через React.lazy.
+ * Раньше все 5 View (Map/Analytics/Clusters/PointStats/LLM) грузились
+ * в начальном бандле — ~250 КБ gzip лишнего на первом заходе.
+ *
+ * Теперь: 4 тяжёлых View загружаются lazy (отдельные чанки .js),
+ * когда пользователь первый раз открывает соответствующую вкладку.
+ * MapFrame остаётся eager (открывается по умолчанию).
+ *
+ * Suspense fallback — простой spinner на bg-secondary, чтобы пользователь
+ * видел, что что-то грузится (не пустой экран).
  */
-import { useState } from 'react'
+import { useState, lazy, Suspense } from 'react'
 import { api, type TaskStatusResponse } from '@/lib/api'
 import { haptic } from '@/lib/telegram'
 import { formatSize, statusLabel } from '@/lib/utils'
 import { MapFrame } from './MapFrame'
-import { AnalyticsView } from './AnalyticsView'
-import { ClustersView } from './ClustersView'
-import { PointStatsView } from './PointStatsView'
-import { LLMAnalysisView } from './LLMAnalysisView'
+
+// Lazy-loaded views — каждый в свой chunk:
+//   - AnalyticsView.tsx  → /assets/analytics-*.js
+//   - ClustersView.tsx   → /assets/clusters-*.js
+//   - PointStatsView.tsx → /assets/point-*.js
+//   - LLMAnalysisView.tsx → /assets/llm-*.js
+// recharts и marked грузятся только когда нужен первый View,
+// который их использует (recharts — analytics/clusters, marked — LLM).
+const AnalyticsView = lazy(() =>
+  import('./AnalyticsView').then((m) => ({ default: m.AnalyticsView })),
+)
+const ClustersView = lazy(() =>
+  import('./ClustersView').then((m) => ({ default: m.ClustersView })),
+)
+const PointStatsView = lazy(() =>
+  import('./PointStatsView').then((m) => ({ default: m.PointStatsView })),
+)
+const LLMAnalysisView = lazy(() =>
+  import('./LLMAnalysisView').then((m) => ({ default: m.LLMAnalysisView })),
+)
 
 interface ResultsPanelProps {
   task: TaskStatusResponse
@@ -89,14 +116,28 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
       {tab === 'map' && mapFile && <MapFrame taskId={task.task_id} />}
 
       {tab === 'analytics' && task.analytics && (
-        <AnalyticsView analytics={task.analytics} />
+        <Suspense fallback={<ViewFallback label="Аналитика" />}>
+          <AnalyticsView analytics={task.analytics} />
+        </Suspense>
       )}
 
-      {tab === 'clusters' && <ClustersView task={task} />}
+      {tab === 'clusters' && (
+        <Suspense fallback={<ViewFallback label="Очаги" />}>
+          <ClustersView task={task} />
+        </Suspense>
+      )}
 
-      {tab === 'point' && <PointStatsView task={task} />}
+      {tab === 'point' && (
+        <Suspense fallback={<ViewFallback label="Статистика по точке" />}>
+          <PointStatsView task={task} />
+        </Suspense>
+      )}
 
-      {tab === 'llm' && <LLMAnalysisView task={task} />}
+      {tab === 'llm' && (
+        <Suspense fallback={<ViewFallback label="ИИ-анализ" />}>
+          <LLMAnalysisView task={task} />
+        </Suspense>
+      )}
 
       {tab === 'files' && (
         <FilesList
@@ -106,6 +147,31 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
           mapFile={mapFile}
         />
       )}
+    </div>
+  )
+}
+
+// ============================================================
+// Suspense fallback — простой spinner с подписью.
+// Показывается < 500ms обычно (chunk уже в кэше браузера), но
+// для первого захода на вкладку — пользователь видит, что грузится.
+// ============================================================
+function ViewFallback({ label }: { label: string }) {
+  return (
+    <div
+      className="flex flex-col items-center justify-center py-12 space-y-2"
+      style={{
+        backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+      }}
+    >
+      <div
+        className="w-8 h-8 rounded-full border-2 border-t-transparent animate-spin"
+        style={{
+          borderColor: 'var(--tg-color-button, #2481cc)',
+          borderTopColor: 'transparent',
+        }}
+      />
+      <div className="text-xs opacity-60">Загрузка: {label}…</div>
     </div>
   )
 }
