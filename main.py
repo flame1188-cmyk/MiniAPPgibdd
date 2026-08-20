@@ -906,20 +906,27 @@ async def health_all():
     return response_body
 
 # ============================================================
-# /debug/supervisor-logs — чтение логов supervisord из контейнера
+# /debug/supervisor-logs — диагностика multi-режима
 # ============================================================
-# Эндпоинт для диагностики multi-режима без shell-доступа к bothost.
-# Возвращает последние N байт каждого лог-файла:
-#   - /var/log/supervisor/supervisord.log
-#   - /var/log/supervisor/api.log + api.err.log
-#   - /var/log/supervisor/worker.log + worker.err.log
-#   - /var/log/supervisor/beat.log + beat.err.log
-#   - /var/log/supervisor/redis.log + redis.err.log
+# Stabilization P1 #4 (2026-08-20): переписан после патча A6.
 #
-# Защита: если задан env DEBUG_LOGS_TOKEN — требует ?token=<значение>.
-# Если не задан — эндпоинт отключён (возвращает 403).
+# До A6: логи supervisord писались в /var/log/supervisor/*.log.
+# Этот эндпоинт читал последние N байт каждого файла.
 #
-# Пример: GET /debug/supervisor-logs?tail=20000&token=secret
+# После A6: все per-program логи идут в /dev/stdout и /dev/stderr
+# (через supervisord.conf stdout_logfile=/dev/stdout), чтобы
+# `docker logs <container>` их видел. Файлов в /var/log/supervisor/
+# больше нет — эндпоинт стал мёртвым кодом.
+#
+# Текущее поведение:
+#   - Без env DEBUG_LOGS_TOKEN — 403 "endpoint disabled"
+#   - С токеном — возвращает информационное сообщение с командой
+#     `docker logs` + (опционально) снимок /health/all.
+#   - Если env DEBUG_LOGS_LEGACY=1 — пытается читать старые файлы
+#     в /var/log/supervisor/ (для back-compat, если supervisord.conf
+#     откачен к старой версии).
+#
+# Пример: GET /debug/supervisor-logs?token=secret
 @app.get("/debug/supervisor-logs")
 async def debug_supervisor_logs(tail: int = 20000, token: str = ""):
     import os as _os
@@ -933,47 +940,67 @@ async def debug_supervisor_logs(tail: int = 20000, token: str = ""):
     if token != expected_token:
         return {"error": "Invalid token"}, 403
 
-    # Ограничиваем tail сверху — не более 200 KB на файл
+    # Ограничиваем tail сверху (для legacy-режима) — не более 200 KB на файл
     tail = max(1, min(int(tail), 200_000))
 
-    log_dir = "/var/log/supervisor"
-    names = [
-        "supervisord.log",
-        "api.log", "api.err.log",
-        "worker.log", "worker.err.log",
-        "beat.log", "beat.err.log",
-        "redis.log", "redis.err.log",
-    ]
+    # Режим: legacy (читать старые файлы) или modern (docker logs)
+    legacy_mode = _os.getenv("DEBUG_LOGS_LEGACY", "0") == "1"
 
-    result = {"tail_bytes": tail, "logs": {}}
-    for name in names:
-        path = f"{log_dir}/{name}"
-        try:
-            with open(path, "rb") as f:
-                # Читаем последние tail байт
-                try:
-                    f.seek(0, 2)
-                    size = f.tell()
-                    read_size = min(size, tail)
-                    f.seek(max(0, size - read_size))
-                    raw = f.read(read_size)
-                except OSError:
-                    # seek не работает (pipe) — читаем всё
-                    raw = f.read()
+    # Шаг 1: всегда возвращаем health/all снапшот
+    try:
+        health_data = await health_all()
+    except Exception as exc:
+        health_data = {"error": f"health_all failed: {exc}"}
+
+    # Шаг 2: если legacy — пытаемся читать старые файлы
+    legacy_logs = None
+    if legacy_mode:
+        legacy_logs = {}
+        log_dir = "/var/log/supervisor"
+        names = [
+            "supervisord.log",
+            "api.log", "api.err.log",
+            "worker.log", "worker.err.log",
+            "beat.log", "beat.err.log",
+            "redis.log", "redis.err.log",
+        ]
+        for name in names:
+            path = f"{log_dir}/{name}"
             try:
-                text = raw.decode("utf-8", errors="replace")
-            except Exception:
-                text = repr(raw)
-            result["logs"][name] = {
-                "size_bytes": len(raw),
-                "content": text,
-            }
-        except FileNotFoundError:
-            result["logs"][name] = None
-        except Exception as exc:
-            result["logs"][name] = {"error": f"{type(exc).__name__}: {exc}"}
+                with open(path, "rb") as f:
+                    try:
+                        f.seek(0, 2)
+                        size = f.tell()
+                        read_size = min(size, tail)
+                        f.seek(max(0, size - read_size))
+                        raw = f.read(read_size)
+                    except OSError:
+                        raw = f.read()
+                try:
+                    text = raw.decode("utf-8", errors="replace")
+                except Exception:
+                    text = repr(raw)
+                legacy_logs[name] = {
+                    "size_bytes": len(raw),
+                    "content": text,
+                }
+            except FileNotFoundError:
+                legacy_logs[name] = None
+            except Exception as exc:
+                legacy_logs[name] = {"error": f"{type(exc).__name__}: {exc}"}
 
-    return result
+    # Итоговый ответ
+    return {
+        "tail_bytes": tail,
+        "mode": "legacy" if legacy_mode else "modern",
+        "modern_hint": (
+            "После Stabilization A6 логи всех процессов (api, worker, beat, "
+            "redis) перенаправлены в stdout/stderr контейнера. "
+            "Используйте `docker logs <container>` для просмотра."
+        ),
+        "health": health_data if not isinstance(health_data, dict) or "error" not in health_data else health_data,
+        "legacy_logs": legacy_logs,
+    }
 
 
 @app.get("/")

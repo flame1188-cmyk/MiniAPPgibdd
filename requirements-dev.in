@@ -1,0 +1,38 @@
+# ====================================
+# Dev dependencies (тесты + инструменты)
+# ====================================
+# Включает все зависимости requirements.in + dev tools.
+# Lock генерируется:  pip-compile requirements-dev.in -o requirements-dev.lock
+# Установка для разработки:  pip install -r requirements-dev.lock
+
+-r requirements.in
+
+# --- Test framework ---
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-cov>=5.0
+
+# --- HTTP mocking (для тестов ГИБДД) ---
+respx>=0.21
+
+# --- Time mocking ---
+freezegun>=1.5
+
+# --- Coverage HTML ---
+coverage>=7.4
+
+# --- Dependency management ---
+# pip-tools — для генерации lock-файла (pip-compile / pip-sync)
+pip-tools>=7.4
+
+# --- Security audit ---
+# pip-audit — проверка уязвимостей в установленных пакетах.
+# Запуск:  pip-audit -r requirements.lock  или  pip-audit
+# В CI вызывается:  pip-audit --strict --ignore-vuln GHSA-XXXX
+pip-audit>=2.7
+
+# --- Code formatting / linting (опционально) ---
+# black — авто-форматирование кода
+black>=24.0
+# ruff — быстрый linter
+ruff>=0.5

@@ -1,11 +1,26 @@
 # ====================================
-# GIBDD Stat Bot + Mini App
+# GIBDD Stat Bot + Mini App — requirements
 # ====================================
+# ВНИМАНИЕ (Stabilization P1 #2 от 2026-08-20):
+# Этот файл оставлен для обратной совместимости со старыми инструкциями
+# в README. Для production-деплоя используйте requirements.lock — он
+# содержит точные версии всех пакетов (включая транзитивные) с хешами.
+#
+# Workflow:
+#   1. Изменить requirements.in (top-level зависимости)
+#   2. Запустить: make compile  (или: pip-compile requirements.in -o requirements.lock)
+#   3. Закоммитить и requirements.in, и requirements.lock
+#   4. В проде: pip install -r requirements.lock
+#
+# Проверка безопасности:
+#   make audit  (или: pip-audit -r requirements.lock --strict)
+#   CI автоматически запускает pip-audit на каждый push + раз в неделю.
+#
+# Старый способ установки (без lock):
+#   pip install -r requirements.txt
+# — работает, но не гарантирует идентичности версий между средами.
 
 # --- Telegram Bot ---
-# ВАЖНО: extra [webhooks] НЕ нужен — мы принимаем webhook через FastAPI
-# endpoint /bot/webhook и передаём в PTB через process_update().
-# Это стандартный паттерн интеграции PTB + FastAPI.
 python-telegram-bot==21.7
 
 # --- HTTP client ---
