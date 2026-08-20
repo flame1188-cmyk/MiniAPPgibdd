@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '20250122_0003_fix_file_bytes'  # Короткий идентификатор!
+revision: str = '20250122_0003_fix_file_bytes'
 down_revision: Union[str, None] = '20250121_add_excel_file_paths'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -25,8 +25,8 @@ def upgrade() -> None:
     """
     # Для PostgreSQL изменение типа колонки с VARCHAR NOT NULL на VARCHAR NULL
     # выполняется через ALTER COLUMN ... DROP NOT NULL
-    op.alter_column('excel_cache', 'file1_bytes', existing_type=sa BYTEA(), nullable=True)
-    op.alter_column('excel_cache', 'file2_bytes', existing_type=sa BYTEA(), nullable=True)
+    op.alter_column('excel_cache', 'file1_bytes', existing_type=sa.LargeBinary(), nullable=True)
+    op.alter_column('excel_cache', 'file2_bytes', existing_type=sa.LargeBinary(), nullable=True)
 
 
 def downgrade() -> None:
@@ -34,5 +34,5 @@ def downgrade() -> None:
     Возвращает NOT NULL ограничения (если потребуется откат).
     Внимание: это может упасть, если в таблице есть NULL значения.
     """
-    op.alter_column('excel_cache', 'file1_bytes', existing_type=sa BYTEA(), nullable=False)
-    op.alter_column('excel_cache', 'file2_bytes', existing_type=sa BYTEA(), nullable=False)
+    op.alter_column('excel_cache', 'file1_bytes', existing_type=sa.LargeBinary(), nullable=False)
+    op.alter_column('excel_cache', 'file2_bytes', existing_type=sa.LargeBinary(), nullable=False)
