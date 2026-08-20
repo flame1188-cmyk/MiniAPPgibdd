@@ -117,10 +117,11 @@ _api_down_lock: Any = None  # инициализируется в async-конт
 # Mutated global — оставлено как в исходном bot.py (100% pure).
 _clean_shutdown: bool = False
 
+# === ДЕПРЕЦИРОВАНО: Заменено на LockManager из bot.services ===
 # Защита от гонок при concurrent_updates=True (БАГ 5)
 # Один asyncio.Lock на пользователя — предотвращает параллельную
 # коррупцию user_data при быстрых двойных нажатиях кнопок.
-_user_locks: dict[int, asyncio.Lock] = {}
+# _user_locks: dict[int, asyncio.Lock] = {}  # УДАЛЕНО
 
 # Lock для защиты от параллельных запусков /precache
 # (предотвращает множественные subprocess-ы, которые перегружают Overpass)
@@ -207,7 +208,8 @@ __all__ = [
     # shared state
     "logger", "_conflict_last_log", "_CONFLICT_LOG_INTERVAL",
     "_api_down", "_api_down_lock", "_clean_shutdown",
-    "_user_locks", "_precache_lock",
+    # "_user_locks",  # ДЕПРЕЦИРОВАНО: заменено на LockManager
+    "_precache_lock",
     "TG_MSG_LIMIT", "REGIONS_PER_PAGE",
     "MONTH_SHORT", "MONTH_FULL", "QUARTER_LABELS",
     "_MAX_TG_RETRIES", "_TG_RETRY_DELAYS", "_QA_HISTORY_MAX_MESSAGES",

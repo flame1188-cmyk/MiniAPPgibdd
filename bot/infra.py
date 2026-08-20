@@ -4,7 +4,7 @@
   • _tg_retry — ретрай при TimedOut/NetworkError
   • _IsDocument — кастомный фильтр
   • _mark_api_down / _is_api_down / _log_memory
-  • _get_user_lock — Lock на пользователя
+  • _get_user_lock — Lock на пользователя (заменено на LockManager)
   • _sanitize_error, _safe_edit, _send_long_message
   • _make_progress_bar
 
@@ -13,7 +13,8 @@
 from bot._state import *
 
 # Примечание: _MAX_TG_RETRIES, _TG_RETRY_DELAYS, _QA_HISTORY_MAX_MESSAGES,
-# TG_MSG_LIMIT, _user_locks объявлены в bot._state (см. __all__).
+# TG_MSG_LIMIT объявлены в bot._state (см. __all__).
+# _user_locks ДЕПРЕЦИРОВАНО — используется LockManager из bot.services
 
 
 async def _tg_retry(coro_factory, description="Telegram API"):
@@ -76,11 +77,12 @@ def _log_memory(label: str) -> int:
     return int(rss_mb) if rss_mb >= 0 else 0
 
 
-def _get_user_lock(user_id: int) -> asyncio.Lock:
-    """Возвращает (или создаёт) Lock для данного пользователя."""
-    if user_id not in _user_locks:
-        _user_locks[user_id] = asyncio.Lock()
-    return _user_locks[user_id]
+# === ДЕПРЕЦИРОВАНО: заменено на LockManager.user_lock() ===
+# def _get_user_lock(user_id: int) -> asyncio.Lock:
+#     """Возвращает (или создаёт) Lock для данного пользователя."""
+#     if user_id not in _user_locks:
+#         _user_locks[user_id] = asyncio.Lock()
+#     return _user_locks[user_id]
 
 
 def _sanitize_error(e: Exception) -> str:
