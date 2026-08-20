@@ -2933,4 +2933,10 @@ Task ID: Refactor global state to service classes
 - Интеграция сервисов в main.py и bot/_build_app.py
 - Убрано глобальное mutable состояние из бота
 
+Преимущества:
+- Нет глобального mutable состояния
+- Потокобезопасность через asyncio.Lock
+- LRU eviction и TTL для задач
+- Улучшенная тестируемость
+
 #8921 refactor state management
