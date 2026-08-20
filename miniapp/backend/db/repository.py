@@ -41,15 +41,20 @@ logger = logging.getLogger(__name__)
 # Раньше это был обычный Dict[str, Dict[str, Any]] — рос без ограничений.
 # При 30 пользователях × 10 задач × 8 MB = ~2.4 GB — превышает bothost 2GB RAM.
 #
-# Теперь: OrderedDict с LRU-политикой. Лимит MAX_HEAVY_STATE_TASKS=60
+# Теперь: OrderedDict с LRU-политикой. Лимит MAX_HEAVY_STATE_TASKS=30
 # (env override через MAX_HEAVY_STATE_TASKS).
 #
-# Лимит выбран чуть больше MAX_INMEMORY_TASKS=50 (из task_registry), потому что:
-#   - В течение короткого времени после eviction из _tasks heavy state
-#     может быть нужен для attach_heavy_state (восстановление)
-#   - 60 × 8 MB = ~480 MB worst case — приемлемо на 2GB RAM
-#   - Это даёт "буфер" в 10 задач поверх LRU _tasks для smooth UX
-_MAX_HEAVY_STATE_TASKS = int(os.getenv("MAX_HEAVY_STATE_TASKS", "60"))
+# Stabilization P0 #3 (2026-08-20): снижен с 60 до 30.
+# Причина: для крупных регионов (Москва, Краснодарский край — 3000+ ДТП
+# тек + 3000+ АППГ) heavy state реально достигает 12-15 МБ на задачу
+# (cards + prev_cards + raw_clusters + clusters_state + llm_summary_state).
+# 60 × 15 MB = 900 MB — риск OOM на 2GB RAM с учётом Celery worker.
+# 30 × 15 MB = 450 MB — безопасно, оставляет запас ~250 MB на пике.
+#
+# Если у вас small-load сценарий (только мелкие регионы) — можно
+# переопределить через env MAX_HEAVY_STATE_TASKS=60. Но для продакшна
+# с обоими типами регионов — 30 безопаснее.
+_MAX_HEAVY_STATE_TASKS = int(os.getenv("MAX_HEAVY_STATE_TASKS", "30"))
 _TASKS_HEAVY_STATE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _TASKS_HEAVY_STATE_LOCK = Lock()
 
