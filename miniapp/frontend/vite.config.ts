@@ -43,8 +43,18 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
+          // Core React — почти на каждой странице
           'react-vendor': ['react', 'react-dom'],
+          // TanStack Query — нужен везде, где есть polling/fetch
           'query-vendor': ['@tanstack/react-query'],
+          // Stabilization P1 #3 (2026-08-20): recharts (~150 КБ gzip)
+          // — отдельный chunk, грузится только когда пользователь откроет
+          // вкладку Analytics/Clusters/NpBdd. До этого — не нужен.
+          'chart-vendor': ['recharts'],
+          // Stabilization P1 #3: marked (~30 КБ gzip) — markdown для LLM
+          // ответов. Грузится только когда пользователь откроет вкладку
+          // «ИИ-анализ».
+          'markdown-vendor': ['marked'],
         },
       },
     },
