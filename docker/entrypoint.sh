@@ -22,7 +22,8 @@
 #   - /app/data — персистентный volume (кэш камер, регионов, OSM)
 #   - /data/redis — персистентный volume для Redis (если включён)
 #
-# Stabilization A6 fix:
+# Phase 0 Stabilization:
+#   - Автоматический запуск Alembic migrations перед стартом приложения
 #   - Задаёт default для CELERY_MAX_TASKS_PER_CHILD (=10) и
 #     CELERY_WORKER_CONCURRENCY (=2) если они не заданы в env.
 #     supervisord требует, чтобы переменные %(ENV_*)s существовали,
@@ -33,8 +34,17 @@ set -e
 # Создаём директории для данных, если ещё нет
 mkdir -p /app/data
 mkdir -p /app/data/osm_cache /app/data/cameras
+mkdir -p /app/data/files
 mkdir -p /data/redis
 mkdir -p /var/log/supervisor
+
+# Phase 0: Автоматическое применение миграций Alembic
+echo "[entrypoint] Applying database migrations..."
+if command -v alembic >/dev/null 2>&1; then
+    cd /app && alembic upgrade head || echo "[entrypoint] WARNING: Migration failed, continuing anyway..."
+else
+    echo "[entrypoint] WARNING: Alembic not installed, skipping migrations"
+fi
 
 # Stabilization A6: defaults для supervisord-подстановок.
 # Если не задать — supervisord упадёт с "subject not defined" при парсинге
