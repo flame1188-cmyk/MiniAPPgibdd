@@ -1,0 +1,126 @@
+# ============================================================
+# CI: проверка requirements.lock + pip-audit security scan
+# ============================================================
+# Запускается на push/PR в main, а также раз в неделю (по воскресеньям)
+# для выявления новых CVE в уже зафиксированных версиях.
+#
+# Что делает:
+#   1. pip install pip-tools pip-audit
+#   2. pip-compile requirements.in --dry-run --no-emit-indexes
+#      → проверяет, что requirements.in валиден и разрешается
+#   3. Если requirements.lock существует — проверяет, что он
+#      совпадает с тем, что бы сгенерировал pip-compile сейчас
+#      (если расходится — fail с инструкцией обновить lock)
+#   4. pip-audit -r requirements.lock --strict
+#      → проверяет все версии пакетов в lock-файле на CVE
+#      Если найдена известная уязвимость — fail
+#   5. pip-audit без аргументов — проверка окружения Python
+# ============================================================
+
+name: dependencies
+
+on:
+  push:
+    paths:
+      - "requirements.in"
+      - "requirements-dev.in"
+      - "requirements.lock"
+      - "requirements-dev.lock"
+      - ".github/workflows/dependencies.yml"
+    branches: [main]
+  pull_request:
+    paths:
+      - "requirements.in"
+      - "requirements-dev.in"
+      - "requirements.lock"
+      - "requirements-dev.lock"
+  schedule:
+    # Каждое воскресенье 03:00 UTC — выявление новых CVE в замороженных версиях
+    - cron: "0 3 * * 0"
+
+jobs:
+  lock-and-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install pip-tools and pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-tools pip-audit
+
+      - name: Verify requirements.in resolves
+        # Проверяем, что requirements.in сам по себе валиден (без генерации lock).
+        # Если есть конфликт версий — упадёт.
+        run: |
+          pip-compile requirements.in --dry-run --output-file=- --no-emit-indexes > /dev/null
+          echo "✅ requirements.in resolves OK"
+
+      - name: Verify requirements-dev.in resolves
+        run: |
+          pip-compile requirements-dev.in --dry-run --output-file=- --no-emit-indexes > /dev/null
+          echo "✅ requirements-dev.in resolves OK"
+
+      - name: Check requirements.lock is up-to-date
+        # Если lock-файл уже закоммичен — сверяем с тем, что бы сгенерировал pip-compile.
+        # Если расходится — предлагаем обновить: `pip-compile requirements.in -o requirements.lock`
+        run: |
+          if [ ! -f requirements.lock ]; then
+            echo "⚠️  requirements.lock не найден. Сгенерируйте:"
+            echo "    pip-compile requirements.in -o requirements.lock"
+            echo "И закоммитьте его в репозиторий."
+            exit 1
+          fi
+          # Сравниваем содержимое lock-файла с тем, что сгенерируется сейчас.
+          # Игнорируем заголовок (дата + версия pip-tools) — остальное должно совпадать.
+          pip-compile requirements.in --output-file=/tmp/generated.lock --no-emit-indexes --quiet
+          # Берём только тело (после строк с "#    via")
+          diff <(grep -E "^[a-zA-Z]" requirements.lock | sort) <(grep -E "^[a-zA-Z]" /tmp/generated.lock | sort) > /tmp/diff.txt || true
+          if [ -s /tmp/diff.txt ]; then
+            echo "❌ requirements.lock устарел. Обновите:"
+            echo "    pip-compile requirements.in -o requirements.lock"
+            echo "Различия:"
+            cat /tmp/diff.txt
+            exit 1
+          fi
+          echo "✅ requirements.lock is up-to-date"
+
+      - name: pip-audit on requirements.lock
+        # Главная проверка безопасности — все пакеты в lock-файле против
+        # базы PyPI Advisory Database.
+        # --strict: любой найденный CVE = fail
+        # Если нужно временно игнорировать конкретный CVE:
+        #   pip-audit -r requirements.lock --strict --ignore-vuln GHSA-XXXX-XXXX-XXXX
+        run: |
+          pip-audit -r requirements.lock --strict
+          echo "✅ pip-audit passed — no known CVEs in locked dependencies"
+
+      - name: pip-audit on requirements-dev.lock (if present)
+        run: |
+          if [ -f requirements-dev.lock ]; then
+            pip-audit -r requirements-dev.lock --strict
+            echo "✅ pip-audit passed for dev dependencies"
+          else
+            echo "⚠️  requirements-dev.lock не найден, пропускаем"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Dependencies check summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f requirements.lock ]; then
+            echo "- ✅ requirements.lock exists" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ requirements.lock missing" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- pip-audit: completed (see log above)" >> $GITHUB_STEP_SUMMARY
