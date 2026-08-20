@@ -9,7 +9,7 @@
 from bot._state import *
 from bot.access import is_user_allowed, _get_regions, _load_regions_if_needed, _fetch_cards_for_period
 from bot.keyboards import build_region_keyboard, build_period_keyboard
-from bot.infra import _tg_retry, _safe_edit, _send_long_message, _get_user_lock, _sanitize_error, _IsDocument
+from bot.infra import _tg_retry, _safe_edit, _send_long_message, _sanitize_error, _IsDocument
 from bot.analysis import (
     _start_fetching, _build_menu_keyboard, _offer_analysis,
     _clear_analytics_data, _run_analysis,
