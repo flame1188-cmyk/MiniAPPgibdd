@@ -198,6 +198,16 @@ async def lifespan(app: FastAPI):
     """Жизненный цикл: запуск Telegram-бота + инициализация Mini App."""
     global tg_app
 
+    # === Инициализация сервисов бота (TaskStateService, LockManager) ===
+    # Заменяет глобальное состояние bot/_state.py на сервисы с DI
+    from bot.services import initialize_services
+    task_service, lock_manager = initialize_services()
+    logger.info(
+        f"Сервисы бота инициализированы: "
+        f"TaskStateService(max_tasks={task_service.max_tasks}, ttl={task_service.ttl_hours}h), "
+        f"LockManager(max_locks={lock_manager.max_locks})"
+    )
+
     # Проверяем конфигурацию
     errors = validate_config()
     if errors:
