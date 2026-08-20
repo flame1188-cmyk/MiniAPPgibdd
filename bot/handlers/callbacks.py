@@ -54,12 +54,12 @@ from bot.point_stats import (
     _handle_location_message,
 )
 from bot.qa import _handle_analytics_question
+from bot.services import get_lock_manager
 from bot.infra import (
     _tg_retry,
     _IsDocument,
     _safe_edit,
     _send_long_message,
-    _get_user_lock,
     _sanitize_error,
     _make_progress_bar,
 )
@@ -629,13 +629,8 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     # Блокировка по пользователю — предотвращает гонку user_data
     # при concurrent_updates=True (быстрые двойные нажатия кнопок)
-    lock = _get_user_lock(user_id)
-    if lock.locked():
-        # Другой callback уже обрабатывается — игнорируем
-        logger.debug(f"Callback от user_id={user_id} пропущен (locked): {data}")
-        return
-
-    async with lock:
+    lock_manager = get_lock_manager()
+    async with lock_manager.user_lock(user_id):
         handler = _resolve_handler(data)
         if handler is None:
             # Неизвестный callback — silent ignore (как в исходном if-elif)
@@ -646,7 +641,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             logger.exception(f"Ошибка в callback handler: {e}")
             try:
                 await _safe_edit(query,
-                    f"\u26A0\uFE0F Ошибка: {_sanitize_error(e)}",
+                    f"\\u26A0\\uFE0F Ошибка: {_sanitize_error(e)}",
                     description="callback ошибка)")
             except Exception:
                 pass
