@@ -204,8 +204,8 @@ async def lifespan(app: FastAPI):
     task_service, lock_manager = initialize_services()
     logger.info(
         f"Сервисы бота инициализированы: "
-        f"TaskStateService(max_tasks={task_service.max_tasks}, ttl={task_service.ttl_hours}h), "
-        f"LockManager(max_locks={lock_manager.max_locks})"
+        f"TaskStateService, "
+        f"LockManager)"
     )
 
     # Проверяем конфигурацию
