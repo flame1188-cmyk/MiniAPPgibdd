@@ -265,6 +265,29 @@ async def execute_task(task_id: str) -> None:
                     f"Task {task_id}: persist FAILED status failed: "
                     f"{persist_exc}"
                 )
+            # Stabilization A4 (P1 #1): критичный sync persist для FAILED.
+            # Дублирует async save_task выше. Если async pool мёртв или
+            # process упал между await save_task и завершением — sync persist
+            # через psycopg.connect() всё равно запишет FAILED в БД.
+            try:
+                from ..db.repository import save_task_final_state_from_snapshot_sync
+                save_task_final_state_from_snapshot_sync(
+                    task.id,
+                    status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+                    progress=task.progress,
+                    error=task.error,
+                    total_dtp=getattr(task, 'total_dtp', 0),
+                    total_dead=getattr(task, 'total_dead', 0),
+                    total_injured=getattr(task, 'total_injured', 0),
+                    files=getattr(task, 'files', None),
+                    analytics=None,
+                )
+            except Exception as sync_persist_exc:
+                logger.warning(
+                    f"Task {task_id}: critical sync persist FAILED "
+                    f"(outer try/except): {sync_persist_exc} — "
+                    f"task status may not be persisted!"
+                )
 
 
 async def _execute_task_impl(task_id: str) -> None:
@@ -286,6 +309,49 @@ async def _execute_task_impl(task_id: str) -> None:
             await save_task(task)
         except Exception as exc:
             logger.debug(f"execute_task: persist failed: {exc}")
+
+    # Stabilization A4 (P1 #1): критичный persist для переходов DONE/FAILED.
+    # Если async pool мёртв (event loop closed, OOM в середине await save_task,
+    # connection reset) — async _persist() молча логирует ошибку и статус
+    # в БД не записывается. При рестарте пользователь видит старый статус
+    # (GENERATING forever).
+    #
+    # Фикс: дублирующий SYNC persist через save_task_final_state_from_snapshot_sync.
+    # Открывает свежее sync-соединение (не из async pool), делает UPDATE напрямую.
+    # Если async уже сработал — sync UPDATE просто перезапишет теми же данными
+    # (no-op). Если async упал — sync всё равно сработает.
+    #
+    # Используется ТОЛЬКО для финальных переходов (DONE/FAILED), т.к. sync
+    # connection-open стоит ~50-100ms и не нужен для промежуточных статусов.
+    def _persist_critical_sync() -> None:
+        try:
+            from ..db.repository import save_task_final_state_from_snapshot_sync
+            ok = save_task_final_state_from_snapshot_sync(
+                task.id,
+                status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+                progress=task.progress,
+                error=task.error,
+                total_dtp=task.total_dtp,
+                total_dead=task.total_dead,
+                total_injured=task.total_injured,
+                files=task.files if hasattr(task, 'files') else None,
+                analytics=None,  # analytics не на каждом переходе, только на DONE
+            )
+            if ok:
+                logger.debug(
+                    f"Task {task_id}: critical sync persist OK "
+                    f"(status={task.status})"
+                )
+            else:
+                logger.warning(
+                    f"Task {task_id}: critical sync persist returned False "
+                    f"(DB not ready or unavailable)"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"Task {task_id}: critical sync persist FAILED: {exc} — "
+                f"task status may not be persisted in DB!"
+            )
 
     try:
         # === 1. FETCHING ===
@@ -318,6 +384,9 @@ async def _execute_task_impl(task_id: str) -> None:
             )
             task.updated_at = _now_utc()
             await _persist()
+            # Stabilization A4: дублирующий sync persist — защита от
+            # OOM-kill между status change и async _persist.
+            _persist_critical_sync()
             return
 
         # Сводная статистика для отображения
@@ -614,6 +683,10 @@ async def _execute_task_impl(task_id: str) -> None:
         task.progress = 100
         task.updated_at = _now_utc()
         await _persist()
+        # Stabilization A4: дублирующий sync persist — защита от
+        # OOM-kill между task.status=DONE и завершением async _persist.
+        # Без этого при рестарте пользователь увидит GENERATING forever.
+        _persist_critical_sync()
 
         # === Фаза 1.6: Prometheus metric — задача завершена успешно ===
         try:
@@ -634,6 +707,10 @@ async def _execute_task_impl(task_id: str) -> None:
         task.error = str(exc)
         task.updated_at = _now_utc()
         await _persist()
+        # Stabilization A4: дублирующий sync persist для FAILED.
+        # Даже если async pool упал (event loop closed, OOM в середине await)
+        # — sync persist через свежее psycopg.connect() всё равно сработает.
+        _persist_critical_sync()
 
         # === Фаза 1.6: Prometheus metric — задача упала ===
         try:
