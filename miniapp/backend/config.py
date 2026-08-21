@@ -73,9 +73,10 @@ class Settings(BaseSettings):
         ),
     )
     max_inmemory_tasks: int = Field(
-        default=50,
+        default=20,
         description=(
-            "Размер in-memory LRU _tasks (50 = ~400 MB максимум RAM)."
+            "Размер in-memory LRU _tasks. 20 = ~300 MB максимум RAM "
+            "(bothost 2 GB). При 50 = ~750 MB — OOM риск."
         ),
     )
     rate_limit_per_minute: int = Field(

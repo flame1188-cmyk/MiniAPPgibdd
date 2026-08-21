@@ -38,11 +38,15 @@ logger = logging.getLogger(__name__)
 # repository.save_task), лёгкие метаданные остаются доступны через
 # get_task_async() (lazy load из БД).
 #
-# MAX_INMEMORY_TASKS=20 выбрано как баланс: ~160 MB максимум в RAM,
-# достаточно для одновременной работы 5-10 пользователей.
-# При 50 (старое значение) worst-case (крупный регион, 3000 карточек)
-# = 50 * 15 MB = 750 MB, что критично для bothost (2 GB RAM).
-MAX_INMEMORY_TASKS = 20
+# MAX_INMEMORY_TASKS: размер LRU-кэша задач.
+# Читается из config.py (env MAX_INMEMORY_TASKS), fallback=20.
+# 20 = ~300 MB максимум RAM, баланс для bothost (2 GB).
+# При 50 worst-case = 750 MB — критично для bothost.
+try:
+    from ..config import settings
+    MAX_INMEMORY_TASKS: int = settings.max_inmemory_tasks
+except Exception:
+    MAX_INMEMORY_TASKS: int = 20
 _tasks: "OrderedDict[str, Task]" = OrderedDict()
 _tasks_lock = Lock()
 
@@ -75,6 +79,20 @@ def _register_task(task: Task) -> None:
             _limit = MAX_INMEMORY_TASKS
         while len(_tasks) >= _limit:
             evicted_id, evicted_task = _tasks.popitem(last=False)
+
+            # N1: синхронно очищаем _TASKS_HEAVY_STATE — без этого тяжёлые поля
+            # (cards ~8 MB, raw_clusters, prev_cards) накапливаются без
+            # лимита до periodic cleanup (раз в 2 часа). При 10-30 юзерах
+            # это 200-700 MB утечки.
+            try:
+                from ..db.repository import drop_heavy_state
+                drop_heavy_state(evicted_id)
+            except Exception as exc:
+                logger.debug(
+                    f"_register_task: drop_heavy_state({evicted_id}) "
+                    f"failed: {exc}"
+                )
+
             logger.info(
                 f"_tasks LRU: вытеснена задача {evicted_id} "
                 f"(регион={evicted_task.region_code}, "

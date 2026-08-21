@@ -8,7 +8,7 @@
 - ensure_prev_cards() — lazy загрузка карточек прошлого года (АППГ)
 - _parse_files_sync() / _task_dir() — хелперы
 
-Использует Semaphore(3) для ограничения одновременных выгрузок к API ГИБДД.
+Использует Semaphore (из config: max_concurrent_tasks, default=3) для ограничения одновременных выгрузок к API ГИБДД.
 
 === Sprint 7 / Фаза C.2.4: опциональное подключение к core/ ===
 Когда env-переменная GIBDD_USE_CORE_PIPELINE=1 — синхронные CPU-bound шаги
@@ -80,12 +80,14 @@ def _core_path_status() -> str:
 
 # === Фаза 1.1: Semaphore на одновременные выгрузки ===
 # Ограничивает количество параллельно выполняемых execute_task().
-# Почему 3: API ГИБДД при 5+ одновременных запросах с одного IP
-# начинает возвращать 429/502; web-fallback (сайт stat.gibdd.ru) ещё
-# хуже — там POST-генерация отчётов. 3 параллельные выгрузки —
-# безопасный максимум. Остальные задачи ждут в очереди Semaphore.
-# При росте до 30 пользователей можно увеличить до 5.
-MAX_CONCURRENT_TASKS = 3
+# Читается из config.py (env MAX_CONCURRENT_TASKS).
+# Рекомендации: 3 для 2-10 юзеров, 5 для 10-30, 8 для 30+.
+# При 5+ одновременных запросах API ГИБДД может возвращать 429/502.
+try:
+    from ..config import settings
+    MAX_CONCURRENT_TASKS: int = settings.max_concurrent_tasks
+except Exception:
+    MAX_CONCURRENT_TASKS: int = 3
 _EXECUTE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
