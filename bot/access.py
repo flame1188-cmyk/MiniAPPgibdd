@@ -188,6 +188,34 @@ async def _fetch_cards_for_period(
                                 f"  {log_prefix}: {dat} -> ОШИБКА "
                                 f"[HTTPStatusError] HTTP 404 (fallback тоже failed)"
                             )
+                    elif status == 400 and "не найден" in (e.response.text or ""):
+                        # 400 «reg = XXX не найден» — код региона не распознан
+                        # API (например, 1167 для Севастополя). Сайт ГИБДД
+                        # использует 2-значные коды и может иметь данные.
+                        logger.warning(
+                            f"  {log_prefix}: {dat} -> HTTP 400 (reg не найден), "
+                            f"пробую через сайт ГИБДД"
+                        )
+                        try:
+                            from web_fallback import fetch_dtp_via_web_period
+                            fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                                [dat], reg_code,
+                                log_prefix=f"{log_prefix} [сайт]",
+                            )
+                            cards.extend(fb_cards)
+                            if fb_errors:
+                                errors.extend(fb_errors)
+                            else:
+                                logger.info(
+                                    f"  {log_prefix}: {dat} -> {len(fb_cards)} ДТП (через сайт)"
+                                )
+                        except Exception as fb_exc:  # noqa: BLE001
+                            err_msg = f"{month_name} {year}: HTTP 400 (API + сайт: {fb_exc})"
+                            errors.append(err_msg)
+                            logger.error(
+                                f"  {log_prefix}: {dat} -> ОШИБКА "
+                                f"[HTTPStatusError] HTTP 400 (fallback тоже failed)"
+                            )
                     else:
                         # Прочие 4xx — не ретраим, не переключаемся
                         err_msg = f"{month_name} {year}: {error_brief(e)}"
