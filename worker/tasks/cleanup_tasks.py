@@ -88,7 +88,6 @@ def cleanup_expired_caches() -> Dict[str, Any]:
     errors = []
     cards_deleted = 0
     clusters_deleted = 0
-    excel_deleted = 0
     llm_deleted = 0
 
     # cards_cache
@@ -111,16 +110,6 @@ def cleanup_expired_caches() -> Dict[str, Any]:
     except Exception as exc:
         errors.append(f"clusters_cache: {exc}")
 
-    # excel_cache
-    try:
-        from miniapp.backend.db.excel_cache import cleanup_old_excel
-        excel_deleted = _run_async(cleanup_old_excel)
-        logger.info(f"cleanup_expired_caches: excel_deleted={excel_deleted}")
-    except ImportError:
-        errors.append("excel_cache module not importable")
-    except Exception as exc:
-        errors.append(f"excel_cache: {exc}")
-
     # llm_cache
     try:
         from miniapp.backend.db.llm_cache import cleanup_expired_llm_cache
@@ -131,18 +120,17 @@ def cleanup_expired_caches() -> Dict[str, Any]:
     except Exception as exc:
         errors.append(f"llm_cache: {exc}")
 
-    total = cards_deleted + clusters_deleted + excel_deleted + llm_deleted
+    total = cards_deleted + clusters_deleted + llm_deleted
     logger.info(
         f"cleanup_expired_caches: done — total={total} "
         f"(cards={cards_deleted}, clusters={clusters_deleted}, "
-        f"excel={excel_deleted}, llm={llm_deleted}), "
+        f"llm={llm_deleted}), "
         f"errors={len(errors)}"
     )
 
     return {
         "cards_deleted": cards_deleted,
         "clusters_deleted": clusters_deleted,
-        "excel_deleted": excel_deleted,
         "llm_deleted": llm_deleted,
         "total_deleted": total,
         "errors": errors,

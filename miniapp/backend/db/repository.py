@@ -776,13 +776,13 @@ def attach_heavy_state(task: Any) -> None:
 # ====================================================================
 # Sprint 5: Task recovery на startup
 # ====================================================================
-# При рестарте сервера in-flight задачи (status='fetching'/'parsing'/'analytics'
-# 'generating'/'running') остаются в этом статусе вечно — рабочий процесс,
+# При рестарте сервера in-flight задачи (status='fetching'/'analytics'
+# 'running') остаются в этом статусе вечно — рабочий процесс,
 # который их обрабатывал, умер вместе с сервером.
 # Эта функция находит такие задачи в БД и помечает их как failed с понятным
 # сообщением, чтобы пользователь увидел ошибку и мог пересоздать задачу
 # вместо бесконечного ожидания.
-_INCOMPLETE_STATUSES = ("fetching", "parsing", "analytics", "generating", "running")
+_INCOMPLETE_STATUSES = ("fetching", "analytics", "running")
 
 
 async def recover_incomplete_tasks() -> int:
@@ -793,7 +793,7 @@ async def recover_incomplete_tasks() -> int:
     Возвращает количество восстановленных задач.
 
     Логика:
-      - status IN (fetching, parsing, analytics, generating, running) → failed
+      - status IN (fetching, analytics, running) → failed
       - error = 'Прервано рестартом сервера (Sprint 5 recovery)'
       - progress не трогаем (полезно для отладки — видно, где оборвалось)
       - clusters_state.status='running' / llm_summary_state.status='running'
@@ -893,7 +893,7 @@ async def recover_incomplete_tasks() -> int:
 #   - in-memory _tasks: пусто (сброшено при redeploy)
 #
 # Существующая recover_incomplete_tasks() НЕ ловит их — она ищет только
-# fetching/parsing/analytics/generating/running, а pending считается
+# fetching/analytics/running, а pending считается
 # легитимным начальным состоянием (задача только что создана, ещё в очереди).
 #
 # Эта функция определяет "stale pending" как:

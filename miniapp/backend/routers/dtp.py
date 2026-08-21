@@ -2,20 +2,24 @@
 Основной роутер: создание задач выгрузки, опрос статуса, скачивание файлов.
 
 Архитектура endpoint'ов:
-- POST /api/dtp/tasks           — создать задачу (async выполнение в фоне)
-- GET  /api/dtp/tasks           — список задач пользователя
-- GET  /api/dtp/tasks/{id}      — статус задачи (для polling)
-- GET  /api/dtp/tasks/{id}/files— список готовых файлов
-- GET  /api/dtp/tasks/{id}/map  — HTML-карта (для iframe)
-- GET  /api/dtp/tasks/{id}/download/{file_type} — скачать Excel/HTML
+- POST /api/dtp/tasks              — создать задачу (async выполнение в фоне)
+- GET  /api/dtp/tasks              — список задач пользователя
+- GET  /api/dtp/tasks/{id}         — статус задачи (для polling)
+- GET  /api/dtp/tasks/{id}/map     — HTML-карта (генерируется лениво при первом запросе)
+- POST /api/dtp/tasks/{id}/generate-excel — ленивая генерация Excel для существующей задачи
+- GET  /api/dtp/tasks/{id}/download/{file_type} — скачать ранее сгенерированный файл
+- POST /api/dtp/export-only        — выгрузка файлов без аналитики (отдельная вкладка)
 """
 from __future__ import annotations
 
+import asyncio
+import io
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..services.gibdd_service import (
@@ -28,6 +32,8 @@ from ..services.gibdd_service import (
     parse_user_query,
 )
 from ..telegram_auth import TelegramUser, get_current_user
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/dtp", tags=["dtp"])
 
@@ -108,6 +114,21 @@ class TaskStatusResponse(BaseModel):
     queue_ahead: Optional[int] = None
 
 
+class ExportOnlyRequest(BaseModel):
+    """Запрос на выгрузку файлов без аналитики (отдельная вкладка)."""
+    region_code: str
+    region_name: str
+    dat_list: List[str]
+    period_label: str
+
+
+class GenerateExcelRequest(BaseModel):
+    """Запрос на ленивую генерацию Excel для существующей задачи."""
+    file_type: str = Field(
+        ..., description="'dtp_cards' или 'dtp_participants'"
+    )
+
+
 # ============================================================
 # Endpoints
 # ============================================================
@@ -172,26 +193,17 @@ async def create_dtp_task(
     )
 
     # Hotfix Sprint 7: гарантированно persist'им метаданные задачи в БД
-    # ДО запуска execute_task. Раньше create_task использовал fire-and-
-    # forget через asyncio.create_task(save_task(task)), что могло потерять
-    # задачу при рестарте контейнера до выполнения корутины. Теперь: даже
-    # если execute_task упадёт в самом начале (до первого _persist()), task
-    # уже есть в БД со статусом PENDING — пользователь увидит его в списке
-    # и сможет удалить/пересоздать.
+    # ДО запуска execute_task.
     try:
         from ..db.repository import save_task
         await save_task(task)
     except Exception as exc:
-        # Не роняем endpoint — задача уже в in-memory _tasks и доступна.
-        # Но логируем на WARNING, чтобы было видно в мониторинге.
-        import logging
         logging.getLogger(__name__).warning(
             f"create_dtp_task: persist task_id={task.id} failed: {exc} "
             f"(задача доступна in-memory, но может быть потеряна при рестарте)"
         )
 
-    # Аудит обращения к ПДн (152-ФЗ): пользователь создал задачу выгрузки.
-    # Логируем регион/период — этого достаточно для журнала доступа.
+    # Аудит обращения к ПДн (152-ФЗ)
     try:
         from ..db.repository import log_access
         await log_access(
@@ -202,10 +214,10 @@ async def create_dtp_task(
             task_id=task.id,
         )
     except Exception:
-        pass  # аудит не должен ронять создание задачи
+        pass
 
-    # Асинхронный запуск в фоне — execute_task сам обновляет статус
-    asyncio_create_task(task.id)
+    # Асинхронный запуск в фоне
+    _asyncio_create_task(task.id)
 
     return TaskCreateResponse(
         task_id=task.id,
@@ -216,34 +228,14 @@ async def create_dtp_task(
     )
 
 
-def asyncio_create_task(task_id: str) -> None:
-    """
-    Запускает pipeline через dispatcher.
-
-    Dispatcher (worker.dispatcher) сам решает, куда отправить задачу:
-    - USE_CELERY=true И REDIS_URL задан → Celery queue "gibdd"
-      (execute_pipeline_task в worker-процессе)
-    - иначе → asyncio.create_task(execute_task(task_id)) в текущем event loop
-      (legacy in-memory path, Sprint 6 behavior)
-
-    В Celery-режиме:
-      - .delay() синхронный — отправляет в broker и возвращается
-      - FastAPI сразу отдаёт HTTP 200, фронтенд polling'ом читает статус
-        из Redis (worker.task_state) через GET /tasks/{id}
-    В in-memory:
-      - _schedule_async(execute_task(task_id)) — fire-and-forget
-    """
-    # Достаём Task для извлечения параметров (dat_list, reg_code, ...)
+def _asyncio_create_task(task_id: str) -> None:
+    """Запускает pipeline через dispatcher."""
     from ..services.gibdd_service import get_task_async
     from worker.dispatcher import dispatch_execute_pipeline
-    import asyncio
 
     async def _dispatch():
         task = await get_task_async(task_id)
         if task is None:
-            # Task уже удалён из памяти (LRU eviction или restart) —
-            # fallback на старый in-memory path, который сам загрузит метаданные
-            # из БД через pipeline.execute_task.
             from ..services.gibdd_service import execute_task
             await execute_task(task_id)
             return
@@ -254,8 +246,8 @@ def asyncio_create_task(task_id: str) -> None:
             reg_code=task.region_code,
             region_name=task.region_name,
             period_label=task.period_label,
-            prev_dat_list=None,  # gibdd_tasks вычислит из dat_list (год - 1)
-            prev_label=task.prev_label,  # может быть None — вычислится внутри
+            prev_dat_list=None,
+            prev_label=task.prev_label,
             user_id=task.user_id,
             raw_query=task.raw_query,
         )
@@ -263,8 +255,6 @@ def asyncio_create_task(task_id: str) -> None:
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # Не в event loop (например, из теста в sync-контексте) — запускаем
-        # dispatcher синхронно. dispatch_execute_pipeline — sync-функция.
         asyncio.run(_dispatch())
         return
 
@@ -306,23 +296,9 @@ async def delete_task_endpoint(
     task_id: str,
     user: TelegramUser = Depends(get_current_user),
 ):
-    """Удаляет задачу пользователя.
-
-    Удаляет из БД, in-memory кэша и файлы с диска (data/tasks/{task_id}/,
-    а также все файлы, перечисленные в task.files[].path).
-
-    Ownership-проверка: можно удалить только свою задачу. Если task_id
-    не существует или принадлежит другому пользователю — возвращаем 404
-    (не раскрываем, какая именно причина, чтобы не давать информации
-    о существовании чужих задач).
-
-    Действие логируется в access_log (требование 152-ФЗ).
-    """
+    """Удаляет задачу пользователя."""
     from ..db.repository import delete_task
 
-    # Pre-check через get_task_async — для логирования и проверки ownership
-    # перед тем, как вызывать repository.delete_task. Это даёт более точные
-    # ошибки (404 vs 403) в in-memory режиме, когда БД недоступна.
     task = await get_task_async(task_id)
     if not task:
         raise HTTPException(
@@ -337,16 +313,11 @@ async def delete_task_endpoint(
 
     deleted = await delete_task(task_id, user.id)
     if not deleted:
-        # Маловероятная ситуация: задача была в памяти на pre-check,
-        # но к моменту delete_task уже исчезла (race condition с cleanup-воркером).
-        # Возвращаем 404 — фронтенд инвалидирует кэш и пользователь увидит
-        # актуальный список.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Task {task_id} not found",
         )
 
-    # Логируем удаление в access_log (152-ФЗ аудит)
     try:
         from ..db.repository import log_access
         await log_access(
@@ -357,11 +328,282 @@ async def delete_task_endpoint(
             task_id=task_id,
         )
     except Exception:
-        pass  # логирование не должно рушить удаление
+        pass
 
     return {"ok": True, "task_id": task_id, "deleted": True}
 
 
+# ============================================================
+# HTML-карта (ленивая генерация при первом запросе)
+# ============================================================
+@router.get("/tasks/{task_id}/map", response_class=HTMLResponse)
+async def get_task_map(
+    task_id: str,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Отдаёт HTML-карту (inline Leaflet с кластеризацией).
+    Генерируется лениво при первом запросе и кэшируется в task.files.
+    """
+    task = await get_task_async(task_id)
+    if not task or task.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Ищем уже сгенерированную карту
+    map_file = next(
+        (f for f in task.files if f["type"] == "map_html"),
+        None,
+    )
+    if map_file:
+        path = Path(map_file["path"])
+        if path.exists():
+            return HTMLResponse(content=path.read_text(encoding="utf-8"))
+
+    # Карта ещё не сгенерирована — генерируем лениво
+    if not task.cards:
+        # Восстанавливаем карточки из кэша
+        from ..services.pipeline import ensure_cards
+        result = await ensure_cards(task)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=503,
+                detail=result.get("error", "Карточки не загружены"),
+            )
+
+    html_content = await _generate_map_html(task)
+    if html_content is None:
+        raise HTTPException(
+            status_code=500, detail="Не удалось сгенерировать карту"
+        )
+
+    return HTMLResponse(content=html_content)
+
+
+# ============================================================
+# Ленивая генерация Excel для существующей задачи
+# ============================================================
+@router.post("/tasks/{task_id}/generate-excel")
+async def generate_excel_for_task(
+    task_id: str,
+    body: GenerateExcelRequest,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Ленивая генерация Excel-файла для существующей задачи.
+
+    Генерирует ОБА Excel-файла (карточки + участники) в thread pool.
+    Первый запрос занимает 5-8 сек, результаты кэшируются на диске —
+    повторный запрос для другого file_type отдаётся мгновенно.
+
+    file_type: 'dtp_cards' — карточки ДТП, 'dtp_participants' — участники.
+    """
+    if body.file_type not in ("dtp_cards", "dtp_participants"):
+        raise HTTPException(
+            status_code=400,
+            detail="file_type должен быть 'dtp_cards' или 'dtp_participants'",
+        )
+
+    task = await get_task_async(task_id)
+    if not task or task.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Проверяем, есть ли уже файл на диске
+    existing = next(
+        (f for f in task.files if f["type"] == body.file_type),
+        None,
+    )
+    if existing:
+        path = Path(existing["path"])
+        if path.exists():
+            return FileResponse(
+                path=str(path),
+                media_type=existing["mime"],
+                filename=existing["filename"],
+            )
+
+    # Восстанавливаем карточки если нужно
+    if not task.cards:
+        from ..services.pipeline import ensure_cards
+        result = await ensure_cards(task)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=503,
+                detail=result.get("error", "Карточки не загружены"),
+            )
+
+    # Генерируем ОБА файла (парсинг + Excel) в thread pool
+    try:
+        from ..services import _imports
+        from ..services.pipeline import _task_dir
+
+        gibdd_parser = _imports._import_module("gibdd_parser")
+        excel_gen = _imports._import_module("excel_generator")
+
+        # 1. Парсинг (CPU-bound)
+        file1_data, file2_data = await asyncio.to_thread(
+            _build_excel_data_sync, gibdd_parser, task.cards
+        )
+
+        # 2. Генерация Excel (I/O-bound + CPU-bound)
+        file1_bytes, file2_bytes = await asyncio.to_thread(
+            excel_gen.generate_both_files, file1_data, file2_data
+        )
+
+        # 3. Сохраняем ОБА файла на диск (кэш для повторных запросов)
+        out_dir = _task_dir(task_id)
+        region_safe = "".join(
+            c if c.isalnum() else "_" for c in task.region_name
+        )[:30] or task.region_code
+        period_safe = "".join(
+            c if c.isalnum() else "_" for c in task.period_label
+        )[:20]
+
+        cards_path = out_dir / f"dtp_cards_{region_safe}_{period_safe}.xlsx"
+        cards_path.write_bytes(file1_bytes)
+
+        # Регистрируем в task.files (если ещё нет)
+        if not any(f["type"] == "dtp_cards" for f in task.files):
+            task.files.append({
+                "type": "dtp_cards",
+                "filename": cards_path.name,
+                "path": str(cards_path),
+                "size_bytes": len(file1_bytes),
+                "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            })
+
+        uch_path = out_dir / f"dtp_uch_{region_safe}_{period_safe}.xlsx"
+        uch_path.write_bytes(file2_bytes)
+
+        if not any(f["type"] == "dtp_participants" for f in task.files):
+            task.files.append({
+                "type": "dtp_participants",
+                "filename": uch_path.name,
+                "path": str(uch_path),
+                "size_bytes": len(file2_bytes),
+                "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            })
+
+        # 4. Отдаём запрошенный файл
+        if body.file_type == "dtp_cards":
+            return FileResponse(
+                path=str(cards_path),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=cards_path.name,
+            )
+        else:
+            return FileResponse(
+                path=str(uch_path),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                filename=uch_path.name,
+            )
+
+    except Exception as exc:
+        logger.exception(f"generate_excel_for_task({task_id}) failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка генерации Excel: {exc}",
+        )
+
+
+# ============================================================
+# Выгрузка файлов без аналитики (отдельная вкладка)
+# ============================================================
+@router.post("/export-only")
+async def export_only(
+    body: ExportOnlyRequest,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Выгрузка Excel-файлов без аналитики, карты и очагов.
+
+    Используется отдельной вкладкой «Выгрузка файлов».
+    Только: запрос карточек → генерация Excel → отдача ZIP.
+
+    Возвращает ZIP-архив с двумя файлами:
+    - dtp_cards_{регион}_{период}.xlsx
+    - dtp_uch_{регион}_{период}.xlsx
+    """
+    # 1. Запрашиваем карточки
+    from ..services import _imports
+
+    bot_module = _imports._import_module("bot")
+    cards, errors = await bot_module._fetch_cards_for_period(
+        dat_list=body.dat_list,
+        reg_code=body.region_code,
+        log_prefix=f"ExportOnly[user={user.id}]",
+        cache_result=True,
+    )
+
+    if not cards:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Не удалось получить данные ДТП. "
+                f"Ошибки: {'; '.join(errors[:3]) if errors else 'нет данных'}"
+            ),
+        )
+
+    # 2. Генерируем Excel
+    try:
+        gibdd_parser = _imports._import_module("gibdd_parser")
+        file1_data, file2_data = await asyncio.to_thread(
+            _build_excel_data_sync, gibdd_parser, cards
+        )
+
+        excel_gen = _imports._import_module("excel_generator")
+        file1_bytes, file2_bytes = await asyncio.to_thread(
+            excel_gen.generate_both_files, file1_data, file2_data
+        )
+    except Exception as exc:
+        logger.exception(f"export_only failed for {body.region_code}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка генерации Excel: {exc}",
+        )
+
+    # 3. Упаковываем в ZIP
+    import zipfile
+
+    safe_region = "".join(
+        c if c.isalnum() else "_" for c in body.region_name
+    )[:30] or body.region_code
+    safe_period = "".join(
+        c if c.isalnum() else "_" for c in body.period_label
+    )[:20]
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            f"dtp_cards_{safe_region}_{safe_period}.xlsx",
+            file1_bytes,
+        )
+        zf.writestr(
+            f"dtp_uch_{safe_region}_{safe_period}.xlsx",
+            file2_bytes,
+        )
+
+    zip_bytes = zip_buf.getvalue()
+    zip_name = f"dtp_{safe_region}_{safe_period}.zip"
+    safe_zip_name = "".join(
+        c if c.isalnum() or c in "._- " else "_"
+        for c in zip_name
+    )[:100]
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{safe_zip_name}"; '
+                f"filename*=UTF-8''{safe_zip_name}"
+            )
+        },
+    )
+
+
+# ============================================================
+# Скачивание ранее сгенерированных файлов (legacy, для кластеров/точки)
+# ============================================================
 @router.get("/tasks/{task_id}/files", response_model=List[TaskFileSchema])
 async def list_task_files(
     task_id: str,
@@ -374,33 +616,6 @@ async def list_task_files(
     return [TaskFileSchema(**f) for f in task.files]
 
 
-@router.get("/tasks/{task_id}/map", response_class=HTMLResponse)
-async def get_task_map(
-    task_id: str,
-    user: TelegramUser = Depends(get_current_user),
-):
-    """
-    Отдаёт HTML-карту (inline Leaflet с кластеризацией).
-    Используется в <iframe> на frontend.
-    """
-    task = await get_task_async(task_id)
-    if not task or task.user_id != user.id:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    map_file = next(
-        (f for f in task.files if f["type"] == "map_html"),
-        None,
-    )
-    if not map_file:
-        raise HTTPException(status_code=404, detail="Map file not generated yet")
-
-    path = Path(map_file["path"])
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Map file missing on disk")
-
-    return HTMLResponse(content=path.read_text(encoding="utf-8"))
-
-
 @router.get("/tasks/{task_id}/download/{file_type}")
 async def download_file(
     task_id: str,
@@ -408,9 +623,8 @@ async def download_file(
     user: TelegramUser = Depends(get_current_user),
 ):
     """
-    Скачивание Excel/HTML-файла.
-
-    file_type: 'dtp_cards' | 'dtp_participants' | 'map_html'
+    Скачивание ранее сгенерированного файла (кластеры, точка и т.д.).
+    Для Excel-выгрузки ДТП используйте POST /tasks/{id}/generate-excel.
     """
     task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
@@ -440,11 +654,77 @@ async def download_file(
 # ============================================================
 # Helpers
 # ============================================================
+def _build_excel_data_sync(gibdd_parser, cards):
+    """Синхронный хелпер: build_file1_data + build_file2_data."""
+    file1_data = gibdd_parser.build_file1_data(cards)
+    file2_data = gibdd_parser.build_file2_data(cards)
+    return file1_data, file2_data
+
+
+async def _generate_map_html(task: Task) -> Optional[str]:
+    """Генерирует HTML-карту и кэширует в task.files."""
+    from ..services import _imports
+
+    try:
+        report_gen_module = _imports._import_module("report_generator")
+
+        # Подгружаем камеры
+        cameras = None
+        try:
+            camera_cache_module = _imports._import_module("camera_cache")
+            if camera_cache_module.has_cached_cameras(task.region_code):
+                cameras = camera_cache_module.load_cameras_from_cache(
+                    task.region_code
+                )
+        except Exception:
+            cameras = None
+
+        generator = report_gen_module.ReportGenerator(
+            region_name=task.region_name,
+            period_label=task.period_label,
+        )
+
+        prev_cards_for_map = task.prev_cards or None
+        html_content = generator.generate_dtp_map(
+            task.cards,
+            cameras=cameras,
+            prev_cards=prev_cards_for_map,
+            prev_label=task.prev_label,
+        )
+
+        # Кэшируем на диск
+        from ..services.pipeline import _task_dir
+        out_dir = _task_dir(task.id)
+        region_safe = "".join(
+            c if c.isalnum() else "_" for c in task.region_name
+        )[:30] or task.region_code
+        period_safe = "".join(
+            c if c.isalnum() else "_" for c in task.period_label
+        )[:20]
+        map_path = out_dir / f"dtp_map_{region_safe}_{period_safe}.html"
+        map_path.write_text(html_content, encoding="utf-8")
+
+        task.files.append({
+            "type": "map_html",
+            "filename": map_path.name,
+            "path": str(map_path),
+            "size_bytes": len(html_content.encode("utf-8")),
+            "mime": "text/html",
+        })
+
+        logger.info(
+            f"Task {task.id}: map generated lazily — "
+            f"{len(html_content.encode('utf-8')) // 1024} KB"
+        )
+        return html_content
+
+    except Exception as exc:
+        logger.warning(f"Task {task.id}: lazy map generation failed: {exc}")
+        return None
+
+
 def _task_to_response(task: Task) -> TaskStatusResponse:
     # N6: backpressure — считаем очередь перед semaphore.
-    # Если задача в статусе pending/fetching — она может ждать semaphore.
-    # Считаем сколько задач в _tasks тоже ждут (pending/fetching)
-    # и созданы раньше текущей.
     queue_pos = None
     queue_ahead = None
     if task.status in ("pending", "fetching"):

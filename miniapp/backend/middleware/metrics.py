@@ -56,7 +56,7 @@ if PROMETHEUS_AVAILABLE:
     TASKS_TOTAL = Counter(
         "gibdd_tasks_total",
         "Всего созданных задач выгрузки",
-        ["status"],  # pending/fetching/parsing/analytics/generating/done/failed
+        ["status"],  # pending/fetching/analytics/done/failed
     )
 
     # Текущее количество активных задач (в execute_task)
@@ -99,7 +99,7 @@ if PROMETHEUS_AVAILABLE:
     TASK_PHASE_DURATION = Histogram(
         "gibdd_task_phase_duration_seconds",
         "Время выполнения фазы задачи",
-        ["phase"],  # fetching / parsing / analytics / generating
+        ["phase"],  # fetching / analytics
     )
 
     # Время ответа внешних API (ГИБДД)

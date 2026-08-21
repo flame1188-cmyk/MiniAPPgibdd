@@ -345,22 +345,6 @@ async def lifespan(app: FastAPI):
                 except Exception as ce:
                     logger.warning(f"Cleanup clusters_cache error: {ce}")
 
-                # Этап 5: чистим протухшие Excel-файлы в excel_cache.
-                # Записи с expires_at < NOW() игнорируются при SELECT,
-                # но физически занимают место (1-2 MB каждая) — удаляем.
-                try:
-                    from miniapp.backend.db.excel_cache import (
-                        cleanup_old_excel,
-                    )
-                    excel_removed = await cleanup_old_excel()
-                    if excel_removed > 0:
-                        logger.info(
-                            f"Cleanup: удалено {excel_removed} протухших "
-                            f"записей кэша Excel"
-                        )
-                except Exception as ce:
-                    logger.warning(f"Cleanup excel_cache error: {ce}")
-
                 # Sprint 2: чистим протухшие LLM-summary в llm_cache.
                 # Записи с expires_at < NOW() игнорируются при SELECT,
                 # но физически занимают место (5-10 KB каждая) — удаляем.
@@ -660,23 +644,9 @@ async def health_db_clusters():
     return await get_cache_stats()
 
 
-@app.get("/health/db/excel")
-async def health_db_excel():
-    """
-    Статистика кэша готовых Excel-файлов в PostgreSQL (Этап 5).
-
-    Возвращает:
-    - configured / ready — состояние БД
-    - total_entries — всего записей в excel_cache (включая протухшие)
-    - valid_entries — валидных записей (expires_at > NOW())
-    - total_dtp_cached — суммарное количество ДТП в валидных записях
-    - total_bytes / total_mb — суммарный размер байтов в кэше
-    - regions_cached — сколько регионов имеют валидные записи
-    - oldest_expiry / newest_expiry — диапазон TTL
-    - top_regions — топ-5 регионов по размеру кэша (с разбивкой по МБ)
-    """
-    from miniapp.backend.db.excel_cache import get_cache_stats
-    return await get_cache_stats()
+@app.get("")
+async def health_root():
+    return {"status": "ok", "service": "gibdd-miniapp"}
 
 
 @app.get("/health/redis")

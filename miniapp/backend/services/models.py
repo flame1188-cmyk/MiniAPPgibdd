@@ -18,9 +18,7 @@ class TaskStatus(str, Enum):
 
     PENDING = "pending"
     FETCHING = "fetching"
-    PARSING = "parsing"
     ANALYTICS = "analytics"
-    GENERATING = "generating"
     DONE = "done"
     FAILED = "failed"
 

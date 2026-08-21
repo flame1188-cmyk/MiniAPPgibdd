@@ -36,60 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Cache helpers
-# ============================================================
-def _check_excel_cache(
-    reg_code: str,
-    dat_list: List[str],
-) -> Optional[tuple[bytes, bytes, Dict[str, Any]]]:
-    """Проверяет кэш Excel в PostgreSQL (через asyncio.run)."""
-    async def _check():
-        from miniapp.backend.db.excel_cache import get_cached_excel
-        return await get_cached_excel(
-            reg_code=reg_code,
-            dat_list=dat_list,
-        )
-
-    try:
-        return asyncio.run(_check())
-    except Exception as exc:
-        logger.warning(f"exports_tasks: excel cache lookup failed: {exc}")
-        return None
-
-
-def _put_excel_cache(
-    reg_code: str,
-    dat_list: List[str],
-    file1_bytes: bytes,
-    file2_bytes: bytes,
-    total_dtp: int,
-    total_dead: int,
-    total_injured: int,
-    region_name: str,
-    period_label: str,
-) -> None:
-    """Сохраняет Excel в кэш (через asyncio.run)."""
-    async def _put():
-        from miniapp.backend.db.excel_cache import put_cached_excel
-        await put_cached_excel(
-            reg_code=reg_code,
-            dat_list=dat_list,
-            file1_bytes=file1_bytes,
-            file2_bytes=file2_bytes,
-            total_dtp=total_dtp,
-            total_dead=total_dead,
-            total_injured=total_injured,
-            region_name=region_name,
-            period_label=period_label,
-        )
-
-    try:
-        asyncio.run(_put())
-    except Exception as exc:
-        logger.warning(f"exports_tasks: excel cache put failed: {exc}")
-
-
-# ============================================================
 # generate_excel_task
 # ============================================================
 @app.task(
@@ -118,9 +64,6 @@ def generate_excel_task(
     Args:
         file1_data: Данные для Файла 1 (карточки ДТП).
         file2_data: Данные для Файла 2 (участники).
-        reg_code, dat_list: Ключ кэша (если use_cache=True).
-        region_name, period_label, total_*: Метаданные для кэша.
-        use_cache: True → проверять/сохранять кэш.
 
     Returns:
         dict:
@@ -130,31 +73,10 @@ def generate_excel_task(
             "file2_bytes_b64": str,
             "file1_size": int,
             "file2_size": int,
-            "from_cache": bool,
             "error": str | None,
         }
     """
     log_prefix = "Celery[generate_excel_task]"
-
-    # === Cache lookup ===
-    if use_cache and reg_code and dat_list:
-        cached = _check_excel_cache(reg_code, dat_list)
-        if cached is not None:
-            file1_bytes, file2_bytes, _meta = cached
-            logger.info(
-                f"{log_prefix}: cache HIT — "
-                f"file1={len(file1_bytes) // 1024} KB, "
-                f"file2={len(file2_bytes) // 1024} KB"
-            )
-            return {
-                "ok": True,
-                "file1_bytes_b64": base64.b64encode(file1_bytes).decode("ascii"),
-                "file2_bytes_b64": base64.b64encode(file2_bytes).decode("ascii"),
-                "file1_size": len(file1_bytes),
-                "file2_size": len(file2_bytes),
-                "from_cache": True,
-                "error": None,
-            }
 
     # === Generate ===
     from miniapp.backend.core import generate_excel_bytes_sync
@@ -169,7 +91,6 @@ def generate_excel_task(
             "file2_bytes_b64": "",
             "file1_size": 0,
             "file2_size": 0,
-            "from_cache": False,
             "error": str(exc),
         }
 
@@ -178,27 +99,12 @@ def generate_excel_task(
         f"file2={len(file2_bytes) // 1024} KB"
     )
 
-    # === Cache put ===
-    if use_cache and reg_code and dat_list:
-        _put_excel_cache(
-            reg_code=reg_code,
-            dat_list=dat_list,
-            file1_bytes=file1_bytes,
-            file2_bytes=file2_bytes,
-            total_dtp=total_dtp,
-            total_dead=total_dead,
-            total_injured=total_injured,
-            region_name=region_name,
-            period_label=period_label,
-        )
-
     return {
         "ok": True,
         "file1_bytes_b64": base64.b64encode(file1_bytes).decode("ascii"),
         "file2_bytes_b64": base64.b64encode(file2_bytes).decode("ascii"),
         "file1_size": len(file1_bytes),
         "file2_size": len(file2_bytes),
-        "from_cache": False,
         "error": None,
     }
 

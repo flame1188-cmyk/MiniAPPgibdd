@@ -4,32 +4,18 @@
 Содержит:
 - create_task() — создание и регистрация новой задачи
 - execute_task() / _execute_task_impl() — основной пайплайн:
-  FETCHING → PARSING → ANALYTICS → GENERATING → DONE
+  FETCHING → ANALYTICS → DONE
 - ensure_prev_cards() — lazy загрузка карточек прошлого года (АППГ)
-- _parse_files_sync() / _task_dir() — хелперы
+- _task_dir() — хелпер
 
 Использует Semaphore (из config: max_concurrent_tasks, default=3) для ограничения одновременных выгрузок к API ГИБДД.
 
-=== Sprint 7 / Фаза C.2.4: опциональное подключение к core/ ===
-Когда env-переменная GIBDD_USE_CORE_PIPELINE=1 — синхронные CPU-bound шаги
-(PARSING, ANALYTICS, GENERATING) идут через miniapp.backend.core.* sync-функции
-через asyncio.to_thread(). Это позволяет:
+Excel-файлы больше НЕ генерируются в пайплайне. Пользователь может:
+1. Скачать их по кнопкам из вкладки «Файлы» (ленивая генерация).
+2. Воспользоваться отдельной вкладкой «Выгрузка файлов».
 
-1. Унифицировать бизнес-логику между FastAPI async-path (этот файл) и
-   будущим Celery sync-path (worker/tasks/*, Фаза C.3).
-2. Единое тестирование — core-функции тестируются изолированно (C.2).
-3. Единый мониторинг/логирование — все метрики собираются в core-функциях.
-4. Лёгкий rollback — GIBDD_USE_CORE_PIPELINE=0 возвращает legacy-путь.
-
-FETCHING остаётся async-native в обоих путях:
-- FastAPI path: прямой await bot._fetch_cards_for_period(...)
-- Celery path (C.3): fetch_cards_for_period_sync через asyncio.run()
-Причина: fetch_cards_for_period_sync использует asyncio.run() внутри,
-что конфликтует с running FastAPI event loop. Celery worker не имеет
-event loop — там это работает.
-
-По умолчанию GIBDD_USE_CORE_PIPELINE=0 (legacy, backward compatible).
-После проверки в staging можно переключить на 1 для A/B-тестирования.
+Это экономит 5-8 секунд на каждой выгрузке — пользователь сразу
+видит карту, аналитику и очаги без ожидания генерации Excel.
 """
 from __future__ import annotations
 
@@ -61,14 +47,9 @@ def _should_use_core_path() -> bool:
     По умолчанию False — backward compatibility с production-деплоями,
     не знающими про C.2.4.
 
-    Когда True, синхронные CPU-bound шаги (PARSING, ANALYTICS, GENERATING)
+    Когда True, синхронные CPU-bound шаги (ANALYTICS)
     в _execute_task_impl идут через miniapp.backend.core.* sync-функции
-    через asyncio.to_thread(), вместо прямых вызовов gibdd_parser / analytics /
-    excel_generator / report_generator.
-
-    Это позволяет унифицировать бизнес-логику между FastAPI path (этот файл)
-    и будущим Celery path (Фаза C.3) — оба будут вызывать одни и те же
-    core-функции.
+    через asyncio.to_thread().
     """
     return os.environ.get("GIBDD_USE_CORE_PIPELINE", "0") == "1"
 
@@ -189,18 +170,6 @@ def _task_dir(task_id: str) -> Path:
     return d
 
 
-def _parse_files_sync(gibdd_parser, cards):
-    """Синхронный хелпер для запуска в thread pool (Фаза 1.2).
-
-    gibdd_parser.build_file1_data + build_file2_data — CPU-bound парсинг
-    карточек. Объединены в одну функцию, чтобы вызвать через
-    asyncio.to_thread() один раз (а не два).
-    """
-    file1_data = gibdd_parser.build_file1_data(cards)
-    file2_data = gibdd_parser.build_file2_data(cards)
-    return file1_data, file2_data
-
-
 async def execute_task(task_id: str) -> None:
     """
     Асинхронное выполнение задачи выгрузки.
@@ -208,9 +177,10 @@ async def execute_task(task_id: str) -> None:
     Шаги:
     1. FETCHING — выгрузка карточек ДТП через bot._fetch_cards_for_period
        (внутри: API → web-fallback → кэш)
-    2. PARSING — генерация Excel-данных через gibdd_parser
-    3. ANALYTICS — расчёт метрик через analytics.calculate_metrics
-    4. GENERATING — запись Excel-файлов и HTML-карты
+    2. ANALYTICS — расчёт метрик через analytics.calculate_metrics
+
+    Excel-файлы и HTML-карта НЕ генерируются в пайплайне.
+    Они доступны по запросу через ленивую генерацию.
 
     На каждом переходе статуса — сохранение в БД через repository.save_task
     (если DATABASE_URL задан; иначе работает только in-memory).
@@ -322,36 +292,10 @@ async def _execute_task_impl(task_id: str) -> None:
         task.total_injured = sum(int(c.get("ran", 0) or 0) for c in cards)
 
         # Сохраняем сырые карточки для последующего анализа
-        # (очаги, статистика по точке, LLM-анализ)
+        # (очаги, статистика по точке, LLM-анализ, ленивая генерация Excel)
         task.cards = cards
 
-        # === 2. PARSING ===
-        task.status = TaskStatus.PARSING
-        task.progress = 45
-        task.updated_at = _now_utc()
-        await _persist()
-
-        # Sprint 7 / Фаза C.2.4: опциональный routing через core/
-        # build_excel_data_sync — pure sync функция, вызывается через
-        # asyncio.to_thread (как и legacy _parse_files_sync). Разница —
-        # только в точке входа: core/ vs прямой вызов gibdd_parser.
-        if _should_use_core_path():
-            from ..core import build_excel_data_sync
-
-            file1_data, file2_data = await asyncio.to_thread(
-                build_excel_data_sync, cards
-            )
-            logger.info(f"Task {task_id}: PARSING via core/build_excel_data_sync")
-        else:
-            gibdd_parser = _imports._import_module("gibdd_parser")
-            # gibdd_parser.build_file1/2_data — синхронный CPU-bound парсинг
-            # 1500-3000 карточек. Выносим в thread pool, чтобы не блокировать
-            # event loop (Фаза 1.2).
-            file1_data, file2_data = await asyncio.to_thread(
-                _parse_files_sync, gibdd_parser, cards
-            )
-
-        # === 3. ANALYTICS ===
+        # === 2. ANALYTICS ===
         task.status = TaskStatus.ANALYTICS
         task.progress = 65
         task.updated_at = _now_utc()
@@ -415,196 +359,6 @@ async def _execute_task_impl(task_id: str) -> None:
             }
         await _persist()  # сохраняем analytics в БД
 
-        # === 4. GENERATING ===
-        task.status = TaskStatus.GENERATING
-        task.progress = 80
-        task.updated_at = _now_utc()
-        await _persist()
-
-        out_dir = _task_dir(task_id)
-        region_safe = "".join(
-            c if c.isalnum() else "_" for c in task.region_name
-        )[:30] or task.region_code
-        period_safe = "".join(
-            c if c.isalnum() else "_" for c in task.period_label
-        )[:20]
-
-        # Excel: карточки ДТП + участники (генерируем оба файла одной функцией)
-        #
-        # === Этап 5: проверяем кэш готовых Excel-байтов в PostgreSQL ===
-        # Ключ (reg_code, dat_hash) совпадает с ключом dtp_cards_cache —
-        # это безопасно: Excel — производное от cards, если cards
-        # идентичны, то и Excel побайтово идентичен.
-        #
-        # Cache hit → пропускаем 5-8 сек excel_generator.generate_both_files()
-        # и сразу пишем байты на диск. Cache miss → генерируем как раньше,
-        # сохраняем в кэш для следующих пользователей.
-        file1_bytes: Optional[bytes] = None
-        file2_bytes: Optional[bytes] = None
-        try:
-            from ..db.excel_cache import get_cached_excel
-            cached_excel = await get_cached_excel(
-                reg_code=task.region_code,
-                dat_list=task.dat_list,
-            )
-            if cached_excel is not None:
-                file1_bytes, file2_bytes, _meta = cached_excel
-                logger.info(
-                    f"Task {task_id}: Excel loaded from cache — "
-                    f"~{(len(file1_bytes) + len(file2_bytes)) // 1024} KB"
-                )
-        except Exception as exc:
-            logger.debug(f"Task {task_id}: excel cache lookup failed: {exc}")
-
-        # Если кэш промахнулся — генерируем Excel штатно (5-8 сек).
-        #
-        # === Фаза 1.2: генерация Excel в ThreadPool ===
-        # openpyxl — синхронная библиотека, при генерации Файла 2
-        # (3999 строк участников) занимает 5-6 сек и БЛОКИРУЕТ event loop.
-        # При 5 одновременных пользователях каждый следующий ждёт суммы
-        # времён всех предыдущих: 5 × 6 сек = 30 сек задержки.
-        # asyncio.to_thread() выносит генерацию в thread pool — event loop
-        # остаётся свободным для других запросов.
-        if file1_bytes is None or file2_bytes is None:
-            # Sprint 7 / Фаза C.2.4: опциональный routing через core/
-            # generate_excel_bytes_sync — pure sync обёртка над тем же
-            # excel_generator.generate_both_files. Разница — только в точке
-            # входа: core/ (для unified Celery path) vs прямой вызов.
-            if _should_use_core_path():
-                from ..core import generate_excel_bytes_sync
-
-                file1_bytes, file2_bytes = await asyncio.to_thread(
-                    generate_excel_bytes_sync,
-                    file1_data,
-                    file2_data,
-                )
-                logger.info(f"Task {task_id}: GENERATING Excel via core/generate_excel_bytes_sync")
-            else:
-                excel_gen = _imports._import_module("excel_generator")
-                file1_bytes, file2_bytes = await asyncio.to_thread(
-                    excel_gen.generate_both_files,
-                    file1_data,
-                    file2_data,
-                )
-
-            # === Этап 5: сохраняем в кэш для следующих пользователей ===
-            try:
-                from ..db.excel_cache import put_cached_excel
-                await put_cached_excel(
-                    reg_code=task.region_code,
-                    dat_list=task.dat_list,
-                    file1_bytes=file1_bytes,
-                    file2_bytes=file2_bytes,
-                    total_dtp=task.total_dtp,
-                    total_dead=task.total_dead,
-                    total_injured=task.total_injured,
-                    region_name=task.region_name,
-                    period_label=task.period_label,
-                )
-            except Exception as exc:
-                logger.debug(f"Task {task_id}: excel cache put failed: {exc}")
-
-        cards_path = out_dir / f"dtp_cards_{region_safe}_{period_safe}.xlsx"
-        cards_path.write_bytes(file1_bytes)
-        task.files.append({
-            "type": "dtp_cards",
-            "filename": cards_path.name,
-            "path": str(cards_path),
-            "size_bytes": len(file1_bytes),
-            "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        })
-
-        uch_path = out_dir / f"dtp_uch_{region_safe}_{period_safe}.xlsx"
-        uch_path.write_bytes(file2_bytes)
-        task.files.append({
-            "type": "dtp_participants",
-            "filename": uch_path.name,
-            "path": str(uch_path),
-            "size_bytes": len(file2_bytes),
-            "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        })
-
-        # HTML-карта через ReportGenerator
-        try:
-            report_gen_module = _imports._import_module("report_generator")
-
-            # Подгружаем камеры из кэша, если они есть для этого региона.
-            # Файл должен лежать в data/cameras_{reg_code}.xls
-            # (загружается через Telegram-бота или через Mini App UI).
-            cameras = None
-            try:
-                camera_cache_module = _imports._import_module("camera_cache")
-                if camera_cache_module.has_cached_cameras(task.region_code):
-                    cameras = camera_cache_module.load_cameras_from_cache(
-                        task.region_code
-                    )
-                    if cameras:
-                        with_pk = sum(
-                            1 for c in cameras if c.get("has_piket")
-                        )
-                        logger.info(
-                            f"Task {task_id}: loaded {len(cameras)} cameras "
-                            f"({with_pk} with piket) for region "
-                            f"{task.region_code}"
-                        )
-                    else:
-                        logger.warning(
-                            f"Task {task_id}: camera file exists for "
-                            f"{task.region_code} but parser returned empty"
-                        )
-            except Exception as exc:
-                logger.warning(
-                    f"Task {task_id}: camera cache load failed: {exc} "
-                    f"— building map without cameras"
-                )
-                cameras = None
-
-            generator = report_gen_module.ReportGenerator(
-                region_name=task.region_name,
-                period_label=task.period_label,
-            )
-            # Передаём карточки прошлого года, чтобы на карте появилась
-            # динамика АППГ в верхней сводке (ДТП / Погибшие / Раненые).
-            prev_cards_for_map = task.prev_cards or None
-
-            # Sprint 7 / Фаза C.2.4: опциональный routing через core/
-            # generate_map_html_sync — pure sync обёртка над тем же
-            # ReportGenerator.generate_dtp_map. В core-path выносим в
-            # asyncio.to_thread (генерация HTML 1-2с, не блокирует event loop).
-            if _should_use_core_path():
-                from ..core import generate_map_html_sync
-
-                html_content = await asyncio.to_thread(
-                    generate_map_html_sync,
-                    cards,
-                    task.region_name,
-                    task.period_label,
-                    cameras,
-                    prev_cards_for_map,
-                    task.prev_label,
-                )
-                logger.info(f"Task {task_id}: GENERATING map via core/generate_map_html_sync")
-            else:
-                html_content = generator.generate_dtp_map(
-                    cards,
-                    cameras=cameras,
-                    prev_cards=prev_cards_for_map,
-                    prev_label=task.prev_label,
-                )
-
-            map_path = out_dir / f"dtp_map_{region_safe}_{period_safe}.html"
-            map_path.write_text(html_content, encoding="utf-8")
-            task.files.append({
-                "type": "map_html",
-                "filename": map_path.name,
-                "path": str(map_path),
-                "size_bytes": len(html_content.encode("utf-8")),
-                "mime": "text/html",
-            })
-        except Exception as exc:
-            logger.warning(f"Task {task_id}: map generation failed: {exc}")
-            # Карта опциональна — задача считается успешной без неё
-
         # === DONE ===
         task.status = TaskStatus.DONE
         task.progress = 100
@@ -620,8 +374,7 @@ async def _execute_task_impl(task_id: str) -> None:
 
         logger.info(
             f"Task {task_id} done: {task.total_dtp} ДТП, "
-            f"{task.total_dead} погибших, {task.total_injured} раненых, "
-            f"{len(task.files)} файлов"
+            f"{task.total_dead} погибших, {task.total_injured} раненых"
         )
 
     except Exception as exc:
@@ -748,10 +501,10 @@ async def ensure_cards(task: Task) -> Dict[str, Any]:
     if task.cards:
         return {"ok": True, "cards": task.cards}
 
-    # Если задача ещё в статусе FETCHING/PARSING/ANALYTICS — не вмешиваемся,
+    # Если задача ещё в статусе FETCHING/ANALYTICS — не вмешиваемся,
     # pipeline.execute_task сам заполнит task.cards. Иначе можем перезаписать
     # данные в процессе их загрузки.
-    if task.status in (TaskStatus.FETCHING, TaskStatus.PARSING, TaskStatus.ANALYTICS):
+    if task.status in (TaskStatus.FETCHING, TaskStatus.ANALYTICS):
         return {
             "ok": False,
             "error": (
