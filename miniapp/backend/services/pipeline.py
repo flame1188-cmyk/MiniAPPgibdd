@@ -107,8 +107,9 @@ def create_task(
     asyncio.create_task(save_task(task)) без done-callback — если корутина
     падала или не успевала выполниться до рестарта контейнера, задача
     терялась навсегда. Теперь:
-    - Синхронно обновляем _TASKS_MEMORY[task.id] (in-memory fallback)
-    - Добавляем done-callback для логирования ошибок save_task
+    - _register_task() гарантирует задачу в task_registry._tasks (in-memory)
+    - asyncio.shield(save_task()) защищает persist при shutdown
+    - done-callback логирует ошибки save_task
     - Дублирующий await save_task(task) в router dtp.py:create_dtp_task
       гарантирует persist ДО запуска execute_task.
     """
@@ -124,15 +125,9 @@ def create_task(
     )
     _register_task(task)
 
-    # Синхронно обновляем in-memory fallback в repository._TASKS_MEMORY.
-    # Это гарантирует, что даже если asyncio.create_task ниже не успеет
-    # выполниться, get_task_async() найдёт задачу через _TASKS_MEMORY
-    # (хотя без БД она потеряется при рестарте процесса).
-    try:
-        from ..db.repository import _TASKS_MEMORY
-        _TASKS_MEMORY[task_id] = task
-    except Exception:
-        pass
+    # Task уже в task_registry._tasks через _register_task() выше —
+    # отдельная запись в repository._TASKS_MEMORY не нужна (удалено
+    # при консолидации кэшей: _tasks — единственный in-memory источник).
 
     # Sprint 7 / Phase C.3: сохраняем начальный snapshot в Redis.
     # Это закрывает окно между dispatch (отправкой в Celery) и моментом,

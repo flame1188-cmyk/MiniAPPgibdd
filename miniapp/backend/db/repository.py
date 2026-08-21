@@ -3,10 +3,11 @@ TaskRepository — CRUD задач выгрузки + аудит-лог обра
 
 Дизайн:
 - Если PostgreSQL готов (is_db_ready() == True) — операции идут в БД,
-  in-memory словарь используется как кэш для тяжёлых полей (cards,
-  raw_clusters и т.д.), которые не сериализуются в БД на Этапе 2.
-- Если PostgreSQL НЕ готов — операции идут только in-memory,
-  поведение идентично тому, что было до подключения БД.
+  in-memory словарь _TASKS_HEAVY_STATE используется как кэш для тяжёлых полей
+  (cards, raw_clusters и т.д.), которые не сериализуются в БД на Этапе 2.
+- Task-объекты хранятся в task_registry._tasks (единственный in-memory кэш).
+- Если PostgreSQL НЕ готов — задачи хранятся только в task_registry._tasks
+  (теряются при рестарте, поведение идентично эпохе до подключения БД).
 
 Это гарантирует, что:
 1. При недоступности БД приложение не падает.
@@ -47,10 +48,9 @@ logger = logging.getLogger(__name__)
 # либо пересоздать задачу.
 _TASKS_HEAVY_STATE: Dict[str, Dict[str, Any]] = {}
 
-# In-memory хранилище метаданных задач — fallback при отсутствии БД.
-# При наличии БД — используется только как кэш поверх SQL (чтобы не
-# дёргать БД на каждый get_task).
-_TASKS_MEMORY: Dict[str, "Task"] = {}  # type: ignore[name-defined]
+# NOTE: _TASKS_MEMORY удалён (P1 cache consolidation).
+# Все in-memory операции с задачами теперь идут через task_registry._tasks
+# (единственный источник правды для in-memory кэша задач).
 
 
 # ====================================================================
@@ -122,13 +122,12 @@ async def save_task(task: Any) -> None:
     _cache_heavy_fields(task)
 
     if not is_db_ready():
-        # БД нет — fallback: обновляем in-memory
-        _TASKS_MEMORY[task.id] = task
+        # БД нет — fallback: только кэшируем тяжёлые поля.
+        # Task-объект уже в task_registry._tasks через _register_task().
         return
 
     pool = get_pool()
     if pool is None:
-        _TASKS_MEMORY[task.id] = task
         return
 
     try:
@@ -193,14 +192,13 @@ async def save_task(task: Any) -> None:
             )
             await conn.commit()
 
-        # Также обновляем in-memory кэш
-        _TASKS_MEMORY[task.id] = task
+        # Task-объект уже в task_registry._tasks — мутации видны через
+        # ту же ссылку. Дублирующая запись не нужна.
 
     except Exception as exc:
         logger.warning(
-            f"save_task({task.id}) failed: {exc} — used in-memory fallback"
+            f"save_task({task.id}) failed: {exc}"
         )
-        _TASKS_MEMORY[task.id] = task
 
 
 # ====================================================================
@@ -218,9 +216,7 @@ async def load_task(task_id: str, task_factory: Any) -> Optional[Any]:
                            period_label, dat_list, raw_query) -> Task
     Используется для создания объекта Task без циклического импорта.
     """
-    # 1. Memory cache hit
-    if task_id in _TASKS_MEMORY:
-        return _TASKS_MEMORY[task_id]
+    # In-memory check делегирован в вызывающий get_task_async()
 
     if not is_db_ready():
         return None
@@ -281,8 +277,8 @@ async def load_task(task_id: str, task_factory: Any) -> Optional[Any]:
         if row["updated_at"]:
             task.updated_at = row["updated_at"]
 
-        # Кэшируем
-        _TASKS_MEMORY[task_id] = task
+        # Caller (get_task_async) зарегистрирует в task_registry._tasks
+        # через _register_task() — кэширование здесь не нужно.
         return task
 
     except Exception as exc:
@@ -334,6 +330,15 @@ async def list_user_tasks_from_db(
     "ghost"-задачи (stale pending) как failed/done, чтобы пользователь
     увидел cleanup в списке без ожидания рестарта сервера.
     """
+    # Lazy-import task_registry._tasks для замены _TASKS_MEMORY
+    # (единственный in-memory кэш задач).
+    try:
+        from ..services.task_registry import _tasks as _reg_tasks
+        from ..services.task_registry import _register_task as _reg_register
+    except Exception:
+        _reg_tasks = {}  # type: ignore[assignment]
+        _reg_register = lambda t: None  # type: ignore[assignment]
+
     # Phase C.3 hotfix: lazy cleanup ghost-задач (TTL-protected)
     try:
         await _maybe_recover_stale_pending_tasks()
@@ -343,7 +348,7 @@ async def list_user_tasks_from_db(
     if not is_db_ready():
         # In-memory fallback
         user_tasks = [
-            t for t in _TASKS_MEMORY.values() if t.user_id == user_id
+            t for t in _reg_tasks.values() if t.user_id == user_id
         ]
         user_tasks.sort(key=lambda t: t.created_at, reverse=True)
         return user_tasks[:limit]
@@ -380,8 +385,8 @@ async def list_user_tasks_from_db(
             tasks: List[Any] = []
             for row in rows:
                 # Проверяем in-memory кэш (чтобы вернуть тяжёлые поля, если они есть)
-                if row["id"] in _TASKS_MEMORY:
-                    tasks.append(_TASKS_MEMORY[row["id"]])
+                if row["id"] in _reg_tasks:
+                    tasks.append(_reg_tasks[row["id"]])
                     continue
 
                 task = task_factory(
@@ -410,7 +415,7 @@ async def list_user_tasks_from_db(
                 if row["updated_at"]:
                     task.updated_at = row["updated_at"]
 
-                _TASKS_MEMORY[task.id] = task
+                _reg_register(task)
                 tasks.append(task)
 
             return tasks
@@ -430,7 +435,7 @@ async def list_user_tasks_from_db(
             break
 
     # In-memory fallback (после retry-exhaustion или не-DB ошибки)
-    user_tasks = [t for t in _TASKS_MEMORY.values() if t.user_id == user_id]
+    user_tasks = [t for t in _reg_tasks.values() if t.user_id == user_id]
     user_tasks.sort(key=lambda t: t.created_at, reverse=True)
     return user_tasks[:limit]
 
@@ -445,7 +450,7 @@ async def delete_old_tasks(
     Удаляет задачи старше max_age_hours.
 
     Удаляет из:
-    - in-memory кэша (_TASKS_MEMORY и _TASKS_HEAVY_STATE)
+    - in-memory кэша (task_registry._tasks и _TASKS_HEAVY_STATE)
     - БД (если доступна)
     - диска (data/tasks/{task_id}/)
 
@@ -455,9 +460,13 @@ async def delete_old_tasks(
     cutoff_ts = now.timestamp() - max_age_hours * 3600
 
     # 1. Собираем кандидатов на удаление из in-memory
+    try:
+        from ..services.task_registry import _tasks as _del_tasks
+    except Exception:
+        _del_tasks = {}  # type: ignore[assignment]
     to_delete_memory = [
         tid
-        for tid, task in _TASKS_MEMORY.items()
+        for tid, task in _del_tasks.items()
         if task.created_at.timestamp() < cutoff_ts
     ]
 
@@ -512,10 +521,11 @@ async def delete_old_tasks(
     # 3. In-memory cleanup
     memory_deleted = 0
     for tid in to_delete_memory:
-        _TASKS_MEMORY.pop(tid, None)
+        # Получаем task ДО удаления из кэша (исправление бага:
+        # раньше было .pop() затем .get() → всегда None).
+        task = _del_tasks.get(tid)
+        _del_tasks.pop(tid, None)
         drop_heavy_state(tid)
-        # Удаляем файлы с диска
-        task = _TASKS_MEMORY.get(tid)
         if task:
             for f in task.files:
                 try:
@@ -548,7 +558,7 @@ async def delete_task(
 
     Удаляет из:
     - БД (только если task.user_id == user_id — защита от удаления чужих задач)
-    - in-memory кэша (_TASKS_MEMORY и _TASKS_HEAVY_STATE)
+    - in-memory кэша (task_registry._tasks и _TASKS_HEAVY_STATE)
     - диска (data/tasks/{task_id}/ и все файлы задачи из task.files[].path)
 
     Args:
@@ -616,10 +626,14 @@ async def delete_task(
                 logger.warning(f"delete_task({task_id}) DB failed: {exc}")
                 # Не возвращаемся — пробуем хотя бы почистить in-memory
 
-    # 2. In-memory cleanup — даже если БД недоступна или задачи в БД не было,
-    # в памяти она могла быть (например, только что создана, save_task ещё
-    # не завершился). Чистим по user_id-проверке.
-    task = _TASKS_MEMORY.get(task_id)
+    # 2. In-memory cleanup + heavy state.
+    # unregister_task() (блок 3 ниже) удалит из task_registry._tasks.
+    # Здесь чистим _TASKS_HEAVY_STATE и файлы на диске.
+    try:
+        from ..services.task_registry import _tasks as _dt_tasks
+    except Exception:
+        _dt_tasks = {}  # type: ignore[assignment]
+    task = _dt_tasks.get(task_id)
     if task is not None and task.user_id == user_id:
         for f in task.files:
             try:
@@ -632,11 +646,10 @@ async def delete_task(
                 task_dir.rmdir()
         except Exception:
             pass
-        _TASKS_MEMORY.pop(task_id, None)
         drop_heavy_state(task_id)
         deleted = True
 
-    # 3. Чистим task_registry._tasks (LRU-кэш, отдельный от _TASKS_MEMORY).
+    # 3. Чистим task_registry._tasks (LRU-кэш — единый in-memory источник).
     # Это критично: pre-check в роутере вызывает get_task_async(), который
     # через _register_task() кладёт задачу в _tasks. Если её не убрать —
     # list_user_tasks() добавит её обратно в список ("в памяти, но не в БД
@@ -839,8 +852,12 @@ async def recover_incomplete_tasks() -> int:
             )
 
         # Также чистим in-memory кэш от мёртвых задач
-        for tid in list(_TASKS_MEMORY.keys()):
-            task = _TASKS_MEMORY[tid]
+        try:
+            from ..services.task_registry import _tasks as _ri_tasks
+        except Exception:
+            _ri_tasks = {}  # type: ignore[assignment]
+        for tid in list(_ri_tasks.keys()):
+            task = _ri_tasks[tid]
             try:
                 if hasattr(task, "status") and hasattr(task.status, "value"):
                     if task.status.value in _INCOMPLETE_STATUSES:
@@ -1170,8 +1187,12 @@ async def _recover_stale_pending_tasks_impl(pool) -> int:
                 )
 
             # Также чистим in-memory кэш от ghost-задач
-            for tid in list(_TASKS_MEMORY.keys()):
-                task = _TASKS_MEMORY[tid]
+            try:
+                from ..services.task_registry import _tasks as _rs_tasks
+            except Exception:
+                _rs_tasks = {}  # type: ignore[assignment]
+            for tid in list(_rs_tasks.keys()):
+                task = _rs_tasks[tid]
                 try:
                     if hasattr(task, "status") and hasattr(task.status, "value"):
                         if task.status.value == "pending" and task.progress == 0:

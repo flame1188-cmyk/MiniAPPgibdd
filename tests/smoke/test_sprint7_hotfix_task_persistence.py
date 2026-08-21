@@ -36,18 +36,19 @@ DTP_PY = PROJECT_ROOT / "miniapp" / "backend" / "routers" / "dtp.py"
 class TestCreateTaskPersistsImmediately:
     """Проверяет, что create_task синхронно обновляет _TASKS_MEMORY."""
 
-    def test_create_task_updates_tasks_memory_sync(self):
-        """create_task должен синхронно положить task в _TASKS_MEMORY."""
+    def test_create_task_registers_in_task_registry(self):
+        """create_task должен зарегистрировать task через _register_task()."""
         source = PIPELINE_PY.read_text(encoding="utf-8")
-        # Ищем синхронное обновление _TASKS_MEMORY[task_id] = task
+        # _register_task(task) вызывается синхронно — это единственный
+        # in-memory кэш задач (consolidation: _TASKS_MEMORY удалён).
         assert re.search(
-            r"_TASKS_MEMORY\[task_id\]\s*=\s*task",
+            r"_register_task\(task\)",
             source,
         ), (
-            "create_task должен синхронно (без await) обновить "
-            "_TASKS_MEMORY[task_id] = task — это in-memory fallback, "
-            "который гарантирует что задача доступна даже если "
-            "asyncio.create_task(save_task) не успеет выполниться"
+            "create_task должен вызывать _register_task(task) — "
+            "это помещает задачу в task_registry._tasks (единственный "
+            "in-memory кэш). Раньше также писалось в _TASKS_MEMORY, "
+            "но этот дублирующий кэш удалён при консолидации."
         )
 
     def test_create_task_has_done_callback(self):
@@ -102,11 +103,6 @@ class TestCreateTaskPersistsImmediately:
 
         # Создаём task с замоканным _register_task и save_task
         with patch("miniapp.backend.services.pipeline._register_task"):
-            with patch.dict(
-                "miniapp.backend.db.repository._TASKS_MEMORY",
-                {},
-                clear=True,
-            ):
                 # asyncio.create_task требует running loop
                 async def _run():
                     with patch(
@@ -301,11 +297,6 @@ class TestCreateTaskRegression:
         from miniapp.backend.db import repository  # noqa: F401 — нужен для patch
 
         with patch("miniapp.backend.services.pipeline._register_task"):
-            with patch.dict(
-                "miniapp.backend.db.repository._TASKS_MEMORY",
-                {},
-                clear=True,
-            ):
                 async def _run():
                     with patch(
                         "miniapp.backend.db.repository.save_task",
@@ -339,11 +330,6 @@ class TestBugReportScenario:
         save_task_mock = AsyncMock()
 
         with patch("miniapp.backend.services.pipeline._register_task"):
-            with patch.dict(
-                "miniapp.backend.db.repository._TASKS_MEMORY",
-                {},
-                clear=True,
-            ):
                 async def _run():
                     with patch(
                         "miniapp.backend.db.repository.save_task",
