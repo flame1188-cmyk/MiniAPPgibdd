@@ -131,7 +131,9 @@ async def _fetch_cards_for_period(
                 except _httpx.HTTPStatusError as e:
                     status = e.response.status_code
                     if status >= 500:
-                        _mark_api_down()  # запоминаем на всю сессию
+                        # Серверная ошибка — помечаем API как недоступный,
+                        # все оставшиеся месяцы через web_fallback.
+                        _mark_api_down()
                         use_web_fallback = True
                         logger.warning(
                             f"  {log_prefix}: {dat} -> HTTP {status}, "
@@ -156,8 +158,38 @@ async def _fetch_cards_for_period(
                         cards.extend(fb_cards)
                         errors.extend(fb_errors)
                         break  # fallback обработал все оставшиеся месяцы
+                    elif status == 404:
+                        # 404 — данные могут быть на сайте, но отсутствуют в API.
+                        # Наблюдается при rate-limiting ГИБДД (API возвращает 404
+                        # вместо 429 для каждого второго запроса на keep-alive).
+                        # Пробуем получить этот месяц через web_fallback.
+                        logger.warning(
+                            f"  {log_prefix}: {dat} -> HTTP 404 от API, "
+                            f"пробую через сайт ГИБДД"
+                        )
+                        try:
+                            from web_fallback import fetch_dtp_via_web_period
+                            fb_cards, fb_errors = await fetch_dtp_via_web_period(
+                                [dat], reg_code,
+                                log_prefix=f"{log_prefix} [сайт]",
+                            )
+                            cards.extend(fb_cards)
+                            if fb_errors:
+                                errors.extend(fb_errors)
+                            else:
+                                # Успешно получили через сайт — убираем ошибку
+                                logger.info(
+                                    f"  {log_prefix}: {dat} -> {len(fb_cards)} ДТП (через сайт)"
+                                )
+                        except Exception as fb_exc:  # noqa: BLE001
+                            err_msg = f"{month_name} {year}: HTTP 404 (API + сайт: {fb_exc})"
+                            errors.append(err_msg)
+                            logger.error(
+                                f"  {log_prefix}: {dat} -> ОШИБКА "
+                                f"[HTTPStatusError] HTTP 404 (fallback тоже failed)"
+                            )
                     else:
-                        # Клиентская ошибка — не ретраим
+                        # Прочие 4xx — не ретраим, не переключаемся
                         err_msg = f"{month_name} {year}: {error_brief(e)}"
                         errors.append(err_msg)
                         logger.error(

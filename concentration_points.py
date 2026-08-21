@@ -2990,31 +2990,36 @@ async def calculate_concentration_points(
             f"Всего с координатами: {len(cards_with_coords)}"
         )
 
+    # CPU-bound операции выполняются в thread pool, чтобы не блокировать
+    # event loop FastAPI. Для 3000+ карточек классификация + кластеризация
+    # могут занять несколько секунд синхронно.
     if settlement_polygons:
-        settlement_cards, non_settlement_cards = classify_cards(
-            cards_with_coords, settlement_polygons,
+        settlement_cards, non_settlement_cards = await asyncio.to_thread(
+            classify_cards, cards_with_coords, settlement_polygons,
         )
     else:
         # Fallback: все как вне НП
         settlement_cards = []
         non_settlement_cards = cards_with_coords
 
-    # Шаг 4: Очаги в НП
+    # Шаг 4: Очаги в НП (CPU-bound: 3 прохода кластеризации)
     if progress_callback:
         await progress_callback(
             f"Поиск очагов в НП ({len(settlement_cards)} ДТП)..."
         )
 
-    settlement_clusters = find_settlement_concentration_points(settlement_cards)
+    settlement_clusters = await asyncio.to_thread(
+        find_settlement_concentration_points, settlement_cards,
+    )
 
-    # Шаг 5: Очаги вне НП
+    # Шаг 5: Очаги вне НП (CPU-bound: скользящее окно 1 км)
     if progress_callback:
         await progress_callback(
             f"Поиск очагов вне НП ({len(non_settlement_cards)} ДТП)..."
         )
 
-    non_settlement_clusters = find_nonsettlement_concentration_points(
-        non_settlement_cards,
+    non_settlement_clusters = await asyncio.to_thread(
+        find_nonsettlement_concentration_points, non_settlement_cards,
     )
 
     # Объединяем: сначала НП, потом вне НП
@@ -3026,7 +3031,7 @@ async def calculate_concentration_points(
         f"вне НП: {len(non_settlement_clusters)})"
     )
 
-    # Шаг 6: Предочаги (после очагов, исключая их карточки)
+    # Шаг 6: Предочаги (CPU-bound: попарные расстояния)
     if progress_callback:
         await progress_callback(
             f"Поиск предочагов..."
@@ -3035,15 +3040,15 @@ async def calculate_concentration_points(
     settlement_assigned = _extract_assigned_indices(
         settlement_clusters, settlement_cards,
     )
-    settlement_preclusters = find_settlement_preclusters(
-        settlement_cards, settlement_assigned,
+    settlement_preclusters = await asyncio.to_thread(
+        find_settlement_preclusters, settlement_cards, settlement_assigned,
     )
 
     non_settlement_assigned = _extract_assigned_indices(
         non_settlement_clusters, non_settlement_cards,
     )
-    non_settlement_preclusters = find_nonsettlement_preclusters(
-        non_settlement_cards, non_settlement_assigned,
+    non_settlement_preclusters = await asyncio.to_thread(
+        find_nonsettlement_preclusters, non_settlement_cards, non_settlement_assigned,
     )
 
     all_preclusters = settlement_preclusters + non_settlement_preclusters

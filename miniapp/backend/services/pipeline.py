@@ -151,12 +151,11 @@ def create_task(
         logger.debug(f"create_task({task_id}): Redis snapshot save skipped: {exc}")
 
     # Асинхронно сохраняем в БД (если доступна).
-    # Fire-and-forget — задача уже в in-memory и доступна сразу.
-    # Hotfix: добавлен done-callback для логирования ошибок. Раньше
-    # asyncio.create_task молча глотал исключения.
+    # Shield защищает корутину от отмены при shutdown — задача будет
+    # сохранена даже если контейнер рестартует сразу после создания.
     try:
         from ..db.repository import save_task
-        fut = asyncio.create_task(save_task(task))
+        fut = asyncio.create_task(asyncio.shield(save_task(task)))
         fut.add_done_callback(_make_save_task_callback(task_id))
     except Exception as exc:
         logger.debug(f"create_task: DB save skipped: {exc}")

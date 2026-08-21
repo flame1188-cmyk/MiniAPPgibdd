@@ -38,9 +38,11 @@ logger = logging.getLogger(__name__)
 # repository.save_task), лёгкие метаданные остаются доступны через
 # get_task_async() (lazy load из БД).
 #
-# MAX_INMEMORY_TASKS=50 выбрано как баланс: ~400 MB максимум в RAM,
-# достаточно для одновременной работы 10-15 пользователей.
-MAX_INMEMORY_TASKS = 50
+# MAX_INMEMORY_TASKS=20 выбрано как баланс: ~160 MB максимум в RAM,
+# достаточно для одновременной работы 5-10 пользователей.
+# При 50 (старое значение) worst-case (крупный регион, 3000 карточек)
+# = 50 * 15 MB = 750 MB, что критично для bothost (2 GB RAM).
+MAX_INMEMORY_TASKS = 20
 _tasks: "OrderedDict[str, Task]" = OrderedDict()
 _tasks_lock = Lock()
 

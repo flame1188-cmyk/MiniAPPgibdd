@@ -618,6 +618,111 @@ def get_year_data(region_code: str, year: int) -> dict[str, Any] | None:
     return None
 
 
+# ==========================================================================
+# Получение фактических погибших: БД (первоисточник) → API (fallback)
+# ==========================================================================
+
+
+def _resolve_db_region_code(excel_code: str) -> str:
+    """Маппит Excel-код региона → ГИБДД-код для запроса к gibdd_cards.
+
+    Использует region_mapping.json (тот же маппинг, что gibdd_adapter).
+    Если код не найден — возвращает как есть (большинство регионов совпадают).
+    """
+    mapping_file = PROJECT_ROOT / "datasets" / "region_mapping.json"
+    if not mapping_file.exists():
+        return excel_code
+    try:
+        data = json.loads(mapping_file.read_text(encoding="utf-8"))
+        entry = data.get("mappings", {}).get(excel_code)
+        if entry and "gibdd_code" in entry:
+            return entry["gibdd_code"]
+    except Exception:  # noqa: BLE001
+        pass
+    return excel_code
+
+
+def fetch_deaths_from_db_sync(excel_code: str, year: int) -> dict[str, int] | None:
+    """Синхронная версия: агрегирует pog из gibdd_cards по месяцам.
+
+    Возвращает {"1": 5, "2": 3, ...} или None, если БД недоступна / нет данных.
+    НЕ вызывать из async-контекста (используйте fetch_deaths_from_db_async).
+    """
+    import asyncio
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        return None  # нельзя вызвать из event loop
+    try:
+        return asyncio.run(fetch_deaths_from_db_async(excel_code, year))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def fetch_deaths_from_db_async(excel_code: str, year: int) -> dict[str, int] | None:
+    """Агрегирует количество погибших (pog) из PostgreSQL по месяцам.
+
+    Использует индекс idx_cards_reg_date (reg_code, date_dtp) — запрос
+    выполняется за миллисекунды даже на миллионах записей.
+
+    Returns:
+        {"1": 5, "2": 3, ...} — словарь {месяц: погибших}.
+        None — если БД недоступна или данных нет.
+    """
+    import sys as _sys
+    # Добавляем корень проекта в sys.path для импорта miniapp.backend.db
+    _root = str(PROJECT_ROOT.parent)
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+
+    try:
+        from miniapp.backend.db.connection import get_pool, is_db_ready
+    except ImportError:
+        print("[forecast] БД недоступна: не удалось импортировать db.connection",
+              file=_sys.stderr)
+        return None
+
+    if not is_db_ready():
+        print("[forecast] БД не готова (is_db_ready=False)", file=_sys.stderr)
+        return None
+
+    pool = get_pool()
+    if pool is None:
+        return None
+
+    reg_code = _resolve_db_region_code(excel_code)
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    SELECT EXTRACT(MONTH FROM date_dtp)::int AS m,
+                           COALESCE(SUM(pog), 0)::int          AS deaths
+                    FROM gibdd_cards
+                    WHERE reg_code = %(reg)s
+                      AND EXTRACT(YEAR FROM date_dtp) = %(year)s
+                    GROUP BY m
+                    ORDER BY m
+                """, {"reg": reg_code, "year": year})
+                rows = await cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[forecast] Ошибка запроса к БД: {exc}", file=_sys.stderr)
+        return None
+
+    if not rows:
+        print(f"[forecast] БД: нет данных для reg={reg_code} year={year}",
+              file=_sys.stderr)
+        return None
+
+    result = {str(r["m"]): r["deaths"] for r in rows}
+    print(f"[forecast] БД: reg={reg_code} year={year} → {len(result)} мес, "
+          f"итого {sum(result.values())} погибших",
+          file=_sys.stderr)
+    return result
+
+
 def fetch_actual_deaths_from_web(region_code: str, year: int) -> dict[str, int]:
     """
     Получает фактические погибшие по месяцам из карточек ДТП через gibdd-bot.
@@ -878,11 +983,20 @@ def runtime_calc(region_code: str,
     """
     Синхронная версия runtime_calc для CLI и тестов.
 
-    ВНИМАНИЕ: использует asyncio.run() через fetch_actual_deaths_from_web.
-    НЕ вызывайте из асинхронного контекста (бота) — используйте
+    Приоритет источников данных:
+      1. PostgreSQL (gibdd_cards)
+      2. API ГИБДД через gibdd_adapter (legacy fallback)
+
+    ВНИМАНИЕ: НЕ вызывайте из асинхронного контекста (бота) — используйте
     `await runtime_calc_async(...)`.
     """
-    deaths_by_month_actual = fetch_actual_deaths_from_web(region_code, TODAY.year)
+    # 1. Пытаемся получить из PostgreSQL
+    db_deaths = fetch_deaths_from_db_sync(region_code, TODAY.year)
+    if db_deaths is not None:
+        deaths_by_month_actual = _fill_monthly_gaps(db_deaths)
+    else:
+        # 2. Fallback: API ГИБДД (legacy путь)
+        deaths_by_month_actual = fetch_actual_deaths_from_web(region_code, TODAY.year)
     return _build_runtime_payload(
         region_code, deaths_by_month_actual, plan_line_mode, forecast_method,
     )
@@ -894,10 +1008,20 @@ async def runtime_calc_async(region_code: str,
                              ) -> dict[str, Any]:
     """
     Асинхронная версия runtime_calc для использования в боте.
+
+    Приоритет источников данных:
+      1. PostgreSQL (gibdd_cards) — мгновенно, без зависимости от API ГИБДД
+      2. API ГИБДД через gibdd_adapter (legacy fallback)
     """
-    deaths_by_month_actual = await fetch_actual_deaths_from_web_async(
-        region_code, TODAY.year
-    )
+    # 1. Пытаемся получить из PostgreSQL
+    db_deaths = await fetch_deaths_from_db_async(region_code, TODAY.year)
+    if db_deaths is not None:
+        deaths_by_month_actual = _fill_monthly_gaps(db_deaths)
+    else:
+        # 2. Fallback: API ГИБДД (legacy путь)
+        deaths_by_month_actual = await fetch_actual_deaths_from_web_async(
+            region_code, TODAY.year
+        )
     return _build_runtime_payload(
         region_code, deaths_by_month_actual, plan_line_mode, forecast_method,
     )
