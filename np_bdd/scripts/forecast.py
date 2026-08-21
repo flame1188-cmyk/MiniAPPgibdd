@@ -703,8 +703,8 @@ async def fetch_deaths_from_db_async(excel_code: str, year: int) -> dict[str, in
                     FROM gibdd_cards
                     WHERE reg_code = %(reg)s
                       AND EXTRACT(YEAR FROM date_dtp) = %(year)s
-                    GROUP BY m
-                    ORDER BY m
+                    GROUP BY 1
+                    ORDER BY 1
                 """, {"reg": reg_code, "year": year})
                 rows = await cur.fetchall()
     except Exception as exc:  # noqa: BLE001
