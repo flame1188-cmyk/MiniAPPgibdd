@@ -1,24 +1,26 @@
 """
-gibdd_adapter.py — мост между np_bdd-модулем и данными о ДТП.
+gibdd_adapter.py — мост между np_bdd-модулем и bot.py из gibdd-bot.
 
 ЗАДАЧА
 ======
 
 Дать функцию fetch_deaths_by_month(region_code_excel, year), которая:
   1. Маппит Excel-код региона (ОКТМО-подобный) → ГИБДД-API-код.
-  2. Сначала пытается загрузить данные из локальной PostgreSQL БД (таблица dtp_cards_archive).
-  3. Если данных нет в БД, обращается к внешнему API ГИБДД через bot._fetch_cards_for_period.
+  2. Формирует dat_list для прошедших месяцев года (с января по текущий месяц).
+  3. Вызывает bot._fetch_cards_for_period из gibdd-bot (использует API + web_fallback + кэш).
   4. Агрегирует карточки в {month_str: deaths_int}.
   5. Возвращает результат + список ошибок.
 
 КРИТИЧНО
 ========
 
-- Функция АСИНХРОННАЯ.
-- Приоритет источников: PostgreSQL БД > API ГИБДД.
-- Кэш: bot._fetch_cards_for_period сам кэширует результат на 1 час.
+- Функция АСИНХРОННАЯ (bot._fetch_cards_for_period — async).
+- Если код региона не найден в region_mapping.json, предполагается, что
+  Excel-код = ГИБДД-код (большинство регионов совпадают).
 - Карточка ДТП: card["pog"] — строка с числом погибших.
   card["date_dtp"] — строка "DD.MM.YYYY".
+- Кэш: bot._fetch_cards_for_period сам кэширует результат на 1 час
+  по ключу (reg_code, dat_list).
 
 ИСПОЛЬЗОВАНИЕ
 =============
@@ -75,11 +77,11 @@ def resolve_gibdd_code(excel_code: str) -> str:
     return excel_code
 
 
-# --- Загрузка модулей -----------------------------------------------------
+# --- Загрузка bot-модуля ---------------------------------------------------
+
 
 _bot_module = None
 _web_fallback_module = None
-_db_adapter_module = None
 _use_direct_web_fallback = False
 
 
@@ -98,7 +100,7 @@ def _get_bot_module():
     if bot_root_str not in sys.path:
         sys.path.insert(0, bot_root_str)
 
-    # Путь 1: импортируем bot (даёт кэш + API).
+    # Путь 1: импортируем bot (даёт кэш + API-first).
     if _bot_module is None and not _use_direct_web_fallback:
         try:
             _bot_module = importlib.import_module("bot")
@@ -116,23 +118,6 @@ def _get_bot_module():
     if _bot_module is not None:
         return _bot_module, _bot_module._fetch_cards_for_period
     return _web_fallback_module, _web_fallback_module.fetch_dtp_via_web_period
-
-
-def _get_db_adapter():
-    """
-    Импортирует db_adapter для загрузки данных из PostgreSQL.
-    Возвращает модуль или None, если импорт не удался.
-    """
-    global _db_adapter_module
-    if _db_adapter_module is None:
-        try:
-            _db_adapter_module = importlib.import_module("np_bdd.scripts.db_adapter")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[gibdd_adapter] ВНИМАНИЕ: не удалось импортировать db_adapter "
-                  f"({type(exc).__name__}: {exc}). Данные будут грузиться только из API.",
-                  file=sys.stderr)
-            return None
-    return _db_adapter_module
 
 
 # --- Агрегация карточек ---------------------------------------------------
@@ -184,10 +169,6 @@ async def fetch_deaths_by_month(
     """
     Получает {месяц: погибших} для региона за указанный год (с января по current_month).
 
-    Приоритет источников данных:
-      1. Локальная PostgreSQL БД (таблица dtp_cards_archive) — быстро, без нагрузки на API.
-      2. Внешнее API ГИБДД (через bot._fetch_cards_for_period или web_fallback) — если в БД нет данных.
-
     Args:
         region_code_excel: код региона в формате Excel пользователя (напр. "1106").
         year: год (напр. 2026).
@@ -210,63 +191,37 @@ async def fetch_deaths_by_month(
     # 2. Формируем dat_list: ["1.2026", "2.2026", ..., "N.2026"]
     dat_list = [f"{m}.{year}" for m in range(1, current_month + 1)]
 
-    # 3. Пытаемся загрузить данные из БД (приоритетный источник)
-    db_adapter = _get_db_adapter()
-    all_cards = []
-    errors = []
-    months_from_db = set()
-    
-    if db_adapter is not None:
-        # Загружаем данные по месяцам из БД
-        for month_num in range(1, current_month + 1):
-            try:
-                cards = await db_adapter.fetch_cards_from_db(gibdd_code, month_num, year)
-                if cards:
-                    all_cards.extend(cards)
-                    months_from_db.add(month_num)
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"Ошибка при загрузке из БД за {month_num}.{year}: {e}")
-    
-    # 4. Для месяцев, которых нет в БД, загружаем через API
-    months_missing = [m for m in range(1, current_month + 1) if m not in months_from_db]
-    
-    if months_missing:
-        # Загружаем модуль и выбираем функцию для запроса карточек.
-        _, fetch_func = _get_bot_module()
-        
-        # Формируем dat_list только для недостающих месяцев
-        missing_dat_list = [f"{m}.{year}" for m in months_missing]
-        
-        try:
-            # Сигнатуры немного различаются:
-            # - bot._fetch_cards_for_period(dat_list, reg_code, log_prefix, ..., cache_result=True)
-            # - web_fallback.fetch_dtp_via_web_period(dat_list, reg_api, log_prefix, progress_callback)
-            import inspect
-            sig = inspect.signature(fetch_func)
-            if "cache_result" in sig.parameters:
-                # Это bot._fetch_cards_for_period
-                cards, api_errors = await fetch_func(
-                    dat_list=missing_dat_list,
-                    reg_code=gibdd_code,
-                    log_prefix=f"NPBDD[{region_code_excel}→{gibdd_code}] (API)",
-                    cache_result=True,
-                )
-            else:
-                # Это web_fallback.fetch_dtp_via_web_period
-                cards, api_errors = await fetch_func(
-                    missing_dat_list,
-                    gibdd_code,
-                    log_prefix=f"NPBDD[{region_code_excel}→{gibdd_code}] (API)",
-                )
-            
-            all_cards.extend(cards)
-            errors.extend(api_errors)
-            
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"Ошибка при вызове API: {exc}")
+    # 3. Загружаем модуль и выбираем функцию для запроса карточек.
+    #    В production-боте: bot._fetch_cards_for_period (API + кэш + web_fallback).
+    #    В CLI/тестах без telegram: web_fallback.fetch_dtp_via_web_period напрямую.
+    _, fetch_func = _get_bot_module()
 
-    # 5. Агрегируем карточки
-    deaths_by_month = aggregate_cards_to_monthly_deaths(all_cards)
+    try:
+        # Сигнатуры немного различаются:
+        # - bot._fetch_cards_for_period(dat_list, reg_code, log_prefix, ..., cache_result=True)
+        # - web_fallback.fetch_dtp_via_web_period(dat_list, reg_api, log_prefix, progress_callback)
+        import inspect
+        sig = inspect.signature(fetch_func)
+        if "cache_result" in sig.parameters:
+            # Это bot._fetch_cards_for_period
+            cards, errors = await fetch_func(
+                dat_list=dat_list,
+                reg_code=gibdd_code,
+                log_prefix=f"NPBDD[{region_code_excel}→{gibdd_code}]",
+                cache_result=True,
+            )
+        else:
+            # Это web_fallback.fetch_dtp_via_web_period
+            cards, errors = await fetch_func(
+                dat_list,
+                gibdd_code,
+                log_prefix=f"NPBDD[{region_code_excel}→{gibdd_code}]",
+            )
+    except Exception as exc:  # noqa: BLE001
+        return {}, [f"Ошибка при вызове fetch-функции: {exc}"]
+
+    # 4. Агрегируем карточки
+    deaths_by_month = aggregate_cards_to_monthly_deaths(cards)
     return deaths_by_month, errors
 
 
