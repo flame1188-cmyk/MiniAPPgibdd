@@ -74,6 +74,12 @@ async function downloadBlobUrl(url: string, fallbackFilename: string, options: R
   const headers = new Headers(options.headers)
   headers.set('X-Tg-Init-Data', initData)
 
+  // Устанавливаем Content-Type: application/json если body — строка (JSON).
+  // Без этого заголовка FastAPI не парсит JSON body → 422 Unprocessable Entity.
+  if (options.body && typeof options.body === 'string') {
+    headers.set('Content-Type', 'application/json')
+  }
+
   const response = await fetch(`${API_BASE}${url}`, {
     ...options,
     headers,
@@ -82,7 +88,15 @@ async function downloadBlobUrl(url: string, fallbackFilename: string, options: R
     let detail = `HTTP ${response.status}`
     try {
       const body = await response.json()
-      detail = (body as { detail?: string })?.detail ?? detail
+      const raw = body?.detail
+      if (typeof raw === 'string') {
+        detail = raw
+      } else if (Array.isArray(raw)) {
+        // FastAPI 422: detail — массив {loc, msg, type}
+        detail = raw.map((e: any) => e.msg ?? JSON.stringify(e)).join('; ')
+      } else if (raw && typeof raw === 'object') {
+        detail = JSON.stringify(raw)
+      }
     } catch {
       // не JSON
     }
