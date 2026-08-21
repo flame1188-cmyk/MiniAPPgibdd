@@ -2,12 +2,15 @@
  * Главный компонент Mini App.
  *
  * Layout:
- *  - Шапка с переключателем вкладок: «ДТП» / «НП БДД»
+ *  - Шапка с переключателем вкладок: «ДТП» / «Выгрузка файлов» / «НП БДД»
  *  - Вкладка «ДТП»:
  *      - Форма запроса
  *      - Прогресс активной задачи
- *      - Результаты (карта, аналитика, файлы)
+ *      - Результаты (карта, аналитика, очаги, ИИ-анализ, файлы)
  *      - История последних запросов
+ *  - Вкладка «Выгрузка файлов»:
+ *      - Выбор региона и периода
+ *      - Кнопка «Выгрузить ZIP-архив»
  *  - Вкладка «НП БДД»:
  *      - NpBddView (KPI + 2 графика + заморозка)
  */
@@ -17,6 +20,7 @@ import { CamerasWidget } from '@/components/CamerasWidget'
 import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
+import { ExportView } from '@/components/ExportView'
 import { NpBddView } from '@/components/NpBddView'
 import { VersionBanner } from '@/components/VersionBanner'
 import { useTaskPolling } from '@/hooks/useTaskPolling'
@@ -34,7 +38,7 @@ import {
   onFullscreenChange,
 } from '@/lib/telegram'
 
-type Tab = 'dtp' | 'np-bdd'
+type Tab = 'dtp' | 'export' | 'np-bdd'
 
 export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
@@ -44,7 +48,6 @@ export default function App() {
   const { data: task, isError } = useTaskPolling(activeTaskId)
 
   // Проверка версии: раз в 60 сек опрашивает /api/version.
-  // Если backend отдаёт новую версию — показываем баннер обновления.
   const hasUpdate = useVersionCheck()
 
   const user = getCurrentUser()
@@ -89,10 +92,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen pb-8">
-      {/* Баннер обновления — поверх всего, фикс сверху.
-          Появляется только если backend отдаёт версию, отличную от
-          встроенной в bundle. Не закрывается без reload — иначе
-          пользователь останется на устаревшем коде. */}
+      {/* Баннер обновления — поверх всего, фикс сверху. */}
       <VersionBanner visible={hasUpdate} />
 
       <div className={`${containerMaxWidth} mx-auto px-4 py-4 space-y-4`}>
@@ -102,7 +102,7 @@ export default function App() {
             <h1 className="text-xl font-bold mb-0.5">ДТП Статистика</h1>
             {user ? (
               <p className="text-xs opacity-60">
-                Привет, {user.first_name}! 👋
+                Привет, {user.first_name}!
               </p>
             ) : (
               <p className="text-xs opacity-60">
@@ -110,8 +110,7 @@ export default function App() {
               </p>
             )}
           </div>
-          {/* Кнопка полноэкранного режима — только на десктопе,
-              если клиент поддерживает requestFullscreen() */}
+          {/* Кнопка полноэкранного режима — только на десктопе */}
           {showFullscreenButton && (
             <button
               onClick={toggleFullscreen}
@@ -127,7 +126,7 @@ export default function App() {
               }}
               title={fullscreen ? 'Выйти из полноэкранного режима' : 'Открыть в полноэкранном режиме (без панели задач)'}
             >
-              {fullscreen ? '🗙 Выйти' : '⤢ Полный экран'}
+              {fullscreen ? 'Выйти' : 'Полный экран'}
             </button>
           )}
         </header>
@@ -146,6 +145,16 @@ export default function App() {
           </button>
           <button
             className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
+              tab === 'export'
+                ? 'bg-tg-section-bg text-tg-text shadow-sm'
+                : 'text-tg-hint'
+            }`}
+            onClick={() => handleTabChange('export')}
+          >
+            Выгрузка файлов
+          </button>
+          <button
+            className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
               tab === 'np-bdd'
                 ? 'bg-tg-section-bg text-tg-text shadow-sm'
                 : 'text-tg-hint'
@@ -156,7 +165,7 @@ export default function App() {
           </button>
         </div>
 
-        {/* Подсказка для desktop-пользователей — только если не в fullscreen */}
+        {/* Подсказка для desktop-пользователей */}
         {isDesktop && !fullscreen && showFullscreenButton && (
           <div
             className="rounded-xl p-2.5 text-xs leading-relaxed"
@@ -165,7 +174,7 @@ export default function App() {
               color: 'var(--tg-color-link, #2481cc)',
             }}
           >
-            💻 <b>Desktop-режим:</b> нажмите «⤢ Полный экран» в шапке,
+            Desktop-режим: нажмите «Полный экран» в шапке,
             чтобы развернуть приложение на весь экран без панели задач.
           </div>
         )}
@@ -179,7 +188,7 @@ export default function App() {
               color: '#ff9500',
             }}
           >
-            ⚠️ Запущено вне Telegram. Запросы к API не будут аутентифицированы.
+            Запущено вне Telegram. Запросы к API не будут аутентифицированы.
             Откройте приложение через Telegram-бота для полноценной работы.
           </div>
         )}
@@ -228,6 +237,9 @@ export default function App() {
             <HistoryList onSelectTask={handleSelectTask} />
           </>
         )}
+
+        {/* --- Вкладка «Выгрузка файлов» --- */}
+        {tab === 'export' && <ExportView />}
 
         {/* --- Вкладка «НП БДД» --- */}
         {tab === 'np-bdd' && <NpBddView />}

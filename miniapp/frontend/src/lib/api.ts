@@ -69,12 +69,15 @@ async function request<T>(
  *
  * Обычный <a download> не подходит, т.к. не передаёт custom headers.
  */
-async function downloadBlobUrl(url: string, fallbackFilename: string): Promise<void> {
+async function downloadBlobUrl(url: string, fallbackFilename: string, options: RequestInit = {}): Promise<void> {
   const initData = getInitData()
-  const headers = new Headers()
+  const headers = new Headers(options.headers)
   headers.set('X-Tg-Init-Data', initData)
 
-  const response = await fetch(`${API_BASE}${url}`, { headers })
+  const response = await fetch(`${API_BASE}${url}`, {
+    ...options,
+    headers,
+  })
   if (!response.ok) {
     let detail = `HTTP ${response.status}`
     try {
@@ -147,9 +150,7 @@ export interface ParseResult {
 export type TaskStatus =
   | 'pending'
   | 'fetching'
-  | 'parsing'
   | 'analytics'
-  | 'generating'
   | 'done'
   | 'failed'
 
@@ -167,10 +168,13 @@ export interface TaskStatusResponse {
   region_code: string
   region_name: string
   period: string
+  total_dtp?: number
+  total_dead?: number
+  total_injured?: number
   error?: string | null
   files: TaskFile[]
   analytics?: Record<string, unknown> | null
-  // N6: backpressure — очередь перед semaphore
+  // N6: backpressure
   queue_position?: number | null
   queue_ahead?: number | null
 }
@@ -650,6 +654,35 @@ export const api = {
 
   getMapUrl: (taskId: string) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/map?tg_init_data=${encodeURIComponent(getInitData())}`,
+
+  /**
+   * Ленивая генерация Excel-файла для задачи.
+   * Первый запрос генерирует оба файла (~5-8 сек), повторные — мгновенно.
+   */
+  generateExcel: async (taskId: string, fileType: 'dtp_cards' | 'dtp_participants') => {
+    const url = `${API_BASE}/api/dtp/tasks/${taskId}/generate-excel`
+    await downloadBlobUrl(url, `dtp_${fileType}.xlsx`, {
+      method: 'POST',
+      body: JSON.stringify({ file_type: fileType }),
+    })
+  },
+
+  /**
+   * Выгрузка файлов без аналитики (ZIP с двумя Excel).
+   * Используется отдельной вкладкой «Выгрузка файлов».
+   */
+  exportOnly: async (params: {
+    region_code: string
+    region_name: string
+    dat_list: string[]
+    period_label: string
+  }) => {
+    const url = `${API_BASE}/api/dtp/export-only`
+    await downloadBlobUrl(url, 'dtp_export.zip', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    })
+  },
 
   getDownloadUrl: (taskId: string, fileType: string) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/download/${fileType}?tg_init_data=${encodeURIComponent(getInitData())}`,

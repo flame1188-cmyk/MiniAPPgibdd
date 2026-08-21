@@ -19,9 +19,7 @@ export function statusLabel(status: string): string {
   const labels: Record<string, string> = {
     pending: 'Ожидание',
     fetching: 'Выгрузка данных ГИБДД',
-    parsing: 'Парсинг карточек',
     analytics: 'Расчёт аналитики',
-    generating: 'Генерация файлов',
     done: 'Готово',
     failed: 'Ошибка',
   }

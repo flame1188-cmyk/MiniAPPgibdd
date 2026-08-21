@@ -1,10 +1,9 @@
 /**
- * Панель результатов: показывает готовые файлы, HTML-карту и аналитику.
+ * Панель результатов: показывает карту, аналитику и кнопки выгрузки файлов.
  */
 import { useState } from 'react'
 import { api, type TaskStatusResponse } from '@/lib/api'
-import { haptic } from '@/lib/telegram'
-import { formatSize, statusLabel } from '@/lib/utils'
+import { haptic, showAlert } from '@/lib/telegram'
 import { MapFrame } from './MapFrame'
 import { AnalyticsView } from './AnalyticsView'
 import { ClustersView } from './ClustersView'
@@ -20,17 +19,13 @@ type Tab = 'map' | 'analytics' | 'clusters' | 'point' | 'llm' | 'files'
 export function ResultsPanel({ task }: ResultsPanelProps) {
   const [tab, setTab] = useState<Tab>('map')
 
-  const cardsFile = task.files.find((f) => f.type === 'dtp_cards')
-  const uchFile = task.files.find((f) => f.type === 'dtp_participants')
-  const mapFile = task.files.find((f) => f.type === 'map_html')
-
   const tabs: { id: Tab; label: string; visible: boolean }[] = [
-    { id: 'map', label: 'Карта', visible: !!mapFile },
+    { id: 'map', label: 'Карта', visible: true },
     { id: 'analytics', label: 'Аналитика', visible: !!task.analytics },
     { id: 'clusters', label: 'Очаги', visible: true },
     { id: 'point', label: 'По точке', visible: true },
     { id: 'llm', label: 'ИИ-анализ', visible: true },
-    { id: 'files', label: 'Файлы', visible: task.files.length > 0 },
+    { id: 'files', label: 'Файлы', visible: true },
   ]
   const visibleTabs = tabs.filter((t) => t.visible)
 
@@ -49,10 +44,12 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
               color: 'var(--tg-color-text, #000000)',
             }}
           >
-            {statusLabel(task.status)}
+            {task.period}
           </div>
         </div>
-        <div className="text-xs opacity-60">Период: {task.period}</div>
+        <div className="text-xs opacity-60">
+          {task.total_dtp} ДТП · {task.total_dead} погибших · {task.total_injured} раненых
+        </div>
       </div>
 
       {/* Табы */}
@@ -86,7 +83,7 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
       )}
 
       {/* Содержимое таба */}
-      {tab === 'map' && mapFile && <MapFrame taskId={task.task_id} />}
+      {tab === 'map' && <MapFrame taskId={task.task_id} />}
 
       {tab === 'analytics' && task.analytics && (
         <AnalyticsView analytics={task.analytics} />
@@ -98,71 +95,90 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
 
       {tab === 'llm' && <LLMAnalysisView task={task} />}
 
-      {tab === 'files' && (
-        <FilesList
-          task={task}
-          cardsFile={cardsFile}
-          uchFile={uchFile}
-          mapFile={mapFile}
-        />
-      )}
+      {tab === 'files' && <FilesList taskId={task.task_id} />}
     </div>
   )
 }
 
 // ============================================================
-// Список файлов
+// Список файлов — ленивая генерация по нажатию
 // ============================================================
-interface FilesListProps {
-  task: TaskStatusResponse
-  cardsFile?: { type: string; filename: string; size_bytes: number; mime: string }
-  uchFile?: { type: string; filename: string; size_bytes: number; mime: string }
-  mapFile?: { type: string; filename: string; size_bytes: number; mime: string }
-}
+function FilesList({ taskId }: { taskId: string }) {
+  const [generating, setGenerating] = useState<string | null>(null)
 
-function FilesList({ task, cardsFile, uchFile, mapFile }: FilesListProps) {
-  const files = [cardsFile, uchFile, mapFile].filter(Boolean) as {
-    type: string
-    filename: string
-    size_bytes: number
-    mime: string
-  }[]
-
-  const typeLabels: Record<string, string> = {
-    dtp_cards: 'Карточки ДТП (Excel)',
-    dtp_participants: 'Участники ДТП (Excel)',
-    map_html: 'Карта (HTML)',
+  const handleGenerate = async (fileType: 'dtp_cards' | 'dtp_participants') => {
+    haptic('medium')
+    setGenerating(fileType)
+    try {
+      await api.generateExcel(taskId, fileType)
+    } catch (err: any) {
+      haptic('error')
+      await showAlert(`Не удалось сгенерировать файл:\n${err.message}`)
+    } finally {
+      setGenerating(null)
+    }
   }
 
+  const isGeneratingCards = generating === 'dtp_cards'
+  const isGeneratingUch = generating === 'dtp_participants'
+  const isAnyGenerating = generating !== null
+
   return (
-    <div className="space-y-2">
-      {files.map((file) => (
-        <a
-          key={file.type}
-          href={api.getDownloadUrl(task.task_id, file.type)}
-          onClick={() => haptic('medium')}
-          className="tg-card flex items-center justify-between active:opacity-70"
-          style={{ textDecoration: 'none' }}
+    <div className="tg-card space-y-3">
+      <div className="tg-section-header m-0">Файлы для скачивания</div>
+      <div className="text-xs opacity-60">
+        Файлы генерируются по запросу. Первый запрос занимает 5-8 секунд.
+      </div>
+
+      <button
+        onClick={() => handleGenerate('dtp_cards')}
+        disabled={isAnyGenerating}
+        className="w-full flex items-center justify-between active:opacity-70"
+        style={{
+          opacity: isAnyGenerating ? 0.5 : 1,
+          textDecoration: 'none',
+          color: 'var(--tg-color-text, #000000)',
+        }}
+      >
+        <div className="flex-1 min-w-0 text-left">
+          <div className="font-medium text-sm">Список ДТП (Excel)</div>
+          <div className="text-xs opacity-60">Карточки ДТП за выбранный период</div>
+        </div>
+        <div
+          className="ml-3 px-3 py-1.5 rounded-lg text-xs font-medium"
+          style={{
+            backgroundColor: 'var(--tg-color-button, #2481cc)',
+            color: 'var(--tg-color-button-text, #ffffff)',
+          }}
         >
-          <div className="flex-1 min-w-0">
-            <div className="font-medium text-sm truncate">
-              {typeLabels[file.type] ?? file.type}
-            </div>
-            <div className="text-xs opacity-60 truncate">
-              {file.filename} · {formatSize(file.size_bytes)}
-            </div>
-          </div>
-          <div
-            className="ml-3 px-3 py-1.5 rounded-lg text-xs font-medium"
-            style={{
-              backgroundColor: 'var(--tg-color-button, #2481cc)',
-              color: 'var(--tg-color-button-text, #ffffff)',
-            }}
-          >
-            Скачать
-          </div>
-        </a>
-      ))}
+          {isGeneratingCards ? 'Генерация...' : 'Выгрузить'}
+        </div>
+      </button>
+
+      <button
+        onClick={() => handleGenerate('dtp_participants')}
+        disabled={isAnyGenerating}
+        className="w-full flex items-center justify-between active:opacity-70"
+        style={{
+          opacity: isAnyGenerating ? 0.5 : 1,
+          textDecoration: 'none',
+          color: 'var(--tg-color-text, #000000)',
+        }}
+      >
+        <div className="flex-1 min-w-0 text-left">
+          <div className="font-medium text-sm">Список участников (Excel)</div>
+          <div className="text-xs opacity-60">Участники ДТП за выбранный период</div>
+        </div>
+        <div
+          className="ml-3 px-3 py-1.5 rounded-lg text-xs font-medium"
+          style={{
+            backgroundColor: 'var(--tg-color-button, #2481cc)',
+            color: 'var(--tg-color-button-text, #ffffff)',
+          }}
+        >
+          {isGeneratingUch ? 'Генерация...' : 'Выгрузить'}
+        </div>
+      </button>
     </div>
   )
 }
