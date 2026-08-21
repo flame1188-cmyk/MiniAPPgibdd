@@ -452,10 +452,10 @@ async def generate_excel_for_task(
         # 3. Сохраняем ОБА файла на диск (кэш для повторных запросов)
         out_dir = _task_dir(task_id)
         region_safe = "".join(
-            c if c.isalnum() else "_" for c in task.region_name
+            c if c.isascii() and c.isalnum() else "_" for c in task.region_name
         )[:30] or task.region_code
         period_safe = "".join(
-            c if c.isalnum() else "_" for c in task.period_label
+            c if c.isascii() and c.isalnum() else "_" for c in task.period_label
         )[:20]
 
         cards_path = out_dir / f"dtp_cards_{region_safe}_{period_safe}.xlsx"
@@ -564,11 +564,12 @@ async def export_only(
     # 3. Упаковываем в ZIP
     import zipfile
 
+    # isalnum() пропускает кириллицу, а HTTP-заголовки — latin-1.
     safe_region = "".join(
-        c if c.isalnum() else "_" for c in body.region_name
+        c if c.isascii() and c.isalnum() else "_" for c in body.region_name
     )[:30] or body.region_code
     safe_period = "".join(
-        c if c.isalnum() else "_" for c in body.period_label
+        c if c.isascii() and c.isalnum() else "_" for c in body.period_label
     )[:20]
 
     zip_buf = io.BytesIO()
@@ -585,7 +586,7 @@ async def export_only(
     zip_bytes = zip_buf.getvalue()
     zip_name = f"dtp_{safe_region}_{safe_period}.zip"
     safe_zip_name = "".join(
-        c if c.isalnum() or c in "._- " else "_"
+        c if (c.isascii() and c.isalnum()) or c in "._-" else "_"
         for c in zip_name
     )[:100]
 
@@ -696,10 +697,10 @@ async def _generate_map_html(task: Task) -> Optional[str]:
         from ..services.pipeline import _task_dir
         out_dir = _task_dir(task.id)
         region_safe = "".join(
-            c if c.isalnum() else "_" for c in task.region_name
+            c if c.isascii() and c.isalnum() else "_" for c in task.region_name
         )[:30] or task.region_code
         period_safe = "".join(
-            c if c.isalnum() else "_" for c in task.period_label
+            c if c.isascii() and c.isalnum() else "_" for c in task.period_label
         )[:20]
         map_path = out_dir / f"dtp_map_{region_safe}_{period_safe}.html"
         map_path.write_text(html_content, encoding="utf-8")
