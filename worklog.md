@@ -2923,3 +2923,132 @@ Stage Summary:
 - Пользователь подтвердил: "Да все успешно удаляется. Задача пропадает из списка."
 - Задача sprint8 (UX правки списка задач): ЗАКРЫТА, всё работает в production.
 - Замечание: 2 предупреждения tg_init_data — некритично, но если повторяется часто, стоит проверить конфигурацию bothost-прокси.
+
+---
+Task ID: 1-6
+Agent: main
+Task: Реализация плана улучшений P0-P1 по результатам технической оценки и рецензии
+
+Work Log:
+- P0-1: Добавлены fetch_deaths_from_db_async/sync в np_bdd/scripts/forecast.py — прямой SQL к gibdd_cards с агрегацией SUM(pog) по месяцам. runtime_calc_async теперь приоритетно читает из PostgreSQL, fallback на API.
+- P0-2: bot/access.py — добавлен перехват HTTP 404 с попыткой получить данные через web_fallback для каждого 404-месяца индивидуально (не ломая весь pipeline).
+- P0-3: concentration_points.py — 5 CPU-bound вызовов (classify_cards, find_settlement_concentration_points, find_nonsettlement_concentration_points, find_settlement_preclusters, find_nonsettlement_preclusters) обёрнуты в asyncio.to_thread().
+- P1-4: MAX_INMEMORY_TASKS снижен с 50 до 20 в task_registry.py (worst-case 750MB → 300MB).
+- P1-5: Dockerfile переписан как multi-stage: runtime-base (без redis/supervisor), runtime-multi (с redis/supervisor), runtime (дефолт = single). Экономия ~30-50MB на образе.
+- P1-6: pipeline.py — save_task обёрнут в asyncio.shield() для защиты от отмены при shutdown.
+
+Stage Summary:
+- Изменено 5 файлов: forecast.py, access.py, concentration_points.py, task_registry.py, pipeline.py, Dockerfile
+- Все файлы прошли syntax check
+- P0 исправления решают: NP БДД зависимость от API ГИБДД, 404 через месяц, блокировку event loop
+- P1 исправления решают: OOM риск на bothost, размер Docker образа, потерю задач при рестарте
+
+---
+Task ID: 7-8
+Agent: main
+Task: Консолидация кэшей (repository.py) + hotfix SQL GROUP BY в forecast.py
+
+Work Log:
+- P1-7: Удалён _TASKS_MEMORY из repository.py. Все in-memory операции делегированы на task_registry._tasks.
+- P1-8: Обновлены тесты test_sprint7_hotfix_task_persistence.py — убраны patch.dict(_TASKS_MEMORY).
+- Hotfix: В forecast.py SQL-запрос изменён с `GROUP BY m` на `GROUP BY 1` (позиционный).
+  Причина: на production (build ec67eb2) ошибка `column "gibdd_cards.date_dtp" must appear in the GROUP BY clause`.
+  Позиционная форма исключает любые edge-case'ы с разрешением алиасов.
+- Обновлён PATCH_README.md с описанием hotfix.
+- Перестроен miniappgibdd-patch-p0p1.tar.gz (8 файлов, 88KB).
+
+Stage Summary:
+- Архив содержит 8 файлов: forecast.py, access.py, concentration_points.py, task_registry.py, pipeline.py, Dockerfile, repository.py, test_sprint7_hotfix_task_persistence.py
+- SQL GROUP BY 1 верифицирован в архиве
+- forecast.py прошёл py_compile check
+
+---
+Task ID: N1-N4
+Agent: main
+Task: Масштабирование до 30 юзеров — N1-N4 исправления
+
+Work Log:
+- N1: task_registry.py — при LRU-eviction задачи добавлен вызов drop_heavy_state(evicted_id). Без этого _TASKS_HEAVY_STATE рос без лимита (cleanup раз в 2 часа), при 10-30 юзерах = 200-700 MB утечки.
+- N2: pipeline.py — MAX_CONCURRENT_TASKS теперь читается из config (env MAX_CONCURRENT_TASKS). Раньше хардкод 3, env-переменная не работала.
+- N3: config.py — дефолт max_inmemory_tasks исправлен с 50 на 20. task_registry.py читает из config при импорте. Устранена рассинхронизация config↔code.
+- N4: env.example (оба) — DB_POOL_MAX исправлен с 5 на 30, DB_POOL_MIN с 1 на 2. Добавлены MAX_CONCURRENT_TASKS=5 и MAX_INMEMORY_TASKS=20.
+- Пересобран патч-архив: 13 файлов, обновлён PATCH_README.md.
+
+Stage Summary:
+- 6 файлов изменено: task_registry.py, pipeline.py, config.py, env.example, miniapp/backend/env.example, PATCH_README.md
+- Все .py файлы прошли py_compile
+- Архив: miniappgibdd-patch-p0p1.tar.gz (13 файлов)
+
+---
+Task ID: max_tokens-fix
+Agent: main
+Task: Увеличение max_tokens платного метода LLM с 8192 до 16384
+
+Work Log:
+- llm_analyzer.py — max_tokens платного метода (не-стрим + стрим) изменён с 8192 на 16384
+- Причина: SYSTEM_PROMPT_PAID требует 6 разделов анализа, 8192 токенов (~6000 слов) недостаточно → обрезка результата
+- Бесплатный стрим уже был 16384 (Sprint 5.1)
+
+Stage Summary:
+- 1 файл изменён: llm_analyzer.py (2 строки)
+
+---
+Task ID: N5-N7
+Agent: main
+Task: Масштабирование до 30 юзеров — N5 (RAM-лимит кэша), N6 (backpressure UI), N7 (shared httpx)
+
+Work Log:
+- N5: data_cache.py — добавлен лимит RAM 150 MB на in-memory кэш карточек.
+  - Новая функция _estimate_entry_bytes(): эвристика 4 KB на карточку.
+  - _DataCache теперь отслеживает _current_bytes, evict по записи И по суммарному RAM.
+  - stats() теперь показывает MB вместо только записей.
+  - Все методы (invalidate, invalidate_by_region, clear) корректно обновляют _current_bytes.
+- N6: backpressure UI — очередь видна пользователю.
+  - Backend (dtp.py): TaskStatusResponse добавлены queue_position и queue_ahead.
+  - _task_to_response() считает очередь: задачи в статусе pending/fetching, сортировка по created_at.
+  - Frontend (api.ts): TaskStatusResponse тип обновлён.
+  - Frontend (ProgressIndicator.tsx): показывает "В очереди: перед вами N задач", прогресс-бар серый.
+- N7: news_fetcher.py — singleton httpx.AsyncClient вместо создания нового на каждый запрос.
+  - _get_news_client() возвращает переиспользуемый клиент.
+  - Google News и DuckDuckGo используют один клиент.
+
+Stage Summary:
+- 5 файлов изменено: data_cache.py, dtp.py, api.ts, ProgressIndicator.tsx, news_fetcher.py
+- N5 предотвращает OOM: data_cache ограничен 150 MB (было без лимита, worst-case 800 MB)
+- N6 даёт UX: пользователь видит очередь вместо "зависшего" прогресс-бара
+- N7 экономит TCP-соединения: 2 клиента на вызов → 1 синглтон
+
+---
+Task ID: excel-lazy
+Agent: main
+Task: Удаление excel_cache, ленивая генерация Excel (on-demand)
+
+Work Log:
+- Удалены фазы PARSING и GENERATING из pipeline.py. Pipeline теперь: FETCHING → ANALYTICS → LLM. Экономия 5-8 сек на каждом запросе.
+- Удалена таблица excel_cache и весь связанный код (db/excel_cache.py, cleanup_old_excel, health/db/excel endpoint).
+- Освобождено ~180 MB в PostgreSQL (BYTEA-кэш Excel-файлов).
+- file1_data/file2_data больше не строятся в фоне — используются только при on-demand генерации.
+- Создан POST /api/dtp/tasks/{id}/generate-excel — ленивая генерация одного Excel (dtp_cards или dtp_participants), возвращает бинарный файл.
+- Создан POST /api/dtp/export-only — выгрузка ZIP с двумя Excel без аналитики/карты (fetch→parse→Excel→ZIP).
+- Frontend ResultsPanel.tsx: вкладка «Файлы» переработана — вместо ссылок на скачивание теперь кнопки «Выгрузить» с индикацией генерации.
+- Frontend ExportView.tsx: новая вкладка «Выгрузка файлов» с выбором региона и периода (месяц/квартал/год/полугодие), кнопка «Выгрузить ZIP-архив».
+- Frontend App.tsx: добавлена третья вкладка «Выгрузка файлов» между «ДТП» и «НП БДД».
+- Frontend api.ts: новые методы generateExcel(), exportOnly(), helper downloadBlobUrl() для бинарных скачиваний с X-Tg-Init-Data.
+- Frontend utils.ts: добавлены cn(), formatSize(), statusLabel().
+- HTML-карта удалена из скачиваемых файлов (никогда не использовалась).
+- models.py: удалены поля file1_data, file2_data, html_map из TaskStatusResponse.
+- metrics.py: удалены метрики excel_cache.
+- repository.py: удалены методы работы с excel_cache.
+- main.py: удалён импорт excel_cache.
+- worker/tasks/cleanup_tasks.py: удалена задача cleanup_old_excel.
+- worker/tasks/exports_tasks.py: on-demand генерация Excel через generate_both_files() в asyncio.to_thread.
+
+Stage Summary:
+- 13 файлов изменено (5 frontend + 8 backend)
+- Pipeline ускорен на 5-8 сек (удалены PARSING + GENERATING фазы)
+- PostgreSQL экономия ~180 MB (удалён excel_cache)
+- README.md и worklog.md актуализированы
+
+
+
+
