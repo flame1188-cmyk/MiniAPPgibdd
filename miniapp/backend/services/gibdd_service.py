@@ -9,7 +9,7 @@ Facade для service-слоя MiniApp.
 - query_ops.py       — parse_user_query, get_regions
 - pipeline.py        — create_task, execute_task, ensure_prev_cards,
                        ensure_cards (Sprint 3.1: cards recovery),
-                       _parse_files_sync, _task_dir, _EXECUTE_SEMAPHORE,
+                       _task_dir, _EXECUTE_SEMAPHORE,
                        MAX_CONCURRENT_TASKS
 - analytics_ops.py   — _get_cross_tables, ensure_comparison, compute_point_stats
 - clusters_ops.py    — start_clusters_calculation, generate_clusters_map_html,
@@ -70,7 +70,6 @@ from .query_ops import (
 from .pipeline import (
     MAX_CONCURRENT_TASKS,
     _EXECUTE_SEMAPHORE,
-    _parse_files_sync,
     _task_dir,
     create_task,
     ensure_cards,
@@ -143,7 +142,6 @@ __all__ = [
     # Pipeline
     "MAX_CONCURRENT_TASKS",
     "_EXECUTE_SEMAPHORE",
-    "_parse_files_sync",
     "_task_dir",
     "create_task",
     "ensure_cards",

@@ -77,7 +77,6 @@ try:
         _ensure_project_path,
         _get_cross_tables,
         _import_module,
-        _parse_files_sync,
         _register_task,
         _run_llm_summary_inner,
         _serialize_cluster,
