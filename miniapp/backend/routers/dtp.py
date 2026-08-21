@@ -103,6 +103,9 @@ class TaskStatusResponse(BaseModel):
     error: Optional[str] = None
     files: List[TaskFileSchema] = []
     analytics: Optional[Dict[str, Any]] = None
+    # N6: backpressure — очередь перед semaphore
+    queue_position: Optional[int] = None
+    queue_ahead: Optional[int] = None
 
 
 # ============================================================
@@ -438,6 +441,30 @@ async def download_file(
 # Helpers
 # ============================================================
 def _task_to_response(task: Task) -> TaskStatusResponse:
+    # N6: backpressure — считаем очередь перед semaphore.
+    # Если задача в статусе pending/fetching — она может ждать semaphore.
+    # Считаем сколько задач в _tasks тоже ждут (pending/fetching)
+    # и созданы раньше текущей.
+    queue_pos = None
+    queue_ahead = None
+    if task.status in ("pending", "fetching"):
+        try:
+            from ..services.task_registry import _tasks
+            from collections import OrderedDict
+            if isinstance(_tasks, OrderedDict):
+                waiting = [
+                    t for t in _tasks.values()
+                    if t.status in ("pending", "fetching")
+                ]
+                waiting.sort(key=lambda t: t.created_at)
+                for idx, t in enumerate(waiting, 1):
+                    if t.id == task.id:
+                        queue_pos = idx
+                        queue_ahead = idx - 1
+                        break
+        except Exception:
+            pass
+
     return TaskStatusResponse(
         task_id=task.id,
         status=task.status,
@@ -451,4 +478,6 @@ def _task_to_response(task: Task) -> TaskStatusResponse:
         error=task.error,
         files=[TaskFileSchema(**f) for f in task.files],
         analytics=task.analytics,
+        queue_position=queue_pos,
+        queue_ahead=queue_ahead,
     )

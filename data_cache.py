@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 # Настройки кэша
 # ========================
 _MAX_ENTRIES = 100       # максимум записей в кэше
+# N5: лимит общего RAM, потребляемого кэшем.
+# При bothost 2 GB: 150 MB на data_cache — безопасный потолок.
+# Одна запись (cards list) = ~2-8 MB в зависимости от региона.
+# 150 MB ≈ 20-50 регионов одновременно.
+_MAX_TOTAL_BYTES = 150 * 1024 * 1024  # 150 MB
 
 # TTL берётся из env CARDS_CACHE_TTL_SECONDS (по умолчанию 3600 = 1 час),
 # чтобы in-memory LRU и PostgreSQL-кэш использовали одинаковое время жизни.
@@ -38,14 +43,31 @@ except Exception:
     _TTL_SECONDS = 3600
 
 
-class _DataCache:
-    """Потокобезопасный LRU-кэш с TTL."""
+def _estimate_entry_bytes(entry: dict[str, Any]) -> int:
+    """N5: грубая оценка RAM одной записи кэша.
 
-    def __init__(self, max_entries: int = _MAX_ENTRIES, ttl: int = _TTL_SECONDS):
+    Вместо sys.getsizeof (который не рекурсивно считает вложенные объекты)
+    используем эвристику: количество карточек × средний вес одной карточки.
+    Средняя карточка ДТП (dict с ts_info, uch_info) ≈ 3-5 KB в Python.
+    Берём 4 KB как среднее, даём запас.
+    """
+    cards = entry.get("cards")
+    if not cards:
+        return 1024  # минимальная запись (пустой список + overhead)
+    return len(cards) * 4096
+
+
+class _DataCache:
+    """Потокобезопасный LRU-кэш с TTL и лимитом RAM (N5)."""
+
+    def __init__(self, max_entries: int = _MAX_ENTRIES, ttl: int = _TTL_SECONDS,
+                 max_total_bytes: int = _MAX_TOTAL_BYTES):
         self._cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._lock = threading.Lock()
         self._max_entries = max_entries
         self._ttl = ttl
+        self._max_total_bytes = max_total_bytes
+        self._current_bytes: int = 0  # N5: текущий размер кэша в байтах
         # Счётчики попаданий/промахов для диагностики
         self.hits = 0
         self.misses = 0
@@ -69,6 +91,7 @@ class _DataCache:
 
             if time.monotonic() - entry["ts"] > self._ttl:
                 # Просрочена — удаляем
+                self._current_bytes -= _estimate_entry_bytes(entry)
                 del self._cache[key]
                 self.misses += 1
                 logger.debug(f"Кэш: запись {key} просрочена, удалена")
@@ -87,25 +110,37 @@ class _DataCache:
             cards: list[dict], errors: list[str]) -> None:
         """Сохраняет результат в кэш."""
         key = self._make_key(reg_code, dat_list)
+        new_entry = {
+            "cards": cards,
+            "errors": errors,
+            "ts": time.monotonic(),
+        }
+        new_bytes = _estimate_entry_bytes(new_entry)
+
         with self._lock:
-            # Если ключ уже есть — обновляем
+            # Если ключ уже есть — вычитаем старый размер
             if key in self._cache:
+                old_entry = self._cache[key]
+                self._current_bytes -= _estimate_entry_bytes(old_entry)
                 self._cache.move_to_end(key)
 
-            self._cache[key] = {
-                "cards": cards,
-                "errors": errors,
-                "ts": time.monotonic(),
-            }
+            self._cache[key] = new_entry
+            self._current_bytes += new_bytes
 
-            # Evict старых записей (LRU)
-            while len(self._cache) > self._max_entries:
-                evicted_key, _ = self._cache.popitem(last=False)
-                logger.debug(f"Кэш: evict {evicted_key} (лимит {_max_entries})")
+            # Evict старых записей: по количеству И по RAM (N5)
+            while len(self._cache) > self._max_entries or self._current_bytes > self._max_total_bytes:
+                evicted_key, evicted_entry = self._cache.popitem(last=False)
+                self._current_bytes -= _estimate_entry_bytes(evicted_entry)
+                logger.debug(
+                    f"Кэш: evict {evicted_key} "
+                    f"(записей={len(self._cache)}/{self._max_entries}, "
+                    f"RAM={self._current_bytes / 1048576:.1f}/{self._max_total_bytes / 1048576:.0f} MB)"
+                )
 
             logger.debug(
                 f"Кэш: PUT {key} ({len(cards)} ДТП), "
-                f"размер кэша: {len(self._cache)}/{self._max_entries}"
+                f"записей={len(self._cache)}/{self._max_entries}, "
+                f"RAM={self._current_bytes / 1048576:.1f} MB"
             )
 
     def has(self, reg_code: str, dat_list: list[str]) -> bool:
@@ -116,7 +151,9 @@ class _DataCache:
         """Удаляет конкретную запись из кэша."""
         key = self._make_key(reg_code, dat_list)
         with self._lock:
-            self._cache.pop(key, None)
+            entry = self._cache.pop(key, None)
+            if entry:
+                self._current_bytes -= _estimate_entry_bytes(entry)
 
     def invalidate_by_region(self, reg_code: str) -> int:
         """Удаляет ВСЕ записи кэша для заданного региона.
@@ -130,7 +167,8 @@ class _DataCache:
         with self._lock:
             keys_to_remove = [k for k in self._cache if k.startswith(prefix)]
             for k in keys_to_remove:
-                del self._cache[k]
+                entry = self._cache.pop(k)
+                self._current_bytes -= _estimate_entry_bytes(entry)
                 removed += 1
         if removed:
             logger.info(f"Кэш: удалены {removed} записей региона {reg_code}")
@@ -143,6 +181,7 @@ class _DataCache:
         with self._lock:
             n = len(self._cache)
             self._cache.clear()
+            self._current_bytes = 0
         logger.info(f"Кэш: полностью очищен ({n} записей удалено)")
 
     def stats_dict(self) -> dict[str, int]:
@@ -158,6 +197,8 @@ class _DataCache:
                 "entries": len(self._cache),
                 "valid": valid,
                 "total_cards_cached": total_cards,
+                "total_bytes_mb": round(self._current_bytes / 1048576, 1),
+                "max_bytes_mb": round(self._max_total_bytes / 1048576, 0),
             }
 
     def stats(self) -> str:
@@ -165,6 +206,7 @@ class _DataCache:
         s = self.stats_dict()
         return (
             f"cache: {s['entries']}/{self._max_entries} записей, "
+            f"{s['total_bytes_mb']}/{s['max_bytes_mb']} MB, "
             f"hits={self.hits}, misses={self.misses}"
         )
 

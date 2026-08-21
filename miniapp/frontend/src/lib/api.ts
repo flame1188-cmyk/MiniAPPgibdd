@@ -170,6 +170,9 @@ export interface TaskStatusResponse {
   error?: string | null
   files: TaskFile[]
   analytics?: Record<string, unknown> | null
+  // N6: backpressure — очередь перед semaphore
+  queue_position?: number | null
+  queue_ahead?: number | null
 }
 
 // Структурированный запрос на создание задачи (без текстового парсинга)

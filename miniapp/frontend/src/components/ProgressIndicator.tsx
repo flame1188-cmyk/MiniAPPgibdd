@@ -14,6 +14,10 @@ export function ProgressIndicator({ task }: ProgressIndicatorProps) {
   const isFailed = task.status === 'failed'
   const isDone = task.status === 'done'
 
+  // N6: backpressure — показываем позицию в очереди
+  const queueAhead = task.queue_ahead
+  const showQueue = queueAhead != null && queueAhead > 0
+
   return (
     <div className="tg-card">
       <div className="flex items-center justify-between mb-2">
@@ -22,6 +26,13 @@ export function ProgressIndicator({ task }: ProgressIndicatorProps) {
         </div>
         <div className="text-xs opacity-60">{task.period}</div>
       </div>
+
+      {/* N6: индикатор очереди */}
+      {showQueue && (
+        <div className="text-xs opacity-70 mb-1" style={{ color: 'var(--tg-color-hint, #999)' }}>
+          В очереди: перед вами {queueAhead} {queueAhead === 1 ? 'задача' : queueAhead < 5 ? 'задачи' : 'задач'}
+        </div>
+      )}
 
       {/* Прогресс-бар */}
       <div
@@ -34,7 +45,9 @@ export function ProgressIndicator({ task }: ProgressIndicatorProps) {
             width: `${task.progress}%`,
             backgroundColor: isFailed
               ? 'var(--tg-color-destructive, #ff3b30)'
-              : 'var(--tg-color-button, #2481cc)',
+              : showQueue
+                ? 'var(--tg-color-hint, #999)'
+                : 'var(--tg-color-button, #2481cc)',
           }}
         />
       </div>
@@ -43,7 +56,9 @@ export function ProgressIndicator({ task }: ProgressIndicatorProps) {
         <span className={isFailed ? 'text-red-500' : ''}>
           {isFailed
             ? `Ошибка: ${task.error ?? 'неизвестная'}`
-            : statusLabel(task.status)}
+            : showQueue
+              ? `Ожидание (очередь ${task.queue_position})`
+              : statusLabel(task.status)}
         </span>
         <span className="opacity-60">{task.progress}%</span>
       </div>

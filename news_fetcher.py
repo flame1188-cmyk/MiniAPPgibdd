@@ -26,6 +26,22 @@ _NEWS_CONNECT_TIMEOUT = 5
 _google_down = False
 _ddg_down = False
 
+# N7: singleton httpx-клиент для новостных источников
+# (раньше создавался новый клиент на каждый запрос)
+_news_client: httpx.AsyncClient | None = None
+
+
+def _get_news_client() -> httpx.AsyncClient:
+    """Возвращает переиспользуемый httpx-клиент для новостных источников."""
+    global _news_client
+    if _news_client is None or _news_client.is_closed:
+        _news_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(_NEWS_TIMEOUT, connect=_NEWS_CONNECT_TIMEOUT),
+            follow_redirects=True,
+        )
+        logger.debug("Создан новый HTTP-клиент для новостных источников")
+    return _news_client
+
 
 def _build_search_query(reg_name: str, current_label: str, prev_label: str) -> str:
     """
@@ -75,11 +91,8 @@ async def _fetch_google_news_rss(query: str, max_results: int = 10) -> list[dict
     logger.info(f"Google News RSS запрос: {query}")
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_NEWS_TIMEOUT, connect=_NEWS_CONNECT_TIMEOUT),
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url)
+        client = _get_news_client()
+        response = await client.get(url)
 
         if response.status_code != 200:
             logger.warning(f"Google News вернул {response.status_code}")
@@ -176,14 +189,11 @@ async def _fetch_duckduckgo_html(query: str, max_results: int = 10) -> list[dict
     logger.info(f"DuckDuckGo запрос: {query}")
 
     try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(_NEWS_TIMEOUT, connect=_NEWS_CONNECT_TIMEOUT),
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            )
+        client = _get_news_client()
+        response = await client.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
 
         if response.status_code == 202:
             # Bot detection — не пробовать до перезапуска
