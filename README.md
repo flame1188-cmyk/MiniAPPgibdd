@@ -16,7 +16,7 @@ Telegram-бот и веб-Mini App для выгрузки и анализа д�
 ### Основной функционал
 
 - **3 способа ввода запроса:** inline-кнопки (`/dtp`), естественный язык («Вологодская область за 2025 год»), строгий формат (`2.2024 1119`)
-- **Два Excel-файла:** карточки ДТП (1 строка = 1 ДТП) и участники ДТП (1 строка = 1 участник)
+- **Два Excel-файла (ленивая генерация):** карточки ДТП (1 строка = 1 ДТП) и участники ДТП (1 строка = 1 участник). Файлы генерируются по нажатию кнопки «Выгрузить» (5-8 сек), а не в фоне при каждом запросе — это экономит 5-8 сек на каждой выгрузке аналитики
 - **Аналитика:** сравнение текущего периода с АППГ, распределение по дням недели, часам, видам ДТП, 25 кросс-таблиц корреляций, статистические метрики (severity rates, Z-score, χ²)
 - **Очаги концентрации ДТП:** автоматический расчёт мест концентрации аварийности с новой методологией v2 (пикетаж + соседи + слияния)
 - **Камеры фотовидеофиксации:** загрузка реестра камер через Excel-файл, кэширование по регионам, автоматическое сопоставление с очагами ДТП (по пикетажу и геопозиции)
@@ -25,7 +25,7 @@ Telegram-бот и веб-Mini App для выгрузки и анализа д�
 - **НП БДД (Национальный проект «Безопасные качественные дороги»):** история погибших, прогноз с сезонными коэффициентами, коридор прогноза, KPI-статус (ok/warning/danger), frozen-годы
 - **Web-fallback:** при ошибке API (5xx, ConnectionError) автоматически переключается на экспорт через сайт stat.gibdd.ru (POST генерация + GET скачивание XML)
 - **4-уровневый fallback справочника регионов:** API → файловый кэш → встроенный хардкод (82 региона) → пустой список
-- **Трёхуровневый кэш данных ДТП:** L1 in-memory LRU → L2 PostgreSQL (cards/clusters/excel) → L3 файловый кэш. Экономия до 18-28 сек на повторных запросах того же региона+периода
+- **Двууровневый кэш данных ДТП:** L1 in-memory LRU → L2 PostgreSQL (cards/clusters) → L3 файловый кэш. Экономия до 11-20 сек на повторных запросах того же региона+периода
 - **Персистентность задач в PostgreSQL:** задачи выгрузки, кластеры и аудит-лог доступа к ПДн (152-ФЗ) хранятся в БД, переживают рестарт
 - **Ограничение доступа:** optional whitelist по Telegram user ID
 
@@ -75,12 +75,9 @@ Telegram-бот и веб-Mini App для выгрузки и анализа д�
 Telegram Mini App, открывающийся в нативном WebView Telegram. Решает главную проблему iOS-пользователей — HTML-карты открываются в WebView, выполняющем JavaScript, а не в Quick Look.
 
 **Вкладки Mini App:**
-1. **Запрос** — структурированная форма (регион + период) или текстовый ввод
-2. **Аналитика** — 25 кросс-таблиц, статистические метрики, ECharts-визуализации
-3. **Очаги** — расчёт очагов концентрации, карта (iframe), KPI-сводка, динамика vs АППГ, Top-10 по тяжести, предочаги, Excel-выгрузка
-4. **Точка** — статистика ДТП в радиусе от геоточки + карта
-5. **ИИ-анализ** — генерация аналитического резюме (15-90 сек), Q&A с историей
-6. **НП БДД** — история, прогноз, коридор, KPI-статус, управление frozen-годами
+1. **ДТП** — структурированная форма (регион + период), карта, аналитика (25 кросс-таблиц), очаги, статистика по точке, ИИ-анализ, ленивая выгрузка Excel
+2. **Выгрузка файлов** — выбор региона и периода (месяц/квартал/год), скачивание ZIP-архива с двумя Excel без построения аналитики и карты
+3. **НП БДД** — история, прогноз, коридор, KPI-статус, управление frozen-годами
 
 **Технические особенности:**
 - **Long polling** (25 сек) для статуса длительных операций (очаги, LLM-резюме) — устраняет 30+ коротких запросов
@@ -154,16 +151,16 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
      .xlsx      .xlsx     .xlsx
 ```
 
-### Трёхуровневый кэш данных ДТП (L1 + L2 + L3)
+### Двууровневый кэш данных ДТП (L1 + L2)
 
-После загрузки и обработки данные кэшируются на трёх уровнях. На повторных запросах того же региона+периода генерация полностью пропускается:
+После загрузки и обработки данные кэшируются на двух уровнях (PostgreSQL). На повторных запросах того же региона+периода генерация полностью пропускается:
 
 ```
 Запрос (reg_code, dat_hash)
        │
        ▼
 ┌─────────────────────────────────────────────────────┐
-│ L1: In-memory LRU (data_cache.py, 100 записей)       │
+│ L1: In-memory LRU (data_cache.py, 150 MB RAM cap)    │
 │    cards + prev_cards in-process, мгновенный HIT     │
 └─────────────┬───────────────────────────────────────┘
               │ miss
@@ -172,7 +169,6 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
 │ L2: PostgreSQL (модуль miniapp/backend/db/)          │
 │    • cards_cache    — JSONB с карточками ДТП          │
 │    • clusters_cache — JSONB с raw_clusters + metrics  │
-│    • excel_cache    — BYTEA с готовыми xlsx-файлами   │
 │    TTL=86400s (24ч), фоновая очистка каждые 2 часа    │
 └─────────────┬───────────────────────────────────────┘
               │ miss
@@ -186,7 +182,7 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
 ```
 
 **Ключи кэша:**
-- `cards_cache`, `excel_cache`: `(reg_code, dat_hash)` — хэш списка dat (месяцев)
+- `cards_cache`: `(reg_code, dat_hash)` — хэш списка dat (месяцев)
 - `clusters_cache`: `(reg_code, current_dat_hash, prev_dat_hash)` — зависит от пары периодов
 
 **Экономия на повторных запросах** (подтверждено в проде):
@@ -195,9 +191,10 @@ Telegram Mini App, открывающийся в нативном WebView Telegr
 |-------|------------------|-----------------|
 | Stage 3 | Карточки ДТП (cards_cache) | ~3-5 сек |
 | Stage 4 | Кластеры + raw_clusters (clusters_cache) | ~8-15 сек (DBSCAN) |
-| Stage 5 | Excel Файл 1 + Файл 2 (excel_cache) | ~7-8 сек |
 
-Совокупная экономия: **~18-28 сек** на повторном запросе. Кэш особенно эффективен, когда несколько сотрудников ГИБДД выгружают один регион за тот же период.
+Совокупная экономия: **~11-20 сек** на повторном запросе. Кэш особенно эффективен, когда несколько сотрудников ГИБДД выгружают один регион за тот же период.
+
+Excel-файлы (карточки ДТП и участники) генерируются **по требованию** (on-demand) при нажатии кнопки «Выгрузить» и не кэшируются в PostgreSQL. Это избавило pipeline от фазы GENERATING (5-8 сек) и освободило ~180 MB в БД.
 
 ### Загрузка справочника регионов
 
@@ -375,11 +372,10 @@ cp .env.example .env
 | `CORS_ORIGINS` | Origins для CORS (URL Mini App + web.telegram.org) | Для production |
 | `ALLOWED_USER_IDS` | ID пользователей через запятую (пустое = доступ всем) | Нет |
 | `DATABASE_URL` | Connection string PostgreSQL (`postgresql://user:pass@host:port/db`). Если пусто — in-memory fallback | Для кэшей L2 |
-| `DB_POOL_MIN` / `DB_POOL_MAX` | Размеры пула соединений (по умолчанию `1` / `5`) | Нет |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | Размеры пула соединений (по умолчанию `2` / `30`) | Нет |
 | `DB_CONNECT_TIMEOUT` | Таймаут подключения к БД в секундах (по умолчанию `10`) | Нет |
 | `CARDS_CACHE_TTL_SECONDS` | TTL кэша карточек ДТП в PostgreSQL (по умолчанию `86400` = 24ч) | Нет |
 | `CLUSTERS_CACHE_TTL_SECONDS` | TTL кэша кластеров в PostgreSQL (по умолчанию `86400` = 24ч) | Нет |
-| `EXCEL_CACHE_TTL_SECONDS` | TTL кэша Excel-файлов в PostgreSQL (по умолчанию `86400` = 24ч) | Нет |
 | `LLM_API_KEY` | API-ключ [ZhipuAI](https://open.bigmodel.cn) для AI-анализа | Нет |
 | `LLM_MODEL` | Модель GLM (по умолчанию `glm-4.7-flash`) | Нет |
 | `ENABLE_NEWS_SEARCH` | Поиск новостей для контекста LLM (`true`/`false`, по умолчанию `true`) | Нет |
@@ -390,7 +386,7 @@ cp .env.example .env
 | `ADMIN_TELEGRAM_IDS` | ID администраторов через запятую — для системных алертов (cache TTL, мониторинг) | Нет |
 | `MAX_CONCURRENT_TASKS` | Лимит одновременных задач выгрузки (по умолчанию `5`, `asyncio.Semaphore`) | Нет |
 | `RATE_LIMIT_PER_MINUTE` | Лимит запросов API на пользователя в минуту (slowapi, по умолчанию `60`) | Нет |
-| `MAX_INMEMORY_TASKS` | Размер LRU-кэша задач в памяти (по умолчанию `50`) | Нет |
+| `MAX_INMEMORY_TASKS` | Размер LRU-кэша задач в памяти (по умолчанию `20`) | Нет |
 | `LOG_FORMAT` | Формат логов: `text` (по умолчанию) или `json` (структурированные логи для ELK/Loki) | Нет |
 | `REGIONS_API_ENABLED` | Запрос справочника регионов через API ГИБДД (`1`/`0`, по умолчанию `0` — сразу файловый кэш) | Нет |
 | `TARGET_API_TIMEOUT` | Таймаут запросов к API ГИБДД в секундах (по умолчанию `120`) | Нет |
@@ -528,14 +524,15 @@ gibdd-bot/
 │   │   │   ├── gibdd_service.py  ← Мост к модулям gibdd-bot (Task, pipeline, recovery)
 │   │   │   ├── llm_ops.py        ← LLM-операции: summary/Q&A, SSE-стрим, кэш, retry 429
 │   │   │   ├── task_registry.py  ← In-memory LRU _tasks + восстановление LLM-сессий
-│   │   │   ├── pipeline.py       ← Анализатор конвейера (cards→analytics→clusters)
+│   │   │   ├── pipeline.py       ← Анализатор конвейера (FETCHING→ANALYTICS→LLM)
+│   │   │   │                       Excel-файлы генерируются по требованию, не в pipeline
 │   │   │   │                       Sprint 7 C.2.4: feature flag GIBDD_USE_CORE_PIPELINE
 │   │   │   │                       routing 4 CPU-bound шагов через core/ via asyncio.to_thread
 │   │   │   ├── analytics_ops.py  ← Аналитические операции (comparison, cross-tables)
 │   │   │   ├── clusters_ops.py   ← Расчёт очагов (concentration_points v2)
 │   │   │   ├── point_stats_ops.py← Статистика по геоточке
 │   │   │   ├── query_ops.py      ← Парсинг запросов пользователя
-│   │   │   ├── cleanup.py        ← Background cleanup (cards/clusters/excel cache TTL)
+│   │   │   ├── cleanup.py        ← Background cleanup (cards/clusters cache TTL)
 │   │   │   └── np_bdd_service.py ← Сервис НП БДД
 │   │   ├── core/           ← Sprint 7 C.2: синхронные pure functions для Celery (C.3)
 │   │   │   ├── __init__.py       ← Re-export всех 12 функций
@@ -549,23 +546,25 @@ gibdd-bot/
 │   │   └── db/             ← Слой PostgreSQL (Этап 2-6)
 │   │       ├── connection.py     ← Async-пул (psycopg), init_pool/close_pool/health_check
 │   │       ├── schema.sql        ← CREATE TABLE IF NOT EXISTS: tasks, access_log,
-│   │       │                       dtp_cards_cache, clusters_cache, excel_cache,
+│   │       │                       dtp_cards_cache, clusters_cache,
 │   │       │                       llm_cache, llm_sessions
+│   │       │                       (excel_cache удалён — Excel генерируется on-demand)
 │   │       ├── repository.py     ← TaskRepository: save/load/list/delete, log_access,
 │   │       │                       save_llm_session/append_qa_entry/load_llm_session
 │   │       ├── cards_cache.py    ← L2-кэш карточек ДТП (Этап 3)
 │   │       ├── clusters_cache.py ← L2-кэш кластеров + raw_clusters (Этап 4)
-│   │       ├── excel_cache.py    ← L2-кэш Excel-файлов (BYTEA, Этап 5)
 │   │       └── llm_cache.py      ← L2-кэш LLM-резюме (Sprint 2, по cache_key SHA-256)
 │   └── frontend/           ← Vite + React + TypeScript + Tailwind
 │       ├── src/
-│       │   ├── App.tsx     ← Главный layout с табами + VersionBanner (Sprint 7 v3)
-│       │   ├── lib/        ← telegram.ts, api.ts, utils.ts (getVersion, ApiError)
+│       │   ├── App.tsx     ← Главный layout: «ДТП» / «Выгрузка файлов» / «НП БДД»
+│       │   ├── lib/        ← telegram.ts, api.ts (generateExcel, exportOnly, downloadBlobUrl),
+│       │   │                 utils.ts (cn, formatSize, statusLabel)
 │       │   ├── hooks/      ← useTaskPolling.ts, useAnalysisPolling.ts,
 │       │   │                 useVersionCheck.ts (polling /api/version 60s, Sprint 7 v3)
-│       │   └── components/ ← ClustersView (404/403 UI), LLMAnalysisView, AnalyticsView,
-│       │                     NpBddView, PointStatsView, StructuredForm,
-│       │                     VersionBanner (fixed-top «Доступна новая версия»), ...
+│       │   └── components/ ← StructuredForm, ResultsPanel (lazy Excel кнопки),
+│       │                     ExportView (отдельная вкладка выгрузки),
+│       │                     ClustersView, LLMAnalysisView, AnalyticsView,
+│       │                     NpBddView, PointStatsView, VersionBanner, ...
 │       └── dist/           ← Собранная ститика + build_version.txt / .build_version
 ├── tests/                  ← Полный набор тестов (464 теста, 77% coverage)
 │   ├── unit/               ← Wave 1-2: чистые функции + LLM/service mocks
@@ -597,7 +596,6 @@ gibdd-bot/
 | GET | `/health/db` | Детальная диагностика PostgreSQL (пул, latency, schema) |
 | GET | `/health/db/cards` | Статистика cards_cache: записи, hits/misses, размер |
 | GET | `/health/db/clusters` | Статистика clusters_cache: записи, hits/misses, размер |
-| GET | `/health/db/excel` | Статистика excel_cache: записи, hits/misses, размер |
 | GET | `/api/regions` | Список регионов с кодами |
 | GET | `/api/regions/search?q=` | Поиск регионов (autocomplete) |
 | POST | `/api/parse` | Парсинг естественного языка → `{region_code, period}` |
@@ -605,9 +603,9 @@ gibdd-bot/
 | GET | `/api/dtp/tasks` | Список задач пользователя (последние N, по умолчанию 20) |
 | GET | `/api/dtp/tasks/{id}` | Статус задачи (для polling) |
 | DELETE | `/api/dtp/tasks/{id}` | Удалить задачу пользователя (БД + in-memory кэш + файлы на диске; с ownership-проверкой и логированием в access_log) |
-| GET | `/api/dtp/tasks/{id}/files` | Список готовых файлов |
+| POST | `/api/dtp/tasks/{id}/generate-excel` | **Ленивая генерация Excel** (on-demand). Возвращает .xlsx как бинарный download. `file_type`: `dtp_cards` или `dtp_participants` |
+| POST | `/api/dtp/export-only` | **Выгрузка без аналитики** — fetch→parse→Excel→ZIP. Отдельная вкладка «Выгрузка файлов». Возвращает ZIP-архив с двумя Excel |
 | GET | `/api/dtp/tasks/{id}/map` | HTML-карта ДТП (для iframe) |
-| GET | `/api/dtp/tasks/{id}/download/{file_type}` | Скачать Excel/HTML |
 | POST | `/api/dtp/tasks/{id}/clusters` | Запустить расчёт очагов |
 | GET | `/api/dtp/tasks/{id}/clusters?wait=N` | Статус очагов (long polling) |
 | GET | `/api/dtp/tasks/{id}/clusters/map` | HTML-карта очагов |
@@ -662,7 +660,6 @@ gibdd-bot/
 |----------|---------------|-----------------|
 | `https://<DOMAIN>/health` | Сервер жив, БД готова | `{"status":"ok","database":{"ready":true}}` |
 | `https://<DOMAIN>/health/db` | Диагностика PostgreSQL | `pool`, `latency_ms`, `tables` |
-| `https://<DOMAIN>/health/db/excel` | Статистика excel_cache | `entries`, `hits`, `misses` |
 | `https://<DOMAIN>/api/regions` | Авторизация | 401 (нужен initData) |
 | `https://<DOMAIN>/app/` | Frontend | HTML страница |
 | `https://<DOMAIN>/docs` | Swagger UI | Документация API |
@@ -1120,12 +1117,12 @@ curl https://<BOTHOST_DOMAIN>/api/version
 - Второй пользователь с тем же регионом+периодом — мгновенный cache hit вместо 15-30 сек расчёта
 
 **1.3 — TTL-мониторинг кэшей** (`Stage 3`)
-- `cleanup_old_cards()`, `cleanup_old_clusters()`, `cleanup_old_excel()` — фоновые задачи
+- `cleanup_old_cards()`, `cleanup_old_clusters()` — фоновые задачи
 - Метрика `gibdd_cards_cache_entries` для наблюдения за размером
 
 **1.2 — PostgreSQL миграция** (`Stage 1-2`)
 - `psycopg_pool.AsyncConnectionPool` (min=2, max=30)
-- Таблицы: `dtp_cards_cache`, `dtp_clusters_cache`, `dtp_excel_cache`, `tasks`, `audit_log`
+- Таблицы: `dtp_cards_cache`, `dtp_clusters_cache`, `tasks`, `audit_log`
 - Fallback: при недоступности БД — in-memory режим (функциональность сохраняется)
 
 **1.1 — Mini App интеграция** (`v0.2-v0.6`)
