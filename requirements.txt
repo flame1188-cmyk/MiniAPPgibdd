@@ -1,26 +1,11 @@
 # ====================================
-# GIBDD Stat Bot + Mini App — requirements
+# GIBDD Stat Bot + Mini App
 # ====================================
-# ВНИМАНИЕ (Stabilization P1 #2 от 2026-08-20):
-# Этот файл оставлен для обратной совместимости со старыми инструкциями
-# в README. Для production-деплоя используйте requirements.lock — он
-# содержит точные версии всех пакетов (включая транзитивные) с хешами.
-#
-# Workflow:
-#   1. Изменить requirements.in (top-level зависимости)
-#   2. Запустить: make compile  (или: pip-compile requirements.in -o requirements.lock)
-#   3. Закоммитить и requirements.in, и requirements.lock
-#   4. В проде: pip install -r requirements.lock
-#
-# Проверка безопасности:
-#   make audit  (или: pip-audit -r requirements.lock --strict)
-#   CI автоматически запускает pip-audit на каждый push + раз в неделю.
-#
-# Старый способ установки (без lock):
-#   pip install -r requirements.txt
-# — работает, но не гарантирует идентичности версий между средами.
 
 # --- Telegram Bot ---
+# ВАЖНО: extra [webhooks] НЕ нужен — мы принимаем webhook через FastAPI
+# endpoint /bot/webhook и передаём в PTB через process_update().
+# Это стандартный паттерн интеграции PTB + FastAPI.
 python-telegram-bot==21.7
 
 # --- HTTP client ---
@@ -77,20 +62,16 @@ pydantic-settings==2.7.1
 # Позволяет стримить LLM-ответ token-by-token вместо 30-60 сек блокирующего запроса.
 sse-starlette>=2.0,<4
 
-# --- Migrations (NEW for Phase 0) ---
-alembic>=1.14.0
-sqlalchemy>=2.0.0
-
 # celery — distributed task queue. Запускает async-задачи в отдельном worker процессе.
 # 4 очереди: gibdd, llm, clusters, exports.
 # При USE_CELERY=false или REDIS_URL пустом — работаем в in-memory режиме (fallback).
-# celery>=5.4,<6
+celery>=5.4,<6
 
 # redis — Python клиент для Redis. Используется как:
 #   - Celery broker (очередь задач)
 #   - Celery result backend (хранение результатов)
 #   - Pub/sub для streaming LLM токенов от worker к FastAPI
-# redis>=5.2,<7
+redis>=5.2,<7
 
 # ====================================
 # GIBDD Stat Bot — dev dependencies

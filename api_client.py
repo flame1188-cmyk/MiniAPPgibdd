@@ -48,27 +48,7 @@ logger = logging.getLogger(__name__)
 # ========================
 # Персистентный HTTP-клиент (connection pooling)
 # ========================
-# Stabilization P0 #1: event-loop-aware singleton.
-#
-# Раньше get_client() проверял только _shared_client.is_closed, но httpx
-# AsyncClient.is_closed — это флаг self._state, он НЕ проверяет, что event
-# loop, на котором клиент создан, ещё жив.
-#
-# Сценарий бага (Celery worker):
-#   1. asyncio.run(fetch_2025) — создаёт loop A
-#   2. get_client() — первый раз, создаёт клиент, привязанный к loop A
-#   3. 12 месяцев 2025 отдаются OK
-#   4. asyncio.run() завершается → loop A ЗАКРЫТ
-#   5. _shared_client остаётся ссылаться на старый клиент
-#   6. asyncio.run(fetch_2024) — создаёт НОВЫЙ loop B
-#   7. get_client() видит is_closed=False → возвращает СТАРЫЙ клиент на loop A
-#   8. await client.get(...) → RuntimeError: Event loop is closed
-#
-# Фикс: храним ссылку на loop, на котором создан клиент. Если loop
-# поменялся (или исчез) — закрываем старый клиент и создаём новый.
-# Connection pooling сохраняется в рамках одной сессии (одного event loop).
 _shared_client: httpx.AsyncClient | None = None
-_client_loop: asyncio.AbstractEventLoop | None = None
 _last_request_time: float = 0.0
 
 
@@ -84,43 +64,8 @@ def _get_proxy_config() -> dict[str, str] | None:
 
 async def get_client() -> httpx.AsyncClient:
     """Возвращает единственный экземпляр httpx.AsyncClient для всего приложения.
-    TCP-соединение переиспользуется между запросами (keep-alive).
-
-    Stabilization P0 #1: event-loop-aware.
-    Если вызвана из другого event loop, чем тот, на котором клиент создан —
-    корректно закрывает старый клиент и создаёт новый. Это закрывает
-    RuntimeError: Event loop is closed при повторном вызове asyncio.run()
-    (например, в Celery worker: fetch_current → asyncio.run → закрыли loop →
-    fetch_prev → asyncio.run → новый loop, старый клиент мёртв).
-    """
-    global _shared_client, _client_loop
-
-    # Определяем текущий event loop.
-    # Если вызвана не из async context (теоретически невозможно, т.к. функция
-    # async, но defensively) — current_loop = None, что триггерит пересоздание.
-    try:
-        current_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        current_loop = None
-
-    # Если клиент привязан к другому loop — закрываем старый, создаём новый.
-    # _client_loop is not current_loop корректно сработает и для None (sync ctx),
-    # и для разных loop объектов (Celery: loop A → closed → loop B).
-    if _shared_client is not None and _client_loop is not current_loop:
-        old_loop_id = id(_client_loop)
-        try:
-            if not _shared_client.is_closed:
-                await _shared_client.aclose()
-        except Exception as exc:
-            # Не роняем — лучше создать новый клиент и продолжить работу
-            logger.debug(f"get_client: aclose() of stale client failed: {exc}")
-        _shared_client = None
-        _client_loop = None
-        logger.info(
-            f"HTTP-клиент пересоздан: сменился event loop "
-            f"(old_loop_id={old_loop_id}, new_loop_id={id(current_loop)})"
-        )
-
+    TCP-соединение переиспользуется между запросами (keep-alive)."""
+    global _shared_client
     if _shared_client is None or _shared_client.is_closed:
         proxy = _get_proxy_config()
         _shared_client = httpx.AsyncClient(
@@ -140,18 +85,16 @@ async def get_client() -> httpx.AsyncClient:
             # HTTP/1.1 keep-alive (GIBDD не поддерживает HTTP/2)
             http2=False,
         )
-        _client_loop = current_loop
         logger.info("Создан новый HTTP-клиент (connection pooling)")
     return _shared_client
 
 
 async def close_client() -> None:
     """Закрывает HTTP-клиент. Вызывать при остановке бота."""
-    global _shared_client, _client_loop
+    global _shared_client
     if _shared_client is not None and not _shared_client.is_closed:
         await _shared_client.aclose()
         _shared_client = None
-        _client_loop = None
         logger.info("HTTP-клиент закрыт")
 
 
