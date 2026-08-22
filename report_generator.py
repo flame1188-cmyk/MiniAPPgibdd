@@ -1172,7 +1172,7 @@ function clearCoordSearch() {
     ) -> str:
         """JavaScript-код карты ДТП с фильтрами."""
         return f"""
-var map = L.map('map', {attributionControl: false}).setView([{center[0]}, {center[1]}], {zoom});
+var map = L.map('map', {{attributionControl: false}}).setView([{center[0]}, {center[1]}], {zoom});
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: false,
@@ -2056,7 +2056,7 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         ДТП очагов и предочагов разделены по слоям.
         """
         return f"""
-var map = L.map('map', {attributionControl: false}).setView([{center[0]}, {center[1]}], {zoom});
+var map = L.map('map', {{attributionControl: false}}).setView([{center[0]}, {center[1]}], {zoom});
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: false,
@@ -2732,7 +2732,7 @@ function updateMultiSelectLabel(id) {{
     ) -> str:
         """JavaScript-код карты точки."""
         return f"""
-var map = L.map('map', {attributionControl: false}).setView([{lat}, {lon}], 15);
+var map = L.map('map', {{attributionControl: false}}).setView([{lat}, {lon}], 15);
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: false,
