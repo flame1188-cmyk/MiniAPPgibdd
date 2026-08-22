@@ -721,16 +721,18 @@ body {
 /* Кнопка слоёв: показываем значок без внешней картинки */
 .leaflet-control-layers-toggle {
   background-image: none !important;
+  background-color: white !important;
   width: 30px !important;
   height: 30px !important;
+  text-indent: 0 !important;
+  font-size: 18px !important;
+  line-height: 30px !important;
+  text-align: center !important;
+  color: #333 !important;
 }
 .leaflet-control-layers-toggle::before {
-  content: '\2630';
-  font-size: 20px;
-  line-height: 30px;
-  text-align: center;
+  content: '\2261';
   display: block;
-  color: #333;
 }
 .clusters-toggle-disabled {
   opacity: 0.4 !important;
@@ -1374,11 +1376,12 @@ function renderDtp(data) {{
 
 function toggleDtpClustering() {{
     if (dtpClusteringEnabled) {{
-        map.removeLayer(dtpCluster);
+        dtpCluster.clearLayers();
         dtpFlatGroup.addTo(map);
     }} else {{
+        dtpFlatGroup.eachLayer(function(m) {{ dtpCluster.addLayer(m); }});
+        dtpFlatGroup.clearLayers();
         map.removeLayer(dtpFlatGroup);
-        dtpCluster.addTo(map);
     }}
     dtpClusteringEnabled = !dtpClusteringEnabled;
 }}
@@ -1429,14 +1432,14 @@ clusterToggleBtn.onAdd = function() {{
     var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
     var a = L.DomUtil.create('a', 'cluster-toggle-btn', div);
     a.href = '#';
-    a.title = 'Группировка: ВКЛ';
+    a.title = 'Группировка ДТП: ВКЛ';
     a.innerHTML = '⊞';
     a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
         L.DomEvent.stopPropagation(e);
         toggleDtpClustering();
-        a.title = dtpClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.title = dtpClusteringEnabled ? 'Группировка ДТП: ВКЛ' : 'Группировка ДТП: ВЫКЛ';
         a.innerHTML = dtpClusteringEnabled ? '⊞' : '⋯';
         a.style.background = dtpClusteringEnabled ? '' : '#ffb74d';
     }});
@@ -1487,18 +1490,21 @@ var cameraCluster = L.markerClusterGroup({{
 }});
 var cameraFlatGroup = L.layerGroup();
 var cameraClusteringEnabled = true;
+var _camToggleLock = false;
 
 function toggleCameraClustering() {{
-    var isOnMap = map.hasLayer(cameraCluster) || map.hasLayer(cameraFlatGroup);
-    if (!isOnMap) return;
+    if (!map.hasLayer(cameraCluster)) return;
+    _camToggleLock = true;
     if (cameraClusteringEnabled) {{
-        map.removeLayer(cameraCluster);
+        cameraCluster.clearLayers();
         cameraFlatGroup.addTo(map);
     }} else {{
+        cameraFlatGroup.eachLayer(function(m) {{ cameraCluster.addLayer(m); }});
+        cameraFlatGroup.clearLayers();
         map.removeLayer(cameraFlatGroup);
-        cameraCluster.addTo(map);
     }}
     cameraClusteringEnabled = !cameraClusteringEnabled;
+    _camToggleLock = false;
 }}
 
 function renderCameras(data) {{
@@ -1510,6 +1516,7 @@ function renderCameras(data) {{
         cameraCluster.addLayer(m);
         cameraFlatGroup.addLayer(m);
     }});
+    if (!cameraClusteringEnabled) cameraCluster.clearLayers();
 }}
 
 renderCameras(cameraDataFull);
@@ -1560,22 +1567,19 @@ var layersControl = L.control.layers({{}}, overlayLayers, {{collapsed: true}}).a
 
 // Синхронизация кнопки группировки камер с контроем слоёв
 map.on('overlayremove', function(e) {{
-    if (e.name === 'Камеры') {{
+    if (e.name === 'Камеры' && !_camToggleLock) {{
         if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
         var btn = document.querySelector('.cam-cluster-toggle-btn');
         if (btn) btn.classList.add('clusters-toggle-disabled');
     }}
 }});
 map.on('overlayadd', function(e) {{
-    if (e.name === 'Камеры') {{
+    if (e.name === 'Камеры' && !_camToggleLock) {{
         var btn = document.querySelector('.cam-cluster-toggle-btn');
         if (btn) btn.classList.remove('clusters-toggle-disabled');
         if (!cameraClusteringEnabled) {{
-            // Пользователь включил слой, но режим — плоский
-            setTimeout(function() {{
-                map.removeLayer(cameraCluster);
-                cameraFlatGroup.addTo(map);
-            }}, 0);
+            cameraCluster.clearLayers();
+            cameraFlatGroup.addTo(map);
         }}
     }}
 }});
@@ -2336,6 +2340,7 @@ var cameraCluster = L.markerClusterGroup({{
 }});
 var cameraClusterFlat = L.layerGroup();
 var cameraClusteringEnabled = true;
+var _camToggleLock = false;
 var cameraDataFull = {camera_markers_js};
 function renderClusterCameras(data) {{
     cameraCluster.clearLayers();
@@ -2346,21 +2351,24 @@ function renderClusterCameras(data) {{
         cameraCluster.addLayer(m);
         cameraClusterFlat.addLayer(m);
     }});
+    if (!cameraClusteringEnabled && map.hasLayer(cameraCluster)) cameraCluster.clearLayers();
 }}
 renderClusterCameras(cameraDataFull);
 // Камеры НЕ добавлены на карту по умолчанию — включаются через контроль слоёв
 
 function toggleCameraClustering() {{
-    var isOnMap = map.hasLayer(cameraCluster) || map.hasLayer(cameraClusterFlat);
-    if (!isOnMap) return;
+    if (!map.hasLayer(cameraCluster)) return;
+    _camToggleLock = true;
     if (cameraClusteringEnabled) {{
-        map.removeLayer(cameraCluster);
+        cameraCluster.clearLayers();
         cameraClusterFlat.addTo(map);
     }} else {{
+        cameraClusterFlat.eachLayer(function(m) {{ cameraCluster.addLayer(m); }});
+        cameraClusterFlat.clearLayers();
         map.removeLayer(cameraClusterFlat);
-        cameraCluster.addTo(map);
     }}
     cameraClusteringEnabled = !cameraClusteringEnabled;
+    _camToggleLock = false;
 }}
 
 // --- Кнопка группировки камер ---
@@ -2369,14 +2377,14 @@ camClusterToggleBtn.onAdd = function() {{
     var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
     var a = L.DomUtil.create('a', 'cam-cluster-toggle-btn', div);
     a.href = '#';
-    a.title = 'Группировка: ВКЛ';
+    a.title = 'Группировка камер: ВКЛ';
     a.innerHTML = '⊞';
     a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
         L.DomEvent.stopPropagation(e);
         toggleCameraClustering();
-        a.title = cameraClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.title = cameraClusteringEnabled ? 'Группировка камер: ВКЛ' : 'Группировка камер: ВЫКЛ';
         a.innerHTML = cameraClusteringEnabled ? '⊞' : '⋯';
         a.style.background = cameraClusteringEnabled ? '' : '#ffb74d';
     }});
@@ -2638,21 +2646,19 @@ L.control.layers({{}}, overlayLayers, {{collapsed: true}}).addTo(map);
 
 // Синхронизация кнопки группировки камер с контроем слоёв
 map.on('overlayremove', function(e) {{
-    if (e.name === 'Камеры') {{
+    if (e.name === 'Камеры' && !_camToggleLock) {{
         if (map.hasLayer(cameraClusterFlat)) map.removeLayer(cameraClusterFlat);
         var btn = document.querySelector('.cam-cluster-toggle-btn');
         if (btn) btn.classList.add('clusters-toggle-disabled');
     }}
 }});
 map.on('overlayadd', function(e) {{
-    if (e.name === 'Камеры') {{
+    if (e.name === 'Камеры' && !_camToggleLock) {{
         var btn = document.querySelector('.cam-cluster-toggle-btn');
         if (btn) btn.classList.remove('clusters-toggle-disabled');
         if (!cameraClusteringEnabled) {{
-            setTimeout(function() {{
-                map.removeLayer(cameraCluster);
-                cameraClusterFlat.addTo(map);
-            }}, 0);
+            cameraCluster.clearLayers();
+            cameraClusterFlat.addTo(map);
         }}
     }}
 }});
@@ -3024,11 +3030,12 @@ curDtpCluster.addTo(map);
 
 function togglePointDtpClustering() {{
     if (pointDtpClusteringEnabled) {{
-        map.removeLayer(curDtpCluster);
+        curDtpCluster.clearLayers();
         curDtpFlatGroup.addTo(map);
     }} else {{
+        curDtpFlatGroup.eachLayer(function(m) {{ curDtpCluster.addLayer(m); }});
+        curDtpFlatGroup.clearLayers();
         map.removeLayer(curDtpFlatGroup);
-        curDtpCluster.addTo(map);
     }}
     pointDtpClusteringEnabled = !pointDtpClusteringEnabled;
 }}
@@ -3038,14 +3045,14 @@ pointDtpToggleBtn.onAdd = function() {{
     var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
     var a = L.DomUtil.create('a', 'point-dtp-toggle-btn', div);
     a.href = '#';
-    a.title = 'Группировка: ВКЛ';
+    a.title = 'Группировка ДТП: ВКЛ';
     a.innerHTML = '⊞';
     a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
         L.DomEvent.stopPropagation(e);
         togglePointDtpClustering();
-        a.title = pointDtpClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.title = pointDtpClusteringEnabled ? 'Группировка ДТП: ВКЛ' : 'Группировка ДТП: ВЫКЛ';
         a.innerHTML = pointDtpClusteringEnabled ? '⊞' : '⋯';
         a.style.background = pointDtpClusteringEnabled ? '' : '#ffb74d';
     }});
@@ -3100,11 +3107,12 @@ cameraCluster.addTo(map);
 
 function togglePointCamClustering() {{
     if (pointCamClusteringEnabled) {{
-        map.removeLayer(cameraCluster);
+        cameraCluster.clearLayers();
         cameraFlatGroup.addTo(map);
     }} else {{
+        cameraFlatGroup.eachLayer(function(m) {{ cameraCluster.addLayer(m); }});
+        cameraFlatGroup.clearLayers();
         map.removeLayer(cameraFlatGroup);
-        cameraCluster.addTo(map);
     }}
     pointCamClusteringEnabled = !pointCamClusteringEnabled;
 }}
@@ -3114,14 +3122,14 @@ pointCamToggleBtn.onAdd = function() {{
     var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
     var a = L.DomUtil.create('a', 'point-cam-toggle-btn', div);
     a.href = '#';
-    a.title = 'Группировка: ВКЛ';
+    a.title = 'Группировка камер: ВКЛ';
     a.innerHTML = '⊞';
     a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
     L.DomEvent.on(a, 'click', function(e) {{
         L.DomEvent.preventDefault(e);
         L.DomEvent.stopPropagation(e);
         togglePointCamClustering();
-        a.title = pointCamClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.title = pointCamClusteringEnabled ? 'Группировка камер: ВКЛ' : 'Группировка камер: ВЫКЛ';
         a.innerHTML = pointCamClusteringEnabled ? '⊞' : '⋯';
         a.style.background = pointCamClusteringEnabled ? '' : '#ffb74d';
     }});
