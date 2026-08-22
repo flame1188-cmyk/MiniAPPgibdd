@@ -1172,12 +1172,13 @@ function clearCoordSearch() {
     ) -> str:
         """JavaScript-код карты ДТП с фильтрами."""
         return f"""
-var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
+var map = L.map('map', {attributionControl: false}).setView([{center[0]}, {center[1]}], {zoom});
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    attribution: '&copy; OpenStreetMap contributors',
+    attribution: false,
     maxZoom: 19,
 }}).addTo(map);
+L.control.attribution({{position:'bottomright',prefix:false}}).addTo(map).addAttribution('© OpenStreetMap contributors · Leaflet');
 
 // --- Линейка (собственная реализация без внешних зависимостей) ---
 var rulerActive = false;
@@ -1329,9 +1330,12 @@ var dtpCluster = L.markerClusterGroup({{
         }});
     }}
 }});
+var dtpFlatGroup = L.layerGroup();
+var dtpClusteringEnabled = true;
 
 function renderDtp(data) {{
     dtpCluster.clearLayers();
+    dtpFlatGroup.clearLayers();
     L.geoJSON(data, {{
         pointToLayer: function(feature, latlng) {{
             return L.circleMarker(latlng, {{
@@ -1345,8 +1349,20 @@ function renderDtp(data) {{
         onEachFeature: function(feature, layer) {{
             layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
             dtpCluster.addLayer(layer);
+            dtpFlatGroup.addLayer(layer);
         }}
     }});
+}}
+
+function toggleDtpClustering() {{
+    if (dtpClusteringEnabled) {{
+        map.removeLayer(dtpCluster);
+        dtpFlatGroup.addTo(map);
+    }} else {{
+        map.removeLayer(dtpFlatGroup);
+        dtpCluster.addTo(map);
+    }}
+    dtpClusteringEnabled = !dtpClusteringEnabled;
 }}
 
 // Первичная отрисовка всех ДТП
@@ -1388,6 +1404,27 @@ document.getElementById('filter_reset').addEventListener('click', function() {{
     document.getElementById('filter_count').textContent =
         dtpData.features.length + ' ДТП';
 }});
+
+// --- Кнопка группировки ДТП ---
+var clusterToggleBtn = L.control({{position: 'topleft'}});
+clusterToggleBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'cluster-toggle-btn', div);
+    a.href = '#';
+    a.title = 'Группировка: ВКЛ';
+    a.innerHTML = '🔍';
+    a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
+        toggleDtpClustering();
+        a.title = dtpClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.innerHTML = dtpClusteringEnabled ? '🔍' : '📌';
+        a.style.background = dtpClusteringEnabled ? '' : '#ffb74d';
+    }});
+    return div;
+}};
+clusterToggleBtn.addTo(map);
 
 // --- Слой камер (кластеризация) ---
 var cameraIcon = L.divIcon({{
@@ -1463,7 +1500,7 @@ var overlayLayers = {{"ДТП": dtpCluster}};
 if ({str(has_cameras).lower()}) {{
     overlayLayers["Камеры"] = cameraCluster;
 }}
-L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
+L.control.layers({{}}, overlayLayers, {{collapsed: true}}).addTo(map);
 """
 
     # --------------------------------------------------
@@ -2019,12 +2056,13 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
         ДТП очагов и предочагов разделены по слоям.
         """
         return f"""
-var map = L.map('map').setView([{center[0]}, {center[1]}], {zoom});
+var map = L.map('map', {attributionControl: false}).setView([{center[0]}, {center[1]}], {zoom});
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    attribution: '&copy; OpenStreetMap contributors',
+    attribution: false,
     maxZoom: 19,
 }}).addTo(map);
+L.control.attribution({{position:'bottomright',prefix:false}}).addTo(map).addAttribution('© OpenStreetMap contributors · Leaflet');
 
 // --- Линейка (собственная реализация без внешних зависимостей) ---
 var rulerActive = false;
@@ -2218,13 +2256,53 @@ var cameraCluster = L.markerClusterGroup({{
         }});
     }}
 }});
+var cameraClusterFlat = L.layerGroup();
+var cameraClusteringEnabled = true;
 var cameraDataFull = {camera_markers_js};
-cameraDataFull.forEach(function(c) {{
-    L.marker([c.lat, c.lon], {{icon: cameraIcon}})
-     .bindPopup(c.popup, {{maxWidth: 320}})
-     .addTo(cameraCluster);
-}});
-cameraCluster.addTo(map);
+function renderClusterCameras(data) {{
+    cameraCluster.clearLayers();
+    cameraClusterFlat.clearLayers();
+    data.forEach(function(c) {{
+        var m = L.marker([c.lat, c.lon], {{icon: cameraIcon}})
+         .bindPopup(c.popup, {{maxWidth: 320}});
+        cameraCluster.addLayer(m);
+        cameraClusterFlat.addLayer(m);
+    }});
+}}
+renderClusterCameras(cameraDataFull);
+// Камеры НЕ добавлены на карту по умолчанию — включаются через контроль слоёв
+
+function toggleCameraClustering() {{
+    if (cameraClusteringEnabled) {{
+        map.removeLayer(cameraCluster);
+        cameraClusterFlat.addTo(map);
+    }} else {{
+        map.removeLayer(cameraClusterFlat);
+        cameraCluster.addTo(map);
+    }}
+    cameraClusteringEnabled = !cameraClusteringEnabled;
+}}
+
+// --- Кнопка группировки камер ---
+var camClusterToggleBtn = L.control({{position: 'topleft'}});
+camClusterToggleBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'cam-cluster-toggle-btn', div);
+    a.href = '#';
+    a.title = 'Группировка: ВКЛ';
+    a.innerHTML = '🔍';
+    a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
+        toggleCameraClustering();
+        a.title = cameraClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.innerHTML = cameraClusteringEnabled ? '🔍' : '📌';
+        a.style.background = cameraClusteringEnabled ? '' : '#ffb74d';
+    }});
+    return div;
+}};
+camClusterToggleBtn.addTo(map);
 
 // --- Функция отрисовки очага/предочага/исчезнувшего/АППГ-повторённого ---
 function drawClusterGroup(data, zoneLayer, dtpLayer, isPre, isLost, isPrevMatched) {{
@@ -2442,20 +2520,13 @@ if (preclusterData.length > 0) {{
     drawClusterGroup(preclusterData, preclusterLayer, dtpPreclusterLayer, true, false, false);
 }}
 
-// Добавляем слои на карту (исчезнувшие и АППГ-повторённые по умолчанию включены, но можно выключить)
+// По умолчанию: только очаги текущего года + ДТП + АППГ(повторённые) + ДТП.
+// Остальные слои доступны через контроль слоёв, но выключены.
 dtpClusterLayer.addTo(map);
 clusterLayer.addTo(map);
 if (prevMatchedData.length > 0) {{
     prevMatchedClusterLayer.addTo(map);
     dtpPrevMatchedLayer.addTo(map);
-}}
-if (lostData.length > 0) {{
-    lostClusterLayer.addTo(map);
-    dtpLostLayer.addTo(map);
-}}
-// Линии связи показываем только если они есть
-if (neighborLinkLayer.getLayers().length > 0) {{
-    neighborLinkLayer.addTo(map);
 }}
 
 // --- Управление слоями ---
@@ -2480,16 +2551,23 @@ if (preclusterData.length > 0) {{
 }}
 if ({str(has_cameras).lower()}) overlayLayers["Камеры"] = cameraCluster;
 
-L.control.layers({{}}, overlayLayers, {{collapsed: false}}).addTo(map);
+L.control.layers({{}}, overlayLayers, {{collapsed: true}}).addTo(map);
 
 // --- Фильтр камер по модели (множественный выбор) ---
-function renderCameras(data) {{
-    cameraCluster.clearLayers();
-    data.forEach(function(c) {{
-        L.marker([c.lat, c.lon], {{icon: cameraIcon}})
-         .bindPopup(c.popup, {{maxWidth: 320}})
-         .addTo(cameraCluster);
+function applyClusterCameraFilter() {{
+    updateMultiSelectLabel('camera_model_multi');
+    var selected = getSelectedModels('camera_model_multi');
+    var filtered = cameraDataFull.filter(function(c) {{
+        return selected.length === 0 || selected.indexOf(c.model) !== -1;
     }});
+    renderClusterCameras(filtered);
+    // Keep camera layer on map after re-render
+    if (!map.hasLayer(cameraCluster) && !map.hasLayer(cameraClusterFlat)) {{
+        if (cameraClusteringEnabled) cameraCluster.addTo(map);
+        else cameraClusterFlat.addTo(map);
+    }}
+    var cntEl = document.getElementById('camera_filter_count');
+    if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
 }}
 function toggleMultiSelect(id) {{
     var dd = document.querySelector('#' + id + ' .multi-select-dropdown');
@@ -2515,16 +2593,7 @@ function updateMultiSelectLabel(id) {{
         lbl.textContent = sel.length + ' выбрано';
     }}
 }}
-function applyClusterCameraFilter() {{
-    updateMultiSelectLabel('camera_model_multi');
-    var selected = getSelectedModels('camera_model_multi');
-    var filtered = cameraDataFull.filter(function(c) {{
-        return selected.length === 0 || selected.indexOf(c.model) !== -1;
-    }});
-    renderCameras(filtered);
-    var cntEl = document.getElementById('camera_filter_count');
-    if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
-}}
+// applyClusterCameraFilter moved above
 """
 
     # --------------------------------------------------
@@ -2663,12 +2732,13 @@ function applyClusterCameraFilter() {{
     ) -> str:
         """JavaScript-код карты точки."""
         return f"""
-var map = L.map('map').setView([{lat}, {lon}], 15);
+var map = L.map('map', {attributionControl: false}).setView([{lat}, {lon}], 15);
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    attribution: '&copy; OpenStreetMap contributors',
+    attribution: false,
     maxZoom: 19,
 }}).addTo(map);
+L.control.attribution({{position:'bottomright',prefix:false}}).addTo(map).addAttribution('© OpenStreetMap contributors · Leaflet');
 
 // --- Линейка (собственная реализация без внешних зависимостей) ---
 var rulerActive = false;
@@ -2829,6 +2899,9 @@ var curDtpCluster = L.markerClusterGroup({{
         }});
     }}
 }});
+var curDtpFlatGroup = L.layerGroup();
+var pointDtpClusteringEnabled = true;
+var curDtpLayers = [];
 L.geoJSON({dtp_geojson}, {{
     pointToLayer: function(feature, latlng) {{
         return L.circleMarker(latlng, {{
@@ -2839,9 +2912,42 @@ L.geoJSON({dtp_geojson}, {{
     onEachFeature: function(feature, layer) {{
         layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
         curDtpCluster.addLayer(layer);
+        curDtpFlatGroup.addLayer(layer);
+        curDtpLayers.push(layer);
     }}
 }});
 curDtpCluster.addTo(map);
+
+function togglePointDtpClustering() {{
+    if (pointDtpClusteringEnabled) {{
+        map.removeLayer(curDtpCluster);
+        curDtpFlatGroup.addTo(map);
+    }} else {{
+        map.removeLayer(curDtpFlatGroup);
+        curDtpCluster.addTo(map);
+    }}
+    pointDtpClusteringEnabled = !pointDtpClusteringEnabled;
+}}
+
+var pointDtpToggleBtn = L.control({{position: 'topleft'}});
+pointDtpToggleBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'point-dtp-toggle-btn', div);
+    a.href = '#';
+    a.title = 'Группировка: ВКЛ';
+    a.innerHTML = '🔍';
+    a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
+        togglePointDtpClustering();
+        a.title = pointDtpClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.innerHTML = pointDtpClusteringEnabled ? '🔍' : '📌';
+        a.style.background = pointDtpClusteringEnabled ? '' : '#ffb74d';
+    }});
+    return div;
+}};
+pointDtpToggleBtn.addTo(map);
 
 // --- ДТП прошлого периода ---
 var prevDtpLayer = L.layerGroup();
@@ -2877,13 +2983,47 @@ var cameraCluster = L.markerClusterGroup({{
         }});
     }}
 }});
+var cameraFlatGroup = L.layerGroup();
+var pointCamClusteringEnabled = true;
 var cameraData = {camera_markers_js};
 cameraData.forEach(function(c) {{
-    L.marker([c.lat, c.lon], {{icon: cameraIcon}})
-     .bindPopup(c.popup + '<br>Расстояние: ' + c.distance_m + ' м', {{maxWidth: 320}})
-     .addTo(cameraCluster);
+    var m = L.marker([c.lat, c.lon], {{icon: cameraIcon}})
+     .bindPopup(c.popup + '<br>Расстояние: ' + c.distance_m + ' м', {{maxWidth: 320}});
+    cameraCluster.addLayer(m);
+    cameraFlatGroup.addLayer(m);
 }});
 cameraCluster.addTo(map);
+
+function togglePointCamClustering() {{
+    if (pointCamClusteringEnabled) {{
+        map.removeLayer(cameraCluster);
+        cameraFlatGroup.addTo(map);
+    }} else {{
+        map.removeLayer(cameraFlatGroup);
+        cameraCluster.addTo(map);
+    }}
+    pointCamClusteringEnabled = !pointCamClusteringEnabled;
+}}
+
+var pointCamToggleBtn = L.control({{position: 'topleft'}});
+pointCamToggleBtn.onAdd = function() {{
+    var div = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+    var a = L.DomUtil.create('a', 'point-cam-toggle-btn', div);
+    a.href = '#';
+    a.title = 'Группировка: ВКЛ';
+    a.innerHTML = '🔍';
+    a.style.cssText = 'font-size:15px;line-height:26px;text-align:center;display:block;width:26px;height:26px;';
+    L.DomEvent.on(a, 'click', function(e) {{
+        L.DomEvent.preventDefault(e);
+        L.DomEvent.stopPropagation(e);
+        togglePointCamClustering();
+        a.title = pointCamClusteringEnabled ? 'Группировка: ВКЛ' : 'Группировка: ВЫКЛ';
+        a.innerHTML = pointCamClusteringEnabled ? '🔍' : '📌';
+        a.style.background = pointCamClusteringEnabled ? '' : '#ffb74d';
+    }});
+    return div;
+}};
+pointCamToggleBtn.addTo(map);
 
 // --- Слои ---
 var overlays = {{
@@ -2892,7 +3032,7 @@ var overlays = {{
 if ({str(has_prev).lower()}) overlays["ДТП (прошлый период)"] = prevDtpLayer;
 if ({str(has_cameras).lower()}) overlays["Камеры"] = cameraCluster;
 
-L.control.layers({{}}, overlays, {{collapsed: false}}).addTo(map);
+L.control.layers({{}}, overlays, {{collapsed: true}}).addTo(map);
 
 // Подгоняем карту под круг
 map.fitBounds(L.circle([{lat}, {lon}], {{radius: {radius_m}}}).getBounds());
