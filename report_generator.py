@@ -718,21 +718,23 @@ body {
   padding: 3px 8px;
 }
 .ruler-tip::before { border-top-color: #d32f2f !important; }
-/* Кнопка слоёв: показываем значок без внешней картинки */
+/* Кнопка слоёв: SVG-иконка (три полоски) */
 .leaflet-control-layers-toggle {
-  background-image: none !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23333' stroke-width='2.5' stroke-linecap='round'%3E%3Cline x1='5' y1='6' x2='19' y2='6'/%3E%3Cline x1='5' y1='12' x2='19' y2='12'/%3E%3Cline x1='5' y1='18' x2='19' y2='18'/%3E%3C/svg%3E") !important;
+  background-size: 18px 18px !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
   background-color: white !important;
   width: 30px !important;
   height: 30px !important;
   text-indent: 0 !important;
-  font-size: 18px !important;
+  font-size: 0 !important;
   line-height: 30px !important;
   text-align: center !important;
-  color: #333 !important;
 }
 .leaflet-control-layers-toggle::before {
-  content: '\2261';
-  display: block;
+  content: none;
+  display: none;
 }
 .clusters-toggle-disabled {
   opacity: 0.4 !important;
@@ -1353,8 +1355,14 @@ var dtpCluster = L.markerClusterGroup({{
 var dtpFlatGroup = L.layerGroup();
 var dtpClusteringEnabled = true;
 
+function _mcgClear(mcg) {{
+    mcg.clearLayers();
+    mcg._layers = {{}};
+}}
+
 function renderDtp(data) {{
-    dtpCluster.clearLayers();
+    if (map.hasLayer(dtpFlatGroup)) map.removeLayer(dtpFlatGroup);
+    _mcgClear(dtpCluster);
     dtpFlatGroup.clearLayers();
     L.geoJSON(data, {{
         pointToLayer: function(feature, latlng) {{
@@ -1372,18 +1380,28 @@ function renderDtp(data) {{
             dtpFlatGroup.addLayer(layer);
         }}
     }});
+    if (!dtpClusteringEnabled) {{
+        _mcgClear(dtpCluster);
+        dtpFlatGroup.addTo(map);
+    }}
 }}
 
 function toggleDtpClustering() {{
     if (dtpClusteringEnabled) {{
-        dtpCluster.clearLayers();
-        dtpFlatGroup.addTo(map);
+        var _m = [];
+        dtpCluster.eachLayer(function(m) {{ _m.push(m); }});
+        _mcgClear(dtpCluster);
+        for (var i = 0; i < _m.length; i++) dtpFlatGroup.addLayer(_m[i]);
+        if (!map.hasLayer(dtpFlatGroup)) dtpFlatGroup.addTo(map);
     }} else {{
-        dtpFlatGroup.eachLayer(function(m) {{ dtpCluster.addLayer(m); }});
+        var _m = [];
+        dtpFlatGroup.eachLayer(function(m) {{ _m.push(m); }});
         dtpFlatGroup.clearLayers();
-        map.removeLayer(dtpFlatGroup);
+        if (map.hasLayer(dtpFlatGroup)) map.removeLayer(dtpFlatGroup);
+        for (var i = 0; i < _m.length; i++) dtpCluster.addLayer(_m[i]);
     }}
     dtpClusteringEnabled = !dtpClusteringEnabled;
+    setTimeout(function() {{ map.invalidateSize(); }}, 0);
 }}
 
 // Первичная отрисовка всех ДТП
@@ -1496,19 +1514,26 @@ function toggleCameraClustering() {{
     if (!map.hasLayer(cameraCluster)) return;
     _camToggleLock = true;
     if (cameraClusteringEnabled) {{
-        cameraCluster.clearLayers();
-        cameraFlatGroup.addTo(map);
+        var _m = [];
+        cameraCluster.eachLayer(function(m) {{ _m.push(m); }});
+        _mcgClear(cameraCluster);
+        for (var i = 0; i < _m.length; i++) cameraFlatGroup.addLayer(_m[i]);
+        if (!map.hasLayer(cameraFlatGroup)) cameraFlatGroup.addTo(map);
     }} else {{
-        cameraFlatGroup.eachLayer(function(m) {{ cameraCluster.addLayer(m); }});
+        var _m = [];
+        cameraFlatGroup.eachLayer(function(m) {{ _m.push(m); }});
         cameraFlatGroup.clearLayers();
-        map.removeLayer(cameraFlatGroup);
+        if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
+        for (var i = 0; i < _m.length; i++) cameraCluster.addLayer(_m[i]);
     }}
     cameraClusteringEnabled = !cameraClusteringEnabled;
+    setTimeout(function() {{ map.invalidateSize(); }}, 0);
     _camToggleLock = false;
 }}
 
 function renderCameras(data) {{
-    cameraCluster.clearLayers();
+    if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
+    _mcgClear(cameraCluster);
     cameraFlatGroup.clearLayers();
     data.forEach(function(c) {{
         var m = L.marker([c.lat, c.lon], {{icon: cameraIcon}})
@@ -1516,7 +1541,10 @@ function renderCameras(data) {{
         cameraCluster.addLayer(m);
         cameraFlatGroup.addLayer(m);
     }});
-    if (!cameraClusteringEnabled) cameraCluster.clearLayers();
+    if (!cameraClusteringEnabled) {{
+        _mcgClear(cameraCluster);
+        if (map.hasLayer(cameraCluster)) cameraFlatGroup.addTo(map);
+    }}
 }}
 
 renderCameras(cameraDataFull);
@@ -1578,7 +1606,7 @@ map.on('overlayadd', function(e) {{
         var btn = document.querySelector('.cam-cluster-toggle-btn');
         if (btn) btn.classList.remove('clusters-toggle-disabled');
         if (!cameraClusteringEnabled) {{
-            cameraCluster.clearLayers();
+            _mcgClear(cameraCluster);
             cameraFlatGroup.addTo(map);
         }}
     }}
@@ -2341,9 +2369,14 @@ var cameraCluster = L.markerClusterGroup({{
 var cameraClusterFlat = L.layerGroup();
 var cameraClusteringEnabled = true;
 var _camToggleLock = false;
+function _mcgClear(mcg) {{
+    mcg.clearLayers();
+    mcg._layers = {{}};
+}}
 var cameraDataFull = {camera_markers_js};
 function renderClusterCameras(data) {{
-    cameraCluster.clearLayers();
+    if (map.hasLayer(cameraClusterFlat)) map.removeLayer(cameraClusterFlat);
+    _mcgClear(cameraCluster);
     cameraClusterFlat.clearLayers();
     data.forEach(function(c) {{
         var m = L.marker([c.lat, c.lon], {{icon: cameraIcon}})
@@ -2351,7 +2384,10 @@ function renderClusterCameras(data) {{
         cameraCluster.addLayer(m);
         cameraClusterFlat.addLayer(m);
     }});
-    if (!cameraClusteringEnabled && map.hasLayer(cameraCluster)) cameraCluster.clearLayers();
+    if (!cameraClusteringEnabled && map.hasLayer(cameraCluster)) {{
+        _mcgClear(cameraCluster);
+        cameraClusterFlat.addTo(map);
+    }}
 }}
 renderClusterCameras(cameraDataFull);
 // Камеры НЕ добавлены на карту по умолчанию — включаются через контроль слоёв
@@ -2360,14 +2396,20 @@ function toggleCameraClustering() {{
     if (!map.hasLayer(cameraCluster)) return;
     _camToggleLock = true;
     if (cameraClusteringEnabled) {{
-        cameraCluster.clearLayers();
-        cameraClusterFlat.addTo(map);
+        var _m = [];
+        cameraCluster.eachLayer(function(m) {{ _m.push(m); }});
+        _mcgClear(cameraCluster);
+        for (var i = 0; i < _m.length; i++) cameraClusterFlat.addLayer(_m[i]);
+        if (!map.hasLayer(cameraClusterFlat)) cameraClusterFlat.addTo(map);
     }} else {{
-        cameraClusterFlat.eachLayer(function(m) {{ cameraCluster.addLayer(m); }});
+        var _m = [];
+        cameraClusterFlat.eachLayer(function(m) {{ _m.push(m); }});
         cameraClusterFlat.clearLayers();
-        map.removeLayer(cameraClusterFlat);
+        if (map.hasLayer(cameraClusterFlat)) map.removeLayer(cameraClusterFlat);
+        for (var i = 0; i < _m.length; i++) cameraCluster.addLayer(_m[i]);
     }}
     cameraClusteringEnabled = !cameraClusteringEnabled;
+    setTimeout(function() {{ map.invalidateSize(); }}, 0);
     _camToggleLock = false;
 }}
 
@@ -2657,7 +2699,7 @@ map.on('overlayadd', function(e) {{
         var btn = document.querySelector('.cam-cluster-toggle-btn');
         if (btn) btn.classList.remove('clusters-toggle-disabled');
         if (!cameraClusteringEnabled) {{
-            cameraCluster.clearLayers();
+            _mcgClear(cameraCluster);
             cameraClusterFlat.addTo(map);
         }}
     }}
@@ -2995,6 +3037,10 @@ L.circle([{lat}, {lon}], {{
 }}).addTo(map);
 
 // --- ДТП текущего периода (кластеризация) ---
+function _mcgClear(mcg) {{
+    mcg.clearLayers();
+    mcg._layers = {{}};
+}}
 var curDtpCluster = L.markerClusterGroup({{
     maxClusterRadius: 40,
     spiderfyOnMaxZoom: true,
@@ -3012,32 +3058,50 @@ var curDtpCluster = L.markerClusterGroup({{
 var curDtpFlatGroup = L.layerGroup();
 var pointDtpClusteringEnabled = true;
 var curDtpLayers = [];
-L.geoJSON({dtp_geojson}, {{
-    pointToLayer: function(feature, latlng) {{
-        return L.circleMarker(latlng, {{
-            radius: 6, fillColor: feature.properties.color,
-            color: '#333', weight: 1, fillOpacity: 0.8
-        }});
-    }},
-    onEachFeature: function(feature, layer) {{
-        layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
-        curDtpCluster.addLayer(layer);
-        curDtpFlatGroup.addLayer(layer);
-        curDtpLayers.push(layer);
+var pointDtpGeoJson = {dtp_geojson};
+function renderPointDtp() {{
+    if (map.hasLayer(curDtpFlatGroup)) map.removeLayer(curDtpFlatGroup);
+    _mcgClear(curDtpCluster);
+    curDtpFlatGroup.clearLayers();
+    curDtpLayers = [];
+    L.geoJSON(pointDtpGeoJson, {{
+        pointToLayer: function(feature, latlng) {{
+            return L.circleMarker(latlng, {{
+                radius: 6, fillColor: feature.properties.color,
+                color: '#333', weight: 1, fillOpacity: 0.8
+            }});
+        }},
+        onEachFeature: function(feature, layer) {{
+            layer.bindPopup(feature.properties.popup, {{maxWidth: 320}});
+            curDtpCluster.addLayer(layer);
+            curDtpFlatGroup.addLayer(layer);
+            curDtpLayers.push(layer);
+        }}
+    }});
+    if (!pointDtpClusteringEnabled) {{
+        _mcgClear(curDtpCluster);
+        curDtpFlatGroup.addTo(map);
     }}
-}});
+}}
+renderPointDtp();
 curDtpCluster.addTo(map);
 
 function togglePointDtpClustering() {{
     if (pointDtpClusteringEnabled) {{
-        curDtpCluster.clearLayers();
-        curDtpFlatGroup.addTo(map);
+        var _m = [];
+        curDtpCluster.eachLayer(function(m) {{ _m.push(m); }});
+        _mcgClear(curDtpCluster);
+        for (var i = 0; i < _m.length; i++) curDtpFlatGroup.addLayer(_m[i]);
+        if (!map.hasLayer(curDtpFlatGroup)) curDtpFlatGroup.addTo(map);
     }} else {{
-        curDtpFlatGroup.eachLayer(function(m) {{ curDtpCluster.addLayer(m); }});
+        var _m = [];
+        curDtpFlatGroup.eachLayer(function(m) {{ _m.push(m); }});
         curDtpFlatGroup.clearLayers();
-        map.removeLayer(curDtpFlatGroup);
+        if (map.hasLayer(curDtpFlatGroup)) map.removeLayer(curDtpFlatGroup);
+        for (var i = 0; i < _m.length; i++) curDtpCluster.addLayer(_m[i]);
     }}
     pointDtpClusteringEnabled = !pointDtpClusteringEnabled;
+    setTimeout(function() {{ map.invalidateSize(); }}, 0);
 }}
 
 var pointDtpToggleBtn = L.control({{position: 'topleft'}});
@@ -3097,24 +3161,40 @@ var cameraCluster = L.markerClusterGroup({{
 var cameraFlatGroup = L.layerGroup();
 var pointCamClusteringEnabled = true;
 var cameraData = {camera_markers_js};
-cameraData.forEach(function(c) {{
-    var m = L.marker([c.lat, c.lon], {{icon: cameraIcon}})
-     .bindPopup(c.popup + '<br>Расстояние: ' + c.distance_m + ' м', {{maxWidth: 320}});
-    cameraCluster.addLayer(m);
-    cameraFlatGroup.addLayer(m);
-}});
+function renderPointCameras() {{
+    if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
+    _mcgClear(cameraCluster);
+    cameraFlatGroup.clearLayers();
+    cameraData.forEach(function(c) {{
+        var m = L.marker([c.lat, c.lon], {{icon: cameraIcon}})
+         .bindPopup(c.popup + '<br>Расстояние: ' + c.distance_m + ' м', {{maxWidth: 320}});
+        cameraCluster.addLayer(m);
+        cameraFlatGroup.addLayer(m);
+    }});
+    if (!pointCamClusteringEnabled) {{
+        _mcgClear(cameraCluster);
+        cameraFlatGroup.addTo(map);
+    }}
+}}
+renderPointCameras();
 cameraCluster.addTo(map);
 
 function togglePointCamClustering() {{
     if (pointCamClusteringEnabled) {{
-        cameraCluster.clearLayers();
-        cameraFlatGroup.addTo(map);
+        var _m = [];
+        cameraCluster.eachLayer(function(m) {{ _m.push(m); }});
+        _mcgClear(cameraCluster);
+        for (var i = 0; i < _m.length; i++) cameraFlatGroup.addLayer(_m[i]);
+        if (!map.hasLayer(cameraFlatGroup)) cameraFlatGroup.addTo(map);
     }} else {{
-        cameraFlatGroup.eachLayer(function(m) {{ cameraCluster.addLayer(m); }});
+        var _m = [];
+        cameraFlatGroup.eachLayer(function(m) {{ _m.push(m); }});
         cameraFlatGroup.clearLayers();
-        map.removeLayer(cameraFlatGroup);
+        if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
+        for (var i = 0; i < _m.length; i++) cameraCluster.addLayer(_m[i]);
     }}
     pointCamClusteringEnabled = !pointCamClusteringEnabled;
+    setTimeout(function() {{ map.invalidateSize(); }}, 0);
 }}
 
 var pointCamToggleBtn = L.control({{position: 'topleft'}});
