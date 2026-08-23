@@ -75,6 +75,9 @@ SETTLEMENT_ROAD_GPS_MAX_M = 2500  # 2.5 км
 NON_SETTLEMENT_WINDOW_KM = 1.0
 # Окно для вне НП без пикетажа (км)
 NON_SETTLEMENT_NO_PK_WINDOW_KM = 0.2  # 200 метров
+# Максимальный разброс по GPS для очага/предочага вне НП (метры).
+# Защита от кольцевых дорог, где пикетаж обнуляется.
+NON_SETTLEMENT_GPS_MAX_SPREAD_M = 10000  # 10 км
 
 # Пороги
 SAME_TYPE_THRESHOLD = 3   # 3+ ДТП одного вида = очаг
@@ -195,6 +198,29 @@ def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
     )
     c = 2 * math.asin(math.sqrt(min(a, 1.0)))
     return EARTH_RADIUS_KM * c * 1000.0
+
+
+def _max_gps_spread(cards: list[dict]) -> float:
+    """Максимальное расстояние (м) между любой парой ДТП в группе по координатам.
+
+    Защита от кольцевых дорог: если пикетаж обнуляется, ДТП с одинаковым
+    пикетажем могут быть географически удалены. Возвращает 0 если координат
+    меньше двух.
+    """
+    coords = [_parse_coords(c) for c in cards]
+    coords = [c for c in coords if c is not None]
+    if len(coords) < 2:
+        return 0.0
+    max_d = 0.0
+    for i in range(len(coords)):
+        for j in range(i + 1, len(coords)):
+            d = haversine_meters(
+                coords[i][0], coords[i][1],
+                coords[j][0], coords[j][1],
+            )
+            if d > max_d:
+                max_d = d
+    return max_d
 
 
 def _parse_coords(card: dict) -> tuple[float, float] | None:
@@ -2431,7 +2457,7 @@ def find_nonsettlement_preclusters(
             type_counter = Counter(_get_dtp_type(c) for c in group_cards)
             is_pre, _ = _check_precluster_criteria(type_counter, len(group_cards))
 
-            if is_pre:
+            if is_pre and _max_gps_spread(group_cards) <= NON_SETTLEMENT_GPS_MAX_SPREAD_M:
                 assigned.update(group_indices)
                 group_cards.sort(key=lambda c: _get_date(c))
 
@@ -2538,7 +2564,7 @@ def find_nonsettlement_concentration_points(cards: list[dict]) -> list[dict]:
             type_counter = Counter(_get_dtp_type(c) for c in group_cards)
             is_cluster, _ = _check_cluster_criteria(type_counter, len(group_cards))
 
-            if is_cluster:
+            if is_cluster and _max_gps_spread(group_cards) <= NON_SETTLEMENT_GPS_MAX_SPREAD_M:
                 assigned.update(group_indices)
                 group_cards.sort(key=lambda c: _get_date(c))
 
