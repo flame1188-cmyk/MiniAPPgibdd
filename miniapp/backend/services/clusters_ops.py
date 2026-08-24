@@ -77,12 +77,14 @@ def _push_clusters_state_to_redis(task: Task) -> None:
         )
 
 
-async def start_clusters_calculation(task: Task) -> None:
+async def start_clusters_calculation(task: Task, force_refresh: bool = False) -> None:
     """
     Асинхронный расчёт очагов концентрации ДТП.
 
     Длительная операция (15-30 сек): OSM Overpass + классификация +
     кластеризация + динамика vs прошлый год.
+
+    force_refresh: пропустить clusters_cache и пересчитать.
 
     Результат сохраняется в task.clusters_state.result.
 
@@ -116,74 +118,62 @@ async def start_clusters_calculation(task: Task) -> None:
         # === Этап 4: проверяем кэш очагов в PostgreSQL ===
         # Если для данного (reg_code, current_dat, prev_dat) уже есть
         # свежий result — берём его без пересчёта (15-30 сек → <100 мс).
-        # prev_dat_list вычисляем заранее, чтобы ключ кэша совпал с тем,
-        # что будет использоваться при PUT в конце функции.
-        try:
-            prev_dat_list_for_cache: List[str] = []
-            for dat in task.dat_list:
-                try:
-                    m, y = dat.split(".")
-                    prev_dat_list_for_cache.append(f"{m}.{int(y) - 1}")
-                except Exception:
-                    continue
+        # При force_refresh пропускаем кэш и всегда пересчитываем.
+        if not force_refresh:
+            try:
+                prev_dat_list_for_cache: List[str] = []
+                for dat in task.dat_list:
+                    try:
+                        m, y = dat.split(".")
+                        prev_dat_list_for_cache.append(f"{m}.{int(y) - 1}")
+                    except Exception:
+                        continue
 
-            from ..db.clusters_cache import get_cached_clusters
-            cached = await get_cached_clusters(
-                reg_code=task.region_code,
-                current_dat_list=task.dat_list,
-                prev_dat_list=prev_dat_list_for_cache if prev_dat_list_for_cache else None,
-            )
-            if cached is not None:
-                # Кэш хит. Если в кэше есть raw_clusters / raw_preclusters —
-                # восстанавливаем их и выходим (15-30 сек → <100 мс).
-                # Если они None (старая запись, созданная до Stage 4 fix,
-                # когда raw_clusters не сохранялся) — игнорируем кэш и идём
-                # штатным путём, иначе карта упадёт в simple map, а Excel
-                # вернёт None (Sprint 3.2 fix).
-                cached_result = cached["result"]
-                cached_raw_clusters = cached.get("raw_clusters")
-                cached_raw_preclusters = cached.get("raw_preclusters")
+                from ..db.clusters_cache import get_cached_clusters
+                cached = await get_cached_clusters(
+                    reg_code=task.region_code,
+                    current_dat_list=task.dat_list,
+                    prev_dat_list=prev_dat_list_for_cache if prev_dat_list_for_cache else None,
+                )
+                if cached is not None:
+                    cached_result = cached["result"]
+                    cached_raw_clusters = cached.get("raw_clusters")
+                    cached_raw_preclusters = cached.get("raw_preclusters")
 
-                has_raw = bool(cached_raw_clusters or cached_raw_preclusters)
+                    has_raw = bool(cached_raw_clusters or cached_raw_preclusters)
 
-                if not has_raw:
-                    # Старая запись без raw-данных. Протухнет сама по TTL,
-                    # а пока — игнорируем и пересчитываем. После пересчёта
-                    # put_cached_clusters сохранит уже полную запись (с raw).
-                    logger.info(
-                        f"Task {task.id}: clusters cache HIT, но raw_clusters/"
-                        f"raw_preclusters=None (старая запись) — "
-                        f"игнорируем кэш, пересчитываем"
-                    )
-                    # Важно: не выходим из функции, идём к штатному расчёту.
-                else:
-                    task.clusters_state.result = cached_result
-                    task.clusters_state.status = AnalysisStatus.DONE
-                    task.clusters_state.progress = 100
-                    task.clusters_state.stage = "Готово (из кэша)"
-                    task.clusters_state.started_at = datetime.now(timezone.utc)
-                    task.clusters_state.finished_at = datetime.now(timezone.utc)
+                    if not has_raw:
+                        logger.info(
+                            f"Task {task.id}: clusters cache HIT, но raw_clusters/"
+                            f"raw_preclusters=None (старая запись) — "
+                            f"игнорируем кэш, пересчитываем"
+                        )
+                    else:
+                        task.clusters_state.result = cached_result
+                        task.clusters_state.status = AnalysisStatus.DONE
+                        task.clusters_state.progress = 100
+                        task.clusters_state.stage = "Готово (из кэша)"
+                        task.clusters_state.started_at = datetime.now(timezone.utc)
+                        task.clusters_state.finished_at = datetime.now(timezone.utc)
 
-                    # Восстанавливаем raw-данные для карты/Excel.
-                    if cached_raw_clusters is not None:
-                        task.raw_clusters = cached_raw_clusters
-                    if cached_raw_preclusters is not None:
-                        task.raw_preclusters = cached_raw_preclusters
+                        if cached_raw_clusters is not None:
+                            task.raw_clusters = cached_raw_clusters
+                        if cached_raw_preclusters is not None:
+                            task.raw_preclusters = cached_raw_preclusters
 
-                    _push_clusters_state_to_redis(task)  # Phase C.4: cache hit → done
+                        _push_clusters_state_to_redis(task)
 
-                    logger.info(
-                        f"Task {task.id}: clusters loaded from cache — "
-                        f"{cached_result.get('total_clusters', 0)} очагов, "
-                        f"{cached_result.get('total_preclusters', 0)} предочагов, "
-                        f"raw=yes"
-                    )
-                    return
-        except Exception as exc:
-            logger.debug(
-                f"Task {task.id}: clusters cache lookup failed: {exc}"
-            )
-            # Не роняем расчёт — просто идём штатным путём.
+                        logger.info(
+                            f"Task {task.id}: clusters loaded from cache — "
+                            f"{cached_result.get('total_clusters', 0)} очагов, "
+                            f"{cached_result.get('total_preclusters', 0)} предочагов, "
+                            f"raw=yes"
+                        )
+                        return
+            except Exception as exc:
+                logger.debug(
+                    f"Task {task.id}: clusters cache lookup failed: {exc}"
+                )
 
         conc_module = _imports._import_module("concentration_points")
 

@@ -79,11 +79,12 @@ def _init_llm_semaphore() -> asyncio.Semaphore:
 _LLM_SEMAPHORE: asyncio.Semaphore = _init_llm_semaphore()
 
 
-async def start_llm_summary(task: Task, provider: str = "free") -> None:
+async def start_llm_summary(task: Task, provider: str = "free", force_refresh: bool = False) -> None:
     """
     Асинхронная генерация LLM-резюме.
 
     provider: "free" (ZhipuAI/GLM) или "paid" (DeepSeek).
+    force_refresh: пропустить LLM-кэш и перегенерировать.
 
     Внутри использует asyncio.wait_for с max duration (5 минут), чтобы
     при зависании LLM (бесконечные 5xx-ретраи, потеря соединения)
@@ -111,7 +112,7 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
     # Если cache hit — LLM не нужен, semaphore не нужен, ответ мгновенный.
     # Это позволяет 100+ одновременных cache hit без блокировок.
     try:
-        cached = await _check_llm_cache(task, provider, state)
+        cached = await _check_llm_cache(task, provider, state, force_refresh=force_refresh)
         if cached:
             return  # cache hit — done
     except Exception as exc:
