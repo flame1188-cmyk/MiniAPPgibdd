@@ -729,10 +729,10 @@ export const api = {
   // ============================================================
   // Analysis: Clusters (очаги)
   // ============================================================
-  startClusters: (taskId: string) =>
+  startClusters: (taskId: string, forceRefresh: boolean = false) =>
     request<ClustersResponse>(`/api/dtp/tasks/${taskId}/clusters`, {
       method: 'POST',
-      body: JSON.stringify({}),
+      body: JSON.stringify({ force_refresh: forceRefresh }),
     }),
 
   getClusters: (taskId: string, wait: number = 0) =>

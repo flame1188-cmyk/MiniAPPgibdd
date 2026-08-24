@@ -59,6 +59,8 @@ export function ClustersView({ task }: ClustersViewProps) {
   const [startError, setStartError] = useState<string | null>(null)
   const [excelLoading, setExcelLoading] = useState(false)
   const [excelError, setExcelError] = useState<string | null>(null)
+  // Флаг «пересчитываем» — пользователь нажал «Пересчитать» на готовом результате
+  const [refreshing, setRefreshing] = useState(false)
 
   // Опрашиваем только если пользователь запустил расчёт ИЛИ
   // если операция уже была запущена (например, в предыдущей сессии вкладки)
@@ -87,6 +89,7 @@ export function ClustersView({ task }: ClustersViewProps) {
     // Когда пришёл первый ответ со статусом running — локальный loading можно снять
     if (data?.state.status === 'running') {
       setStarting(false)
+      setRefreshing(false)
     }
   }, [data?.state.status])
 
@@ -105,6 +108,20 @@ export function ClustersView({ task }: ClustersViewProps) {
       setStartError(e?.message ?? 'Не удалось запустить расчёт')
       setStarting(false)
       setStarted(false)
+      haptic('error')
+    }
+  }
+
+  const handleRefresh = async () => {
+    setStartError(null)
+    setRefreshing(true)
+    setStarted(true)
+    haptic('medium')
+    try {
+      await api.startClusters(task.task_id, true)
+    } catch (e: any) {
+      setStartError(e?.message ?? 'Не удалось перезапустить расчёт')
+      setRefreshing(false)
       haptic('error')
     }
   }
@@ -401,6 +418,24 @@ export function ClustersView({ task }: ClustersViewProps) {
               АППГ-очагов, повторённых в текущем: <b>{summary.total_prev_matched}</b>
             </div>
           )}
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className="w-full py-2.5 rounded-xl font-medium text-xs mt-3 flex items-center justify-center gap-2"
+            style={{
+              backgroundColor: refreshing
+                ? 'var(--tg-color-secondary-bg, #f1f1f1)'
+                : 'var(--tg-color-secondary-bg, #f1f1f1)',
+              color: 'var(--tg-color-text, #333)',
+              opacity: refreshing ? 0.6 : 0.8,
+            }}
+          >
+            {refreshing ? (
+              <><span className="inline-block animate-spin">⏳</span> Пересчёт...</>
+            ) : (
+              <>↻ Пересчитать очаги</>
+            )}
+          </button>
         </div>
 
         {/* Динамика */}

@@ -59,6 +59,18 @@ from .connection import get_pool, is_db_ready
 
 logger = logging.getLogger(__name__)
 
+# ============================================================
+# Версия алгоритма кластеризации (Вариант 3: автоинвалидация кэша)
+# ============================================================
+# При изменении алгоритма (concentration_points.py) — увеличиваем
+# эту константу. Кэш с другой версией автоматически игнорируется
+# (treated as MISS), и расчёт пересчитывается с новой версией.
+#
+# История версий:
+#   1 — начальная версия (до Sprint 10)
+#   2 — Sprint 10: добавлено version-based cache invalidation
+CLUSTERS_ALGORITHM_VERSION = 2
+
 # TTL берётся из env CLUSTERS_CACHE_TTL_SECONDS (по умолчанию 21600 = 6 часов).
 # См. config.py → раздел «PostgreSQL-кэш (Этап 3+)».
 try:
@@ -178,7 +190,7 @@ async def get_cached_clusters(
                     """
                     SELECT payload, raw_clusters, raw_preclusters,
                            total_clusters, total_preclusters,
-                           has_prev_data
+                           has_prev_data, algorithm_version
                     FROM clusters_cache
                     WHERE reg_code = %(reg)s
                       AND current_dat_hash = %(curr)s
@@ -193,7 +205,7 @@ async def get_cached_clusters(
                     """
                     SELECT payload, raw_clusters, raw_preclusters,
                            total_clusters, total_preclusters,
-                           has_prev_data
+                           has_prev_data, algorithm_version
                     FROM clusters_cache
                     WHERE reg_code = %(reg)s
                       AND current_dat_hash = %(curr)s
@@ -220,6 +232,24 @@ async def get_cached_clusters(
 
         payload = row["payload"]
         if not payload:
+            return None
+
+        # === Вариант 3: проверка версии алгоритма ===
+        # Если запись кэша создана старой версией алгоритма —
+        # игнорируем (treated as MISS). Следующий PUT сохранит
+        # результат с новой версией.
+        cached_version = row["algorithm_version"]
+        if cached_version is not None and cached_version != CLUSTERS_ALGORITHM_VERSION:
+            logger.info(
+                f"clusters_cache: HIT but version mismatch: "
+                f"cached={cached_version}, current={CLUSTERS_ALGORITHM_VERSION} "
+                f"— treating as MISS (reg={reg_code})"
+            )
+            try:
+                from ..middleware.metrics import record_cache_miss
+                record_cache_miss("clusters")
+            except Exception:
+                pass
             return None
 
         # raw_clusters / raw_preclusters могут быть NULL для старых записей
@@ -356,6 +386,7 @@ async def put_cached_clusters(
                     payload, raw_clusters, raw_preclusters,
                     total_clusters, total_preclusters, has_prev_data,
                     current_label, prev_label, region_name,
+                    algorithm_version,
                     created_at, expires_at
                 ) VALUES (
                     %(reg)s, %(curr)s, %(prev)s,
@@ -363,6 +394,7 @@ async def put_cached_clusters(
                     %(payload)s, %(raw_c)s, %(raw_p)s,
                     %(tc)s, %(tpc)s, %(hpd)s,
                     %(cl)s, %(pl)s, %(rn)s,
+                    %(av)s,
                     NOW(),
                     NOW() + (%(ttl)s || ' seconds')::INTERVAL
                 )
@@ -380,6 +412,7 @@ async def put_cached_clusters(
                     current_label = EXCLUDED.current_label,
                     prev_label = EXCLUDED.prev_label,
                     region_name = EXCLUDED.region_name,
+                    algorithm_version = EXCLUDED.algorithm_version,
                     created_at = NOW(),
                     expires_at = NOW() + (%(ttl)s || ' seconds')::INTERVAL
                 """,
@@ -398,6 +431,7 @@ async def put_cached_clusters(
                     "cl": current_label,
                     "pl": prev_label,
                     "rn": region_name,
+                    "av": CLUSTERS_ALGORITHM_VERSION,
                     "ttl": str(ttl_seconds),
                 },
             )

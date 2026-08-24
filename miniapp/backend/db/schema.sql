@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS clusters_cache (
     current_label       TEXT,
     prev_label          TEXT,
     region_name         TEXT,
+    algorithm_version  INT          NOT NULL DEFAULT 1,   -- версия алгоритма (auto-invalidate)
     created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     expires_at          TIMESTAMPTZ  NOT NULL
 );
@@ -200,6 +201,7 @@ CREATE TABLE IF NOT EXISTS clusters_cache (
 -- ============================================================
 ALTER TABLE clusters_cache ADD COLUMN IF NOT EXISTS raw_clusters    JSONB;
 ALTER TABLE clusters_cache ADD COLUMN IF NOT EXISTS raw_preclusters JSONB;
+ALTER TABLE clusters_cache ADD COLUMN IF NOT EXISTS algorithm_version INT NOT NULL DEFAULT 1;
 
 -- Уникальный индекс на составной ключ с COALESCE для NULL-безопасности.
 -- Важно: prev_dat_hash может быть NULL (АППГ не используется),

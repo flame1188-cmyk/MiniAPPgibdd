@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..services.gibdd_service import (
     AnalysisStatus,
@@ -96,6 +96,14 @@ class ClustersResult(BaseModel):
     preclusters: List[ClusterItem]
 
 
+class ClustersStartRequest(BaseModel):
+    """Тело POST /clusters."""
+    force_refresh: bool = Field(
+        default=False,
+        description="Пропустить кэш очагов и пересчитать",
+    )
+
+
 class ClustersResponse(BaseModel):
     """Ответ POST /clusters и GET /clusters."""
     state: AnalysisStatusResponse
@@ -140,6 +148,7 @@ def _clusters_result_to_response(result: Optional[dict]) -> Optional[ClustersRes
 )
 async def start_clusters(
     task_id: str,
+    request: ClustersStartRequest = ClustersStartRequest(),
     user: TelegramUser = Depends(get_current_user),
 ):
     """
@@ -166,12 +175,12 @@ async def start_clusters(
         raise HTTPException(status_code=404, detail="Task not found")
     state = task.clusters_state
 
-    # Если уже выполнено — возвращаем готовое.
+    # Если уже выполнено И не запрошена перегенерация — возвращаем готовое.
     # НО: Sprint 3.2 — если task.raw_clusters и task.raw_preclusters пусты,
     # значит кэш восстановил state.result, но без raw-данных (старая запись
     # без raw_clusters). В этом случае форсируем recompute, иначе карта
     # упадёт в simple map (без слоёв/попапов), а Excel вернёт None.
-    if state.status == AnalysisStatus.DONE:
+    if state.status == AnalysisStatus.DONE and not request.force_refresh:
         if not task.raw_clusters and not task.raw_preclusters:
             logger.info(
                 f"Task {task_id}: clusters state=DONE, но raw_clusters/"
@@ -190,7 +199,7 @@ async def start_clusters(
             state.result = None
             # raw_clusters/raw_preclusters и так пустые
             loop = asyncio.get_running_loop()
-            loop.create_task(start_clusters_calculation(task))
+            loop.create_task(start_clusters_calculation(task, force_refresh=True))
             return ClustersResponse(state=_state_to_response(state))
         return ClustersResponse(
             state=_state_to_response(state),
@@ -201,10 +210,16 @@ async def start_clusters(
     if state.status == AnalysisStatus.RUNNING:
         return ClustersResponse(state=_state_to_response(state))
 
-    # Если предыдущая попытка упала — перезапускаем
-    # Запускаем async
+    # === Пересчёт (включая при force_refresh=True) ===
+    # Сбрасываем state, чтобы UI сразу увидел running, а не старый done.
+    state.status = AnalysisStatus.IDLE
+    state.progress = 0
+    state.stage = "Запуск..."
+    state.started_at = None
+    state.finished_at = None
+    state.result = None
     loop = asyncio.get_running_loop()
-    loop.create_task(start_clusters_calculation(task))
+    loop.create_task(start_clusters_calculation(task, force_refresh=request.force_refresh))
 
     return ClustersResponse(state=_state_to_response(state))
 
