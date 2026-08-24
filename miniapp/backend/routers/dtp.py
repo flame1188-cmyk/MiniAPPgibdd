@@ -76,10 +76,6 @@ class TaskCreateRequest(BaseModel):
         default=None,
         description="Человекочитаемая метка периода (например '2025 год').",
     )
-    compare_year: Optional[int] = Field(
-        default=None,
-        description="Год для сравнения (например 2024). По умолчанию АППГ (year-1).",
-    )
 
 
 class TaskCreateResponse(BaseModel):
@@ -130,6 +126,14 @@ class GenerateExcelRequest(BaseModel):
     """Запрос на ленивую генерацию Excel для существующей задачи."""
     file_type: str = Field(
         ..., description="'dtp_cards' или 'dtp_participants'"
+    )
+
+
+class CompareYearRequest(BaseModel):
+    """Запрос пересчёта сравнения с другим годом."""
+    compare_year: Optional[int] = Field(
+        default=None,
+        description="Год для сравнения. None = АППГ (year-1).",
     )
 
 
@@ -194,7 +198,6 @@ async def create_dtp_task(
         period_label=period_label,
         dat_list=dat_list,
         raw_query=raw_query,
-        compare_year=request.compare_year,
     )
 
     # Hotfix Sprint 7: гарантированно persist'им метаданные задачи в БД
@@ -767,3 +770,98 @@ def _task_to_response(task: Task) -> TaskStatusResponse:
         queue_position=queue_pos,
         queue_ahead=queue_ahead,
     )
+
+
+@router.post("/tasks/{task_id}/compare")
+async def compare_task_year(
+    task_id: str,
+    request: CompareYearRequest,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """Пересчитывает сравнение аналитики с указанным годом.
+
+    Использует SQL-агрегацию (calculate_metrics_from_db) — быстрый запрос
+    без загрузки сырых карточек. Текущие метрики берутся из кэша задачи.
+
+    compare_year=None → АППГ (year-1, по умолчанию).
+    """
+    from ..services.gibdd_service import get_task_async
+    from ..services.analytics_ops import ensure_comparison
+
+    task = await get_task_async(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if task.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+    if not task.cards:
+        raise HTTPException(
+            status_code=400,
+            detail="Карточки текущего периода не загружены",
+        )
+
+    # Вычисляем prev_dat_list: те же месяцы, другой год
+    compare_year = request.compare_year
+    try:
+        first_dat = task.dat_list[0]
+        _, current_year_str = first_dat.split(".")
+        current_year = int(current_year_str)
+    except (IndexError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось определить год из dat_list",
+        )
+
+    target_year = compare_year if compare_year else current_year - 1
+    prev_dat_list = []
+    for dat in task.dat_list:
+        try:
+            m, _ = dat.split(".")
+            prev_dat_list.append(f"{m}.{target_year}")
+        except Exception:
+            continue
+
+    if not prev_dat_list:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось вычислить период для сравнения",
+        )
+
+    # Формируем prev_label
+    prev_label = task.period_label.replace(str(current_year), str(target_year))
+
+    # Текущие метрики — из кэша или пересчитываем
+    analytics_module = __import__("analytics", fromlist=["calculate_metrics"])
+    cards_id = id(task.cards)
+    if task.current_metrics is not None and task.current_metrics_cards_id == cards_id:
+        current_metrics = task.current_metrics
+    else:
+        current_metrics = analytics_module.calculate_metrics(task.cards)
+        task.current_metrics = current_metrics
+        task.current_metrics_cards_id = cards_id
+
+    # Метрики за compare_year — через SQL (быстро, без RAM)
+    from ..db.metrics import calculate_metrics_from_db
+
+    prev_metrics = await calculate_metrics_from_db(task.region_code, prev_dat_list)
+
+    if not prev_metrics:
+        # Нет данных за этот год
+        return {
+            "ok": True,
+            "has_prev_data": False,
+            "prev_label": prev_label,
+            "current_label": task.period_label,
+            "comparison": None,
+        }
+
+    comparison = analytics_module.compare_metrics(current_metrics, prev_metrics)
+
+    return {
+        "ok": True,
+        "has_prev_data": True,
+        "prev_label": prev_label,
+        "current_label": task.period_label,
+        "comparison": comparison,
+        "previous": prev_metrics,
+        "current": current_metrics,
+    }

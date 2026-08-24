@@ -38,6 +38,7 @@
  *  - График по погоде (сортировка по выбранной метрике)
  */
 import { useState } from 'react'
+import { useMutation } from '@tanstack/react-query'
 import {
   Bar,
   BarChart,
@@ -51,9 +52,13 @@ import {
   YAxis,
 } from 'recharts'
 import { haptic } from '@/lib/telegram'
+import { api } from '@/lib/api'
+
+const COMPARE_YEARS_MIN = 2021
 
 interface AnalyticsViewProps {
   analytics: Record<string, unknown>
+  taskId: string
 }
 
 const DAY_SHORT = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
@@ -180,16 +185,44 @@ function makeBarLegendFormatter(
 // ============================================================
 // Главный компонент
 // ============================================================
-export function AnalyticsView({ analytics }: AnalyticsViewProps) {
+export function AnalyticsView({ analytics, taskId }: AnalyticsViewProps) {
   const a = analytics as Record<string, any>
   const [metric, setMetric] = useState<Metric>('dtp')
+  const [compareYear, setCompareYear] = useState<number | null>(null)
+
+  // === Мутация пересчёта сравнения ===
+  const compareMutation = useMutation({
+    mutationFn: (year: number | null) => api.compareTaskYear(taskId, year),
+  })
+
+  // Оверрайд-данные: если мутация успешна, используем их вместо оригинальных
+  const overrideData = compareMutation.data
+  const isLoadingCompare = compareMutation.isPending
+
+  const handleCompareYearChange = (year: number | null) => {
+    haptic('light')
+    setCompareYear(year)
+    compareMutation.mutate(year)
+  }
+
+  // Определяем текущий год из данных
+  const rawCurrentLabel = (a.current_label ?? 'Текущий период') as string
+  const yearMatch = rawCurrentLabel.match(/(\d{4})/)
+  const currentYearNum = yearMatch ? parseInt(yearMatch[1]) : new Date().getFullYear()
+
+  // Доступные годы для сравнения
+  const compareYears = Array.from(
+    { length: currentYearNum - 1 - COMPARE_YEARS_MIN + 1 },
+    (_, i) => currentYearNum - 1 - i
+  ).filter((y) => y >= COMPARE_YEARS_MIN)
 
   // === Извлекаем current/previous ===
-  const current = (a.current ?? a) as Record<string, any>
-  const previous = (a.previous ?? null) as Record<string, any> | null
-  const hasPrev = !!a.has_prev_data && !!previous
-  const prevLabel = (a.prev_label ?? 'АППГ') as string
-  const currentLabel = (a.current_label ?? 'Текущий период') as string
+  const effectiveAnalytics = (overrideData as Record<string, any>) ?? a
+  const current = (effectiveAnalytics.current ?? a.current ?? a) as Record<string, any>
+  const previous = (effectiveAnalytics.previous ?? a.previous ?? null) as Record<string, any> | null
+  const hasPrev = !!effectiveAnalytics.has_prev_data && !!previous
+  const prevLabel = (effectiveAnalytics.prev_label ?? a.prev_label ?? 'АППГ') as string
+  const currentLabel = (effectiveAnalytics.current_label ?? a.current_label ?? 'Текущий период') as string
 
   // Текущая метрика для подписи
   const currentMetricLabel =
@@ -356,12 +389,75 @@ export function AnalyticsView({ analytics }: AnalyticsViewProps) {
                   marginLeft: 6,
                 }}
               >
-                ({previous.injured_per_100.toFixed(1)} в АППГ)
+                ({previous.injured_per_100.toFixed(1)} в {prevLabel})
               </span>
             )}
           </div>
         )}
       </div>
+
+      {/* Переключатель года сравнения */}
+      {compareYears.length > 0 && (
+        <div className="tg-card">
+          <div className="tg-section-header mb-2">Сравнить с</div>
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              onClick={() => handleCompareYearChange(null)}
+              disabled={isLoadingCompare}
+              className="text-xs px-3 py-2 rounded-lg font-medium"
+              style={{
+                backgroundColor:
+                  compareYear === null
+                    ? 'var(--tg-color-button, #2481cc)'
+                    : 'var(--tg-color-secondary-bg, #f1f1f1)',
+                color:
+                  compareYear === null
+                    ? 'var(--tg-color-button-text, #ffffff)'
+                    : 'var(--tg-color-text, #000000)',
+                opacity: isLoadingCompare ? 0.5 : 1,
+              }}
+            >
+              АППГ ({currentYearNum - 1})
+            </button>
+            {compareYears
+              .filter((y) => y !== currentYearNum - 1)
+              .map((y) => (
+                <button
+                  key={y}
+                  onClick={() => handleCompareYearChange(y)}
+                  disabled={isLoadingCompare}
+                  className="text-xs px-3 py-2 rounded-lg font-medium"
+                  style={{
+                    backgroundColor:
+                      compareYear === y
+                        ? 'var(--tg-color-button, #2481cc)'
+                        : 'var(--tg-color-secondary-bg, #f1f1f1)',
+                    color:
+                      compareYear === y
+                        ? 'var(--tg-color-button-text, #ffffff)'
+                        : 'var(--tg-color-text, #000000)',
+                    opacity: isLoadingCompare ? 0.5 : 1,
+                  }}
+                >
+                  {y}
+                </button>
+              ))}
+          </div>
+          {isLoadingCompare && (
+            <div className="text-[10px] opacity-50 mt-1.5 text-center">
+              Пересчитываем...
+            </div>
+          )}
+          {compareMutation.isError && (
+            <div
+              className="text-[10px] mt-1.5 text-center"
+              style={{ color: 'var(--tg-color-destructive, #ff3b30)' }}
+            >
+              Нет данных за выбранный год
+            </div>
+          )}
+        </div>
+      )}
 
       {/* === Переключатель метрики — применяется ко всем графикам ниже === */}
       <div className="tg-card">

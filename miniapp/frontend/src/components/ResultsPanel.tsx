@@ -86,7 +86,7 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
       {tab === 'map' && <MapFrame taskId={task.task_id} />}
 
       {tab === 'analytics' && task.analytics && (
-        <AnalyticsView analytics={task.analytics} />
+        <AnalyticsView analytics={task.analytics} taskId={task.task_id} />
       )}
 
       {tab === 'clusters' && <ClustersView task={task} />}

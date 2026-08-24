@@ -199,7 +199,6 @@ export interface StructuredTaskRequest {
   region_name: string
   dat_list: string[]          // ['1.2025', '2.2025', ...]
   period_label: string         // '2025 год' / 'I квартал 2025'
-  compare_year?: number | null  // Год для сравнения (null = АППГ)
 }
 
 // ============================================================
@@ -868,6 +867,28 @@ export const api = {
 
   getQAHistory: (taskId: string) =>
     request<QAHistoryItem[]>(`/api/dtp/tasks/${taskId}/llm/qa-history`),
+
+  // ============================================================
+  // Analysis: Compare year (динамическое переключение года сравнения)
+  // ============================================================
+  /**
+   * Пересчитывает сравнение аналитики с указанным годом.
+   * compare_year=null → АППГ (по умолчанию).
+   * Использует SQL-агрегацию — быстро (~100-300мс).
+   */
+  compareTaskYear: (taskId: string, compareYear: number | null = null) =>
+    request<{
+      ok: boolean
+      has_prev_data: boolean
+      prev_label: string | null
+      current_label: string
+      comparison: Record<string, unknown> | null
+      previous: Record<string, unknown> | null
+      current: Record<string, unknown> | null
+    }>(`/api/dtp/tasks/${taskId}/compare`, {
+      method: 'POST',
+      body: JSON.stringify({ compare_year: compareYear }),
+    }),
 
   // ============================================================
   // НП БДД
