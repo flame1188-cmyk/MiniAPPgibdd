@@ -203,7 +203,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
   }, [])
 
   // === Summary streaming (Sprint 5: без polling fallback) ===
-  const handleGenerateStream = async () => {
+  const handleGenerateStream = async (forceRefresh = false) => {
     setStarting(true)
     setStarted(true)
     setSummaryStreaming(true)
@@ -254,6 +254,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
           },
         },
         controller.signal,
+        forceRefresh,
       )
     } catch (e: any) {
       if (e?.name !== 'AbortError') {
@@ -537,7 +538,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
               по мере генерации (token-by-token) с markdown-форматированием.
             </p>
             <button
-              onClick={handleGenerateStream}
+              onClick={() => handleGenerateStream()}
               disabled={!providers}
               className="w-full py-2.5 rounded-xl font-medium text-sm disabled:opacity-50"
               style={{
@@ -661,7 +662,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
               {summaryError}
             </div>
             <button
-              onClick={handleGenerateStream}
+              onClick={() => handleGenerateStream()}
               className="px-4 py-2 rounded-xl text-sm font-medium"
               style={{
                 backgroundColor: 'var(--tg-color-button, #2481cc)',
@@ -686,7 +687,7 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                     аналитику в Telegram-чат или сохранить локально. */}
                 <CopyButton text={cachedSummary.text} />
                 <button
-                  onClick={handleGenerateStream}
+                  onClick={() => handleGenerateStream(true)}
                   className="text-xs px-2 py-1 rounded-lg"
                   style={{
                     backgroundColor:

@@ -856,10 +856,11 @@ export const api = {
       onError?: (err: string, retryable?: boolean, errorType?: string) => void
     },
     signal?: AbortSignal,
+    forceRefresh = false,
   ): Promise<void> => {
     return consumeSSE(
       `/api/dtp/tasks/${taskId}/llm/summary/stream`,
-      { provider },
+      { provider, force_refresh: forceRefresh },
       handlers,
       signal,
     )
