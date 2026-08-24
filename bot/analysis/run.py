@@ -102,18 +102,140 @@ async def _run_analysis(
     cached_prev = context.user_data.get("analytics_prev_cards", [])
     cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
-    # Также проверяем глобальный кэш (БД + in-memory; может быть заполнен preload-задачей)
-    if (not cached_prev or cached_prev_label != prev_label):
-        global_cached = await data_cache_get_async(reg_code, dat_list_prev)
-        if global_cached is not None:
-            cached_prev, _ = global_cached
-            cached_prev_label = prev_label
+    # Проверяем, можно ли получить метрики АППГ из SQL (без загрузки карточек).
+    # Карточки нужны только для LLM-анализа (extract_raw_supplement,
+    # calculate_cross_tables). Без LLM — SQL достаточно.
+    sql_metrics_available = False
+    prev_sql_total = 0
+    if not use_llm:
+        try:
+            from miniapp.backend.db.metrics import calculate_metrics_from_db
+            _test_metrics = await calculate_metrics_from_db(reg_code, dat_list_prev)
+            if _test_metrics is not None and _test_metrics["total"] > 0:
+                sql_metrics_available = True
+                prev_sql_total = _test_metrics["total"]
+                logger.info(
+                    f"  Аналитика: SQL-метрики АППГ доступны "
+                    f"({prev_sql_total} ДТП, загрузка карточек пропущена)"
+                )
+        except Exception:
+            pass
 
-    if cached_prev and cached_prev_label == prev_label:
-        # Данные за прошлый год уже есть — не скачиваем повторно
-        prev_cards = cached_prev
+    # Загружаем карточки за прошлый год ТОЛЬКО если:
+    #   - SQL-метрики недоступны, ИЛИ
+    #   - Нужен LLM-анализ (требует сырые данные)
+    prev_cards = []
+    prev_cards_count = 0
+    if not sql_metrics_available or use_llm:
+        # Также проверяем кэш (БД + in-memory; может быть заполнен preload-задачей)
+        if (cached_prev and cached_prev_label == prev_label):
+            prev_cards = cached_prev
+            errors = []
+            if status_msg is None:
+                status_msg = await _tg_retry(lambda: context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"{mode_label}: подготовка...\n\n"
+                        f"Регион: {reg_name}\n"
+                        f"Текущий период: {current_label}\n"
+                        f"Сравнение: {prev_label}\n\n"
+                        f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                    ),
+                ), "send_message (статус аналитики)")
+            else:
+                await status_msg.edit_text(
+                    f"{mode_label}: подготовка...\n\n"
+                    f"Регион: {reg_name}\n"
+                    f"Текущий период: {current_label}\n"
+                    f"Сравнение: {prev_label}\n\n"
+                    f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                )
+        else:
+            # Проверяем глобальный кэш
+            if (not cached_prev or cached_prev_label != prev_label):
+                global_cached = await data_cache_get_async(reg_code, dat_list_prev)
+                if global_cached is not None:
+                    cached_prev, _ = global_cached
+                    cached_prev_label = prev_label
+
+            if cached_prev and cached_prev_label == prev_label:
+                prev_cards = cached_prev
+                errors = []
+                if status_msg is None:
+                    status_msg = await _tg_retry(lambda: context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"{mode_label}: подготовка...\n\n"
+                            f"Регион: {reg_name}\n"
+                            f"Текущий период: {current_label}\n"
+                            f"Сравнение: {prev_label}\n\n"
+                            f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                        ),
+                    ), "send_message (статус аналитики)")
+                else:
+                    await status_msg.edit_text(
+                        f"{mode_label}: подготовка...\n\n"
+                        f"Регион: {reg_name}\n"
+                        f"Текущий период: {current_label}\n"
+                        f"Сравнение: {prev_label}\n\n"
+                        f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                    )
+            else:
+                # Скачиваем данные за прошлый год
+                if status_msg is None:
+                    status_msg = await _tg_retry(lambda: context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"{mode_label}: подготовка...\n\n"
+                            f"Регион: {reg_name}\n"
+                            f"Текущий период: {current_label}\n"
+                            f"Сравнение: {prev_label}\n\n"
+                            f"Загрузка данных за {prev_year} год..."
+                        ),
+                    ), "send_message (статус аналитики)")
+                else:
+                    await status_msg.edit_text(
+                        f"{mode_label}: загрузка...\n\n"
+                        f"Регион: {reg_name}\n"
+                        f"Текущий период: {current_label}\n"
+                        f"Сравнение: {prev_label}\n\n"
+                        f"\u23F3 Загрузка данных за {prev_year} год..."
+                    )
+
+                async def progress(i, total, month_name, year):
+                    bar = _make_progress_bar(i, total)
+                    try:
+                        await status_msg.edit_text(
+                            f"{mode_label}: загрузка...\n\n"
+                            f"{bar} {i}/{total}\n"
+                            f"Запрос: {month_name} {year}..."
+                        )
+                    except Exception:
+                        pass
+
+                prev_cards, errors = await _fetch_cards_for_period(
+                    dat_list_prev, reg_code, "Аналитика", progress_callback=progress,
+                )
+
+                # Кэшируем для повторного использования
+                if prev_cards:
+                    context.user_data["analytics_prev_cards"] = prev_cards
+                    context.user_data["analytics_prev_label"] = prev_label
+
+        prev_cards_count = len(prev_cards)
+
+        if not prev_cards:
+            error_text = "\n".join(f"- {e}" for e in errors) if errors else "Нет данных"
+            await status_msg.edit_text(
+                f"\u26A0\uFE0F Не удалось загрузить данные за {prev_label}.\n\n"
+                f"Ошибки:\n{error_text}\n\n"
+                f"Возможно, данные за этот период ещё не опубликованы."
+            )
+            return
+    else:
+        # SQL-метрики доступны, карточки не загружены
+        prev_cards_count = prev_sql_total
         errors = []
-        context.user_data["analytics_prev_cards"] = prev_cards
         if status_msg is None:
             status_msg = await _tg_retry(lambda: context.bot.send_message(
                 chat_id=chat_id,
@@ -122,7 +244,7 @@ async def _run_analysis(
                     f"Регион: {reg_name}\n"
                     f"Текущий период: {current_label}\n"
                     f"Сравнение: {prev_label}\n\n"
-                    f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                    f"Данные за прошлый год из базы ({prev_sql_total} ДТП)..."
                 ),
             ), "send_message (статус аналитики)")
         else:
@@ -131,70 +253,22 @@ async def _run_analysis(
                 f"Регион: {reg_name}\n"
                 f"Текущий период: {current_label}\n"
                 f"Сравнение: {prev_label}\n\n"
-                f"Данные за прошлый год из кэша ({len(prev_cards)} ДТП)..."
+                f"Данные за прошлый год из базы ({prev_sql_total} ДТП)..."
             )
-    else:
-        # Скачиваем данные за прошлый год
-        if status_msg is None:
-            status_msg = await _tg_retry(lambda: context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"{mode_label}: подготовка...\n\n"
-                    f"Регион: {reg_name}\n"
-                    f"Текущий период: {current_label}\n"
-                    f"Сравнение: {prev_label}\n\n"
-                    f"Загрузка данных за {prev_year} год..."
-                ),
-            ), "send_message (статус аналитики)")
-        else:
-            await status_msg.edit_text(
-                f"{mode_label}: загрузка...\n\n"
-                f"Регион: {reg_name}\n"
-                f"Текущий период: {current_label}\n"
-                f"Сравнение: {prev_label}\n\n"
-                f"\u23F3 Загрузка данных за {prev_year} год..."
-            )
-
-        async def progress(i, total, month_name, year):
-            bar = _make_progress_bar(i, total)
-            try:
-                await status_msg.edit_text(
-                    f"{mode_label}: загрузка...\n\n"
-                    f"{bar} {i}/{total}\n"
-                    f"Запрос: {month_name} {year}..."
-                )
-            except Exception:
-                pass
-
-        prev_cards, errors = await _fetch_cards_for_period(
-            dat_list_prev, reg_code, "Аналитика", progress_callback=progress,
-        )
-
-        # Сохраняем количество ДТП за прошлый год
-        prev_cards_count = len(prev_cards)
-
-        # Кэшируем для повторного использования
-        if prev_cards:
-            context.user_data["analytics_prev_cards"] = prev_cards
-            context.user_data["analytics_prev_label"] = prev_label
-
-    # Сохраняем количество ДТП за прошлый год (для обоих веток)
-    prev_cards_count = len(prev_cards)
-
-    if not prev_cards:
-        error_text = "\n".join(f"- {e}" for e in errors) if errors else "Нет данных"
-        await status_msg.edit_text(
-            f"\u26A0\uFE0F Не удалось загрузить данные за {prev_label}.\n\n"
-            f"Ошибки:\n{error_text}\n\n"
-            f"Возможно, данные за этот период ещё не опубликованы."
-        )
-        return
 
     # Считаем метрики
     await status_msg.edit_text(f"{mode_label}: считаю метрики...")
 
     current_metrics = calculate_metrics(current_cards)
-    previous_metrics = calculate_metrics(prev_cards)
+
+    if sql_metrics_available and not use_llm:
+        # Метрики АППГ уже получены из SQL ранее — используем кэш
+        previous_metrics = await calculate_metrics_from_db(reg_code, dat_list_prev)
+        if previous_metrics is None:
+            previous_metrics = calculate_metrics(prev_cards)
+    else:
+        previous_metrics = calculate_metrics(prev_cards)
+
     comparison = compare_metrics(current_metrics, previous_metrics)
 
     # Сохраняем comparison для возможных вопросов
