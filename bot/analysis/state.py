@@ -5,8 +5,11 @@
   • _clear_analytics_data
 
 Эти функции не имеют зависимостей от других подмодулей bot.analysis —
-чистые геттеры user_data + data_cache. Используются в menu.py, pipeline.py,
-run.py, clusters.py и в других пакетах (output.py, point_stats.py, qa.py).
+чистые геттеры user_data. Ранее имели fallback на in-memory data_cache,
+который был удалён (сырые карточки теперь только в БД).
+
+Используются в menu.py, pipeline.py, run.py, clusters.py и в других
+пакетах (output.py, point_stats.py, qa.py).
 
 Выделено из единого bot/analysis.py (Phase 3-4). 100% pure.
 """
@@ -19,23 +22,12 @@ def _get_current_cards(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> list[dict] | None:
     """
-    Получает карточки ДТП текущего периода.
-    Сначала проверяет user_data, потом data_cache.
+    Получает карточки ДТП текущего периода из user_data.
     Возвращает None если данные не найдены.
     """
     cards = context.user_data.get("analytics_cards", [])
     if cards:
         return cards
-
-    reg_code = context.user_data.get("analytics_reg_code", "")
-    period = context.user_data.get("analytics_period")
-    if not reg_code or not period:
-        return None
-
-    dat_list = [f"{m}.{period.year}" for m in period.months]
-    cached = data_cache.get(reg_code, dat_list)
-    if cached:
-        return cached[0]
     return None
 
 
@@ -63,26 +55,13 @@ def _get_prev_cards(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> list[dict] | None:
     """
-    Получает карточки ДТП за период сравнения.
+    Получает карточки ДТП за период сравнения из user_data.
     Учитывает analytics_compare_year если задан (мультигодовой селектор).
-    Сначала проверяет user_data, потом data_cache.
     Возвращает None если данные не найдены.
     """
     prev_cards = context.user_data.get("analytics_prev_cards", [])
     if prev_cards:
         return prev_cards
-
-    reg_code = context.user_data.get("analytics_reg_code", "")
-    period = context.user_data.get("analytics_period")
-    if not reg_code or not period:
-        return None
-
-    compare_year = context.user_data.get("analytics_compare_year")
-    prev_year = compare_year if compare_year else period.year - 1
-    dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
-    cached = data_cache.get(reg_code, dat_list_prev)
-    if cached:
-        return cached[0]
     return None
 
 

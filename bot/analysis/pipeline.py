@@ -108,8 +108,7 @@ async def _start_fetching(
 
     # Логируем память после загрузки всех карточек
     _log_memory(
-        f"Выгрузка ЗАГРУЖЕНО: {reg_name}, {len(all_cards)} ДТП, "
-        f"кэш: {data_cache.stats()}"
+        f"Выгрузка ЗАГРУЖЕНО: {reg_name}, {len(all_cards)} ДТП"
     )
 
     # Обработка и генерация Excel
@@ -243,8 +242,7 @@ async def _preload_prev_year(
         )
         if cards:
             logger.info(
-                f"Preload: загружено {len(cards)} ДТП за прошлый год "
-                f"[{data_cache.stats()}]"
+                f"Preload: загружено {len(cards)} ДТП за прошлый год"
             )
         elif errors:
             logger.warning(f"Preload: ошибки при загрузке: {errors}")
