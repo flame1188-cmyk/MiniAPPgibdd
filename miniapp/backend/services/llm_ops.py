@@ -174,6 +174,7 @@ async def start_llm_summary(task: Task, provider: str = "free") -> None:
 
 async def _check_llm_cache(
     task: Task, provider: str, state: AnalysisState,
+    force_refresh: bool = False,
 ) -> bool:
     """
     Sprint 2: проверяет LLM cache перед вызовом LLM.
@@ -181,12 +182,10 @@ async def _check_llm_cache(
     Возвращает True, если найден cache hit (state уже заполнен результатом).
     Возвращает False, если cache miss (нужно вызывать LLM).
 
-    Логика:
-    1. Готовит clusters_ctx и cross_tables_ctx (как в _run_llm_summary_inner).
-    2. Вычисляет cache_key.
-    3. Запрашивает summary из БД.
-    4. Если hit — заполняет state.result и завершает операцию.
+    При force_refresh=True всегда возвращает False (кэш пропускается).
     """
+    if force_refresh:
+        return False
     # Проверяем доступность БД и провайдера
     config = _imports._import_module("config")
     if provider == "paid":
@@ -953,7 +952,7 @@ async def ask_llm_question_stream(
 
 
 async def stream_llm_summary(
-    task: Task, provider: str = "free",
+    task: Task, provider: str = "free", force_refresh: bool = False,
 ) -> AsyncIterator[str]:
     """
     Streaming-версия start_llm_summary: yields дельты резюме по мере
@@ -961,7 +960,7 @@ async def stream_llm_summary(
 
     Семантика:
       1. Сразу ставит state.status = RUNNING, stage = "Подготовка данных..."
-      2. Проверяет LLM cache. Если hit — обновляет state (DONE) и
+      2. Проверяет LLM cache (если не force_refresh). Если hit — обновляет state (DONE) и
          yield'ит весь кэшированный текст одним куском (мгновенно).
       3. Если cache miss: готовит промпт (comparison, cross_tables, clusters),
          ставит stage = "Генерация нейросетью...", acquire semaphore,
@@ -972,6 +971,8 @@ async def stream_llm_summary(
     На ошибку до первого yield: поднимает RuntimeError, state → FAILED.
     На обрыв потока: state оставляем RUNNING (caller может показать partial),
       но в cache НЕ сохраняем.
+
+    force_refresh: пропускает кэш и перегенерирует.
     """
     state = task.llm_summary_state
     state.status = AnalysisStatus.RUNNING
@@ -982,8 +983,9 @@ async def stream_llm_summary(
     state.result = None
 
     # Cache check (без semaphore — мгновенно)
+    # При force_refresh пропускаем кэш
     try:
-        cached = await _check_llm_cache(task, provider, state)
+        cached = await _check_llm_cache(task, provider, state, force_refresh=force_refresh)
         if cached:
             # cache hit — state уже DONE, текст уже в state.result
             # Эмитим весь текст одним delta-событием.

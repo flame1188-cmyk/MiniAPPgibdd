@@ -135,6 +135,10 @@ class CompareYearRequest(BaseModel):
         default=None,
         description="Год для сравнения. None = АППГ (year-1).",
     )
+    force_refresh: bool = Field(
+        default=False,
+        description="Принудительно пересчитать current_metrics (сбросить in-memory кэш).",
+    )
 
 
 # ============================================================
@@ -832,12 +836,17 @@ async def compare_task_year(
     # Текущие метрики — из кэша или пересчитываем
     analytics_module = __import__("analytics", fromlist=["calculate_metrics"])
     cards_id = id(task.cards)
-    if task.current_metrics is not None and task.current_metrics_cards_id == cards_id:
-        current_metrics = task.current_metrics
-    else:
+    if request.force_refresh or task.current_metrics is None or task.current_metrics_cards_id != cards_id:
         current_metrics = analytics_module.calculate_metrics(task.cards)
         task.current_metrics = current_metrics
         task.current_metrics_cards_id = cards_id
+        # Сбрасываем и другие кэши, зависящие от cards
+        task.cross_tables = None
+        task.cross_tables_cards_id = None
+        task.comparison = None
+        logger.info(f"Task {task.id}: in-memory cache flushed (force_refresh)")
+    else:
+        current_metrics = task.current_metrics
 
     # Метрики за compare_year — через SQL (быстро, без RAM)
     from ..db.metrics import calculate_metrics_from_db

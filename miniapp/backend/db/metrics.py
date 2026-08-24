@@ -1,18 +1,18 @@
 """metrics.py — SQL-агрегация метрик ДТП из архива PostgreSQL.
 
 Вычисляет тот же словарь, что analytics.calculate_metrics(),
-но напрямую SQL-запросами к gibdd_cards/gibdd_participants
+но напрямую SQL-запросами к gibdd_cards (включая JSONB raw_payload)
 без загрузки сырых карточек в память Python.
 
 Используется для:
   - Сравнения с АППГ и мультигодовой динамики (быстро, без RAM)
   - Текущий период по-прежнему через calculate_metrics() (нужен для LLM/очагов)
 
-Все запросы используют индексы:
+Основной индекс:
   - idx_cards_reg_dat (reg_code, dat_period)
-  - idx_participants_card (card_id)
-  - idx_participants_alco (alco) WHERE alco != '00'
-  - idx_participants_kt (kt_uch)
+
+Алкоголь и пешеходы ищутся через raw_payload (JSONB),
+т.к. gibdd_participants может быть не заполнена для некоторых периодов.
 """
 from __future__ import annotations
 
@@ -159,33 +159,37 @@ async def _compute_all(
                 return await cur.fetchall()
 
     async def _q7_alcohol() -> int:
-        """Количество ДТП с нетрезвыми водителями."""
+        """Количество ДТП с нетрезвыми водителями.
+
+        Ищет в raw_payload->ts_info[*].ts_uch[*], аналогично
+        _has_alcohol() из analytics.py. Не зависит от gibdd_participants.
+        """
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                # DIAG: считаем диагностику отдельно от основного запроса
                 await cur.execute("""
-                    SELECT COUNT(DISTINCT p.card_id) AS cnt,
-                           COUNT(*) AS total_drivers,
-                           COUNT(p.alco) AS alco_not_null,
-                           COUNT(CASE WHEN p.alco NOT IN ('0', '00', '') THEN 1 END) AS alco_non_zero
-                    FROM gibdd_participants p
-                    JOIN gibdd_cards c ON c.id = p.card_id
+                    SELECT COUNT(DISTINCT c.id) AS cnt
+                    FROM gibdd_cards c
                     WHERE c.reg_code = %(reg)s
                       AND c.dat_period = ANY(%(dats)s)
-                      AND p.kt_uch ILIKE '%%водитель%%'
-                      AND p.alco IS NOT NULL
-                      AND p.alco NOT IN ('0', '00', '')
+                      AND EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements(c.raw_payload->'ts_info') AS ts,
+                               jsonb_array_elements(ts->'ts_uch') AS uch
+                          WHERE LOWER(TRIM(uch->>'kt_uch')) = 'водитель'
+                            AND uch->>'alco' IS NOT NULL
+                            AND TRIM(uch->>'alco') NOT IN ('0', '00', '')
+                      )
                 """, {"reg": reg_code, "dats": dat_list})
-                diag = await cur.fetchone()
-                logger.info(
-                    f"[DIAG q7_alcohol] reg={reg_code} dats={dat_list}: "
-                    f"cnt={diag['cnt']}, total_drivers={diag['total_drivers']}, "
-                    f"alco_not_null={diag['alco_not_null']}, alco_non_zero={diag['alco_non_zero']}"
-                )
-                return int(diag["cnt"]) if diag else 0
+                r = await cur.fetchone()
+                return int(r["cnt"]) if r else 0
 
     async def _q8_pedestrian() -> int:
-        """Количество ДТП с пешеходами (по участникам ИЛИ по dtpv)."""
+        """Количество ДТП с пешеходами.
+
+        Ищет в raw_payload->uch_info[*].kt_uch ИЛИ по полю dtpv,
+        аналогично _has_pedestrian() из analytics.py.
+        Не зависит от gibdd_participants.
+        """
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("""
@@ -195,9 +199,9 @@ async def _compute_all(
                       AND c.dat_period = ANY(%(dats)s)
                       AND (
                           EXISTS (
-                              SELECT 1 FROM gibdd_participants p
-                              WHERE p.card_id = c.id
-                                AND p.kt_uch ILIKE '%%пешеход%%'
+                              SELECT 1
+                              FROM jsonb_array_elements(c.raw_payload->'uch_info') AS uch
+                              WHERE LOWER(TRIM(uch->>'kt_uch')) = 'пешеход'
                           )
                           OR c.dtpv ILIKE '%%пешеход%%'
                           OR c.dtpv ILIKE '%%сим%%'

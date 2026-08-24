@@ -155,6 +155,10 @@ class LLMSummaryRequest(BaseModel):
         default="free",
         description="'free' (ZhipuAI/GLM) или 'paid' (DeepSeek)",
     )
+    force_refresh: bool = Field(
+        default=False,
+        description="Пропустить LLM-кэш и перегенерировать",
+    )
 
 
 class LLMSummaryResult(BaseModel):
@@ -519,11 +523,12 @@ async def llm_summary_stream(
         )
 
     provider = request.provider
+    force_refresh = request.force_refresh
 
     async def event_generator():
         # Sprint 5: явная ссылка на inner generator для надёжной отмены.
         # Определяем ДО try: чтобы finally всегда мог вызвать aclose().
-        inner_gen = stream_llm_summary(task=task, provider=provider)
+        inner_gen = stream_llm_summary(task=task, provider=provider, force_refresh=force_refresh)
         try:
             chunks_emitted = 0
             async for delta in inner_gen:
