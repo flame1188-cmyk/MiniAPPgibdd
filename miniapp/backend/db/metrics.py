@@ -233,10 +233,11 @@ async def _compute_all(
         _q9_weather(),
     )
 
-    (total, deaths, injured,
+    (totals,
      type_rows, hour_rows, weekday_rows, month_rows, road_rows,
      alcohol_count, pedestrian_count,
      weather_rows) = results
+    total, deaths, injured = totals
 
     # --- Постобработка: группировки (как в analytics.py) ---
     from analytics import group_dtp_type, group_road_significance
