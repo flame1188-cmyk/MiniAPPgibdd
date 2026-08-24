@@ -70,15 +70,12 @@ async def get_cached_cards(
 ) -> Optional[Tuple[List[dict], List[str]]]:
     """
     Возвращает (cards, errors) из БД или None, если записи нет / протухла.
-
-    Дополнительно кладёт результат в in-memory LRU из data_cache.py —
-    повторные вызовы в том же процессе будут идти без SQL-запроса.
     """
     if not dat_list:
         return None
 
     if not is_db_ready():
-        return None  # fallback на in-memory в caller'е
+        return None
 
     pool = get_pool()
     if pool is None:
@@ -113,14 +110,6 @@ async def get_cached_cards(
         cards = list(row["payload"]) if row["payload"] else []
         errors = list(row["errors"]) if row["errors"] else []
 
-        # L2-кэш in-memory для ускорения повторных обращений в этом процессе
-        try:
-            # Импортируем here чтобы избежать циклической зависимости на старте
-            from data_cache import data_cache as _memory_cache
-            _memory_cache.put(reg_code, dat_list, cards, errors)
-        except Exception:
-            pass  # in-memory L2 — nice-to-have, не обязательно
-
         logger.debug(
             f"cards_cache: HIT reg={reg_code} hash={dat_hash[:8]}.. "
             f"({len(cards)} ДТП)"
@@ -153,22 +142,12 @@ async def put_cached_cards(
 ) -> None:
     """
     Сохраняет карточки в БД (upsert: INSERT ... ON CONFLICT DO UPDATE).
-
-    Тоже обновляет in-memory LRU из data_cache.py для консистентности.
     """
     if not dat_list or not cards:
         return
 
-    # In-memory LRU обновляем ВСЕГДА — даже если БД недоступна,
-    # чтобы within-process кэширование работало.
-    try:
-        from data_cache import data_cache as _memory_cache
-        _memory_cache.put(reg_code, dat_list, cards, errors)
-    except Exception:
-        pass
-
     if not is_db_ready():
-        return  # в БД не пишем, но в in-memory уже положили
+        return
 
     pool = get_pool()
     if pool is None:
@@ -226,24 +205,16 @@ async def put_cached_cards(
 # ====================================================================
 async def invalidate_region(reg_code: str) -> int:
     """
-    Удаляет ВСЕ записи кэша для заданного региона (из БД + in-memory).
+    Удаляет ВСЕ записи кэша для заданного региона из БД.
 
-    Возвращает количество удалённых строк из БД.
+    Возвращает количество удалённых строк.
     """
-    # Сначала in-memory — быстрый путь, не зависит от БД
-    memory_removed = 0
-    try:
-        from data_cache import data_cache as _memory_cache
-        memory_removed = _memory_cache.invalidate_by_region(reg_code)
-    except Exception:
-        pass
-
     if not is_db_ready():
-        return memory_removed
+        return 0
 
     pool = get_pool()
     if pool is None:
-        return memory_removed
+        return 0
 
     try:
         async with pool.connection() as conn:
@@ -255,18 +226,18 @@ async def invalidate_region(reg_code: str) -> int:
             await conn.commit()
             db_removed = cur.rowcount or 0
 
-        if db_removed or memory_removed:
+        if db_removed:
             logger.info(
                 f"cards_cache: invalidate_region({reg_code}) — "
-                f"DB={db_removed}, memory={memory_removed}"
+                f"DB={db_removed}"
             )
-        return max(db_removed, memory_removed)
+        return db_removed
 
     except Exception as exc:
         logger.warning(
             f"cards_cache: invalidate_region failed (reg={reg_code}): {exc}"
         )
-        return memory_removed
+        return 0
 
 
 # ====================================================================
