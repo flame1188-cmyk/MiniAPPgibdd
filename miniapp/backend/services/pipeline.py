@@ -79,7 +79,6 @@ def create_task(
     period_label: str,
     dat_list: List[str],
     raw_query: str,
-    compare_year: int | None = None,
 ) -> Task:
     """Создаёт новую задачу и возвращает её объект.
 
@@ -106,7 +105,6 @@ def create_task(
         period_label=period_label,
         dat_list=dat_list,
         raw_query=raw_query,
-        compare_year=compare_year,
     )
     _register_task(task)
 
@@ -309,7 +307,7 @@ async def _execute_task_impl(task_id: str) -> None:
             # но без блока comparison/previous.
             try:
                 if not task.prev_cards_loaded:
-                    await ensure_prev_cards(task, compare_year=task.compare_year)
+                    await ensure_prev_cards(task)
                 prev_cards = task.prev_cards or []
                 prev_label = task.prev_label
             except Exception as exc:

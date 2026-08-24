@@ -35,7 +35,6 @@ const MONTH_LABELS = [
 ]
 
 const YEARS = [2026, 2025, 2024, 2023]
-const COMPARE_YEARS_MIN = 2021  // Минимальный год для сравнения (как в боте)
 
 const PRESETS: { label: string; months: number[] }[] = [
   { label: 'Весь год', months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] },
@@ -52,7 +51,6 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
   const [selectedRegion, setSelectedRegion] = useState<Region | null>(null)
   const [year, setYear] = useState<number>(YEARS[0])
   const [selectedMonths, setSelectedMonths] = useState<number[]>([])
-  const [compareYear, setCompareYear] = useState<number | null>(null)  // null = АППГ
 
   // Сворачиваемый блок: по умолчанию развёрнут.
   // После успешной отправки задачи — автоматически сворачивается.
@@ -87,7 +85,6 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
         region_name: selectedRegion.name,
         dat_list,
         period_label,
-        compare_year: compareYear,
       })
     },
     onSuccess: (data) => {
@@ -299,68 +296,6 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
               </button>
             ))}
           </div>
-        </div>
-
-        {/* === Сравнить с === */}
-        <div>
-          <label className="block text-xs opacity-60 mb-1.5">Сравнить с</label>
-          <div className="flex flex-wrap gap-1.5">
-            <button
-              type="button"
-              onClick={() => {
-                haptic('light')
-                setCompareYear(null)
-              }}
-              disabled={isLoading}
-              className="text-xs px-3 py-2 rounded-lg font-medium"
-              style={{
-                backgroundColor:
-                  compareYear === null
-                    ? 'var(--tg-color-button, #2481cc)'
-                    : 'var(--tg-color-secondary-bg, #f1f1f1)',
-                color:
-                  compareYear === null
-                    ? 'var(--tg-color-button-text, #ffffff)'
-                    : 'var(--tg-color-text, #000000)',
-              }}
-            >
-              АППГ
-            </button>
-            {Array.from(
-              { length: year - 1 - COMPARE_YEARS_MIN + 1 },
-              (_, i) => year - 1 - i
-            )
-              .filter((y) => y >= COMPARE_YEARS_MIN)
-              .map((y) => (
-                <button
-                  key={y}
-                  type="button"
-                  onClick={() => {
-                    haptic('light')
-                    setCompareYear(y)
-                  }}
-                  disabled={isLoading}
-                  className="text-xs px-3 py-2 rounded-lg font-medium"
-                  style={{
-                    backgroundColor:
-                      compareYear === y
-                        ? 'var(--tg-color-button, #2481cc)'
-                        : 'var(--tg-color-secondary-bg, #f1f1f1)',
-                    color:
-                      compareYear === y
-                        ? 'var(--tg-color-button-text, #ffffff)'
-                        : 'var(--tg-color-text, #000000)',
-                  }}
-                >
-                  {y}
-                </button>
-              ))}
-          </div>
-          {compareYear !== null && (
-            <div className="text-[10px] opacity-50 mt-1">
-              Вместо АППГ ({year - 1}) данные за {compareYear} год
-            </div>
-          )}
         </div>
 
         {/* === Месяцы === */}

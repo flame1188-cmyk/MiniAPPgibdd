@@ -84,9 +84,6 @@ class Task:
     # Сырые карточки ДТП текущего периода — нужны для очагов, точки, LLM
     cards: List[Dict[str, Any]] = field(default_factory=list)
 
-    # Год для сравнения (None = АППГ, т.е. year-1)
-    compare_year: Optional[int] = None
-
     # Карточки за прошлый год (lazy-loaded через _ensure_prev_cards)
     prev_cards: List[Dict[str, Any]] = field(default_factory=list)
     prev_label: Optional[str] = None
