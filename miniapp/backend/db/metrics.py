@@ -162,8 +162,12 @@ async def _compute_all(
         """Количество ДТП с нетрезвыми водителями."""
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
+                # DIAG: считаем диагностику отдельно от основного запроса
                 await cur.execute("""
-                    SELECT COUNT(DISTINCT p.card_id) AS cnt
+                    SELECT COUNT(DISTINCT p.card_id) AS cnt,
+                           COUNT(*) AS total_drivers,
+                           COUNT(p.alco) AS alco_not_null,
+                           COUNT(CASE WHEN p.alco NOT IN ('0', '00', '') THEN 1 END) AS alco_non_zero
                     FROM gibdd_participants p
                     JOIN gibdd_cards c ON c.id = p.card_id
                     WHERE c.reg_code = %(reg)s
@@ -172,8 +176,13 @@ async def _compute_all(
                       AND p.alco IS NOT NULL
                       AND p.alco NOT IN ('0', '00', '')
                 """, {"reg": reg_code, "dats": dat_list})
-                r = await cur.fetchone()
-                return int(r["cnt"]) if r else 0
+                diag = await cur.fetchone()
+                logger.info(
+                    f"[DIAG q7_alcohol] reg={reg_code} dats={dat_list}: "
+                    f"cnt={diag['cnt']}, total_drivers={diag['total_drivers']}, "
+                    f"alco_not_null={diag['alco_not_null']}, alco_non_zero={diag['alco_non_zero']}"
+                )
+                return int(diag["cnt"]) if diag else 0
 
     async def _q8_pedestrian() -> int:
         """Количество ДТП с пешеходами (по участникам ИЛИ по dtpv)."""
