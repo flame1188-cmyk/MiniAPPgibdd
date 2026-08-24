@@ -31,13 +31,18 @@ def _build_menu_keyboard(
 
     card_count = len(current_cards)
 
-    prev_year = period.year - 1
-    prev_label = period.label.replace(str(period.year), str(prev_year))
+    # Определяем текущий выбранный год сравнения (если есть)
+    custom_compare = context.user_data.get("analytics_compare_year")
+    if custom_compare:
+        prev_label = period.label.replace(str(period.year), str(custom_compare))
+    else:
+        prev_year = period.year - 1
+        prev_label = period.label.replace(str(period.year), str(prev_year))
 
     buttons = []
     buttons.append([InlineKeyboardButton(
-        f"\U0001F4CA Анализ ({prev_label})",
-        callback_data="do_analytics",
+        f"\U0001F4CA Анализ (Сравнить с...)",
+        callback_data="choose_compare_year",
     )])
 
     # Кнопка "Анализ с ИИ" — доступна если есть любой LLM (бесплатный или платный)
@@ -45,14 +50,14 @@ def _build_menu_keyboard(
         if is_paid_llm_available():
             # Есть оба провайдера — покажем подменю выбора
             buttons.append([InlineKeyboardButton(
-                f"\U0001F916 Анализ с ИИ ({prev_label})",
-                callback_data="choose_ai_method",
+                f"\U0001F916 Анализ с ИИ (Сравнить с...)",
+                callback_data="choose_compare_year:ai",
             )])
         else:
-            # Только бесплатный — сразу запускаем
+            # Только бесплатный — выбор года, затем запуск
             buttons.append([InlineKeyboardButton(
-                f"\U0001F916 Анализ с ИИ ({prev_label})",
-                callback_data="do_analytics_ai",
+                f"\U0001F916 Анализ с ИИ (Сравнить с...)",
+                callback_data="choose_compare_year:ai:f",
             )])
 
     buttons.append([InlineKeyboardButton(

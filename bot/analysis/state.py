@@ -63,7 +63,8 @@ def _get_prev_cards(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> list[dict] | None:
     """
-    Получает карточки ДТП за прошлый период.
+    Получает карточки ДТП за период сравнения.
+    Учитывает analytics_compare_year если задан (мультигодовой селектор).
     Сначала проверяет user_data, потом data_cache.
     Возвращает None если данные не найдены.
     """
@@ -76,7 +77,8 @@ def _get_prev_cards(
     if not reg_code or not period:
         return None
 
-    prev_year = period.year - 1
+    compare_year = context.user_data.get("analytics_compare_year")
+    prev_year = compare_year if compare_year else period.year - 1
     dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
     cached = data_cache.get(reg_code, dat_list_prev)
     if cached:
@@ -91,6 +93,7 @@ def _clear_analytics_data(user_data: dict) -> None:
         "analytics_period", "analytics_cards", "analytics_comparison",
         "analytics_current_label", "analytics_prev_label",
         "analytics_prev_cards", "analytics_clusters",
+        "analytics_compare_year",
         "analytics_news_context", "qa_mode", "qa_llm_provider", "qa_history",
         "point_stats_mode", "point_stats_lat", "point_stats_lon", "point_stats_radius",
         "cameras_data", "waiting_camera_file", "waiting_camera_for_map",

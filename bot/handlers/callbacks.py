@@ -82,32 +82,131 @@ async def _h_back(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str)
                      reply_markup=keyboard, description="назад к регионам)")
 
 
+async def _h_choose_compare_year(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    """choose_compare_year — показать клавиатуру выбора года для сравнения.
+
+    callback_data может содержать режим после выбора:
+      choose_compare_year        → меню аналитики без ИИ
+      choose_compare_year:ai     → подменю выбора метода ИИ
+      choose_compare_year:ai:f   → сразу бесплатный ИИ
+      choose_compare_year:ai:p   → сразу платный ИИ
+    """
+    query = update.callback_query
+    period = context.user_data.get("analytics_period")
+    if not period:
+        await _safe_edit(query, "Данные не найдены. Выполните выгрузку заново.",
+                         description="выбор года (нет периода)")
+        return
+
+    current_year = period.year
+    # Доступные годы для сравнения: от 2021 до (текущий год - 1)
+    available_years = [y for y in range(current_year - 1, 2020, -1)]
+    if not available_years:
+        await _safe_edit(query, "Нет доступных годов для сравнения.",
+                         description="выбор года (нет годов)")
+        return
+
+    # Определяем, что запустить после выбора года
+    # data = "choose_compare_year" или "choose_compare_year:ai:f"
+    parts = data.split(":")
+    mode = parts[1] if len(parts) > 1 else ""  # "" | "ai" | "ai:f" | "ai:p"
+
+    buttons = []
+    row = []
+    for i, y in enumerate(available_years):
+        label = f"{y}" + (" (АППГ)" if y == current_year - 1 else "")
+        cb = f"cy:{y}:{mode}"
+        row.append(InlineKeyboardButton(label, callback_data=cb))
+        if len(row) == 2 or i == len(available_years) - 1:
+            buttons.append(row)
+            row = []
+
+    buttons.append([InlineKeyboardButton(
+        "\u21A9\uFE0F Назад", callback_data="back_to_menu",
+    )])
+
+    period_label_short = period.label
+    await _safe_edit(query,
+        f"\U0001F4CA <b>Сравнение с:</b>\n\n"
+        f"Текущий период: <b>{period_label_short}</b>\n\n"
+        f"Выберите год для сравнения:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+        description="выбор года сравнения",
+    )
+
+
+async def _h_compare_year_select(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
+    """cy:{year}:{mode} — пользователь выбрал год сравнения.
+
+    Сохраняет год в user_data и запускает аналитику в нужном режиме.
+    mode: "" | "ai" | "ai:f" | "ai:p"
+    """
+    parts = data.split(":")  # ["cy", "2024", "ai:f"]
+    if len(parts) < 3:
+        return
+    year = int(parts[1])
+    mode = parts[2]  # "" | "ai" | "ai:f" | "ai:p"
+
+    context.user_data["analytics_compare_year"] = year
+
+    if mode == "":
+        await _run_analysis(update, context, use_llm=False)
+    elif mode == "ai":
+        # Показываем подменю выбора метода ИИ
+        await _h_choose_ai_method(update, context, data)
+    elif mode == "ai:f":
+        await _run_analysis(update, context, use_llm=True, llm_provider="free")
+    elif mode == "ai:p":
+        await _run_analysis(update, context, use_llm=True, llm_provider="paid")
+
+
 async def _h_do_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
     """do_analytics — запуск аналитики без ИИ."""
+    # Сбрасываем кастомный год сравнения (АППГ по умолчанию)
+    context.user_data.pop("analytics_compare_year", None)
     await _run_analysis(update, context, use_llm=False)
 
 
 async def _h_do_analytics_ai_free(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
     """do_analytics_ai — аналитика с бесплатным LLM-провайдером."""
+    context.user_data.pop("analytics_compare_year", None)
     await _run_analysis(update, context, use_llm=True, llm_provider="free")
 
 
 async def _h_do_analytics_ai_paid(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
     """do_analytics_ai_paid — аналитика с платным LLM-провайдером."""
+    context.user_data.pop("analytics_compare_year", None)
     await _run_analysis(update, context, use_llm=True, llm_provider="paid")
 
 
 async def _h_choose_ai_method(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str) -> None:
-    """choose_ai_method — показать выбор метода ИИ (free vs paid)."""
+    """choose_ai_method — показать выбор метода ИИ (free vs paid).
+
+    Если в context.user_data есть analytics_compare_year (пользователь пришёл
+    через choose_compare_year:ai → выбрал год), кнопки используют cy: префикс
+    чтобы сохранить выбранный год.
+    """
     query = update.callback_query
+    has_custom_year = "analytics_compare_year" in context.user_data
+    # Если пользователь пришёл через выбор года, кнопки «Бесплатный»/«Полный»
+    # должны сохранить его. Используем префикс cy: с mode=ai:f/ai:p.
+    if has_custom_year:
+        yr = context.user_data["analytics_compare_year"]
+        kb_free = f"cy:{yr}:ai:f"
+        kb_paid = f"cy:{yr}:ai:p"
+    else:
+        kb_free = "do_analytics_ai"
+        kb_paid = "do_analytics_ai_paid"
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "\U0001F490 Бесплатный (GLM, ограниченный)",
-            callback_data="do_analytics_ai",
+            callback_data=kb_free,
         )],
         [InlineKeyboardButton(
             "\U0001F3AF Полный (DeepSeek, 1M контекст)",
-            callback_data="do_analytics_ai_paid",
+            callback_data=kb_paid,
         )],
         [InlineKeyboardButton(
             "\u21A9\uFE0F Назад",
@@ -554,6 +653,8 @@ _EXACT_HANDLERS: dict[str, Handler] = {
     "do_analytics_ai":       _h_do_analytics_ai_free,
     "do_analytics_ai_paid":  _h_do_analytics_ai_paid,
     "choose_ai_method":      _h_choose_ai_method,
+    "choose_compare_year":   _h_choose_compare_year,
+    "choose_compare_year:ai": _h_choose_compare_year,
     "do_concentration":      _h_do_concentration,
     "cam_skip":              _h_cam_skip,
     "cam_use_cached":        _h_cam_use_cached,
@@ -581,6 +682,7 @@ _PREFIX_HANDLERS: list[tuple[str, Handler]] = [
     ("pm:",         _h_period_month),
     ("yy:",         _h_year_nav),
     ("ps_radius:",  _h_ps_radius),
+    ("cy:",         _h_compare_year_select),
 ]
 
 

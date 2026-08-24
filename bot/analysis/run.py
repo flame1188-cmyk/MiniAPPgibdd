@@ -58,8 +58,18 @@ async def _run_analysis(
         )
         return
 
-    # Период прошлого года
-    prev_year = period.year - 1
+    # Период для сравнения (по умолчанию — АППГ, но может быть выбран другой год)
+    compare_year = context.user_data.get("analytics_compare_year")
+    if compare_year:
+        prev_year = compare_year
+        # Сбрасываем кэш prev_cards если он был загружен за другой год
+        old_label = context.user_data.get("analytics_prev_label", "")
+        expected_label = period.label.replace(str(period.year), str(prev_year))
+        if old_label and old_label != expected_label:
+            context.user_data.pop("analytics_prev_cards", None)
+            context.user_data.pop("analytics_prev_label", None)
+    else:
+        prev_year = period.year - 1
     dat_list_prev = [f"{m}.{prev_year}" for m in period.months]
     prev_label = period.label.replace(str(period.year), str(prev_year))
     current_label = period.label
@@ -102,7 +112,8 @@ async def _run_analysis(
     cached_prev = context.user_data.get("analytics_prev_cards", [])
     cached_prev_label = context.user_data.get("analytics_prev_label", "")
 
-    # Проверяем, можно ли получить метрики АППГ из SQL (без загрузки карточек).
+    # Проверяем, можно ли получить метрики из SQL (без загрузки карточек).
+    # Работает для любого года, если данные есть в gibdd_cards архиве.
     # Карточки нужны только для LLM-анализа (extract_raw_supplement,
     # calculate_cross_tables). Без LLM — SQL достаточно.
     sql_metrics_available = False
@@ -115,7 +126,7 @@ async def _run_analysis(
                 sql_metrics_available = True
                 prev_sql_total = _test_metrics["total"]
                 logger.info(
-                    f"  Аналитика: SQL-метрики АППГ доступны "
+                    f"  Аналитика: SQL-метрики за {prev_year} доступны "
                     f"({prev_sql_total} ДТП, загрузка карточек пропущена)"
                 )
         except Exception:

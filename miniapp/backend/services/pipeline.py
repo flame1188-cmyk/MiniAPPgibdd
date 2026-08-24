@@ -395,9 +395,13 @@ async def _execute_task_impl(task_id: str) -> None:
 # ============================================================
 # Загрузка данных за прошлый год (lazy)
 # ============================================================
-async def ensure_prev_cards(task: Task) -> Dict[str, Any]:
+async def ensure_prev_cards(task: Task, compare_year: int | None = None) -> Dict[str, Any]:
     """
     Гарантирует, что task.prev_cards загружены.
+
+    Args:
+        task: Task объект с dat_list и region_code.
+        compare_year: Год для сравнения (по умолчанию year-1).
 
     Возвращает:
         {
@@ -415,13 +419,14 @@ async def ensure_prev_cards(task: Task) -> Dict[str, Any]:
             "error": None if task.prev_cards else "Нет данных за прошлый год",
         }
 
-    # Вычисляем прошлый период: те же месяцы, год-1
+    # Вычисляем период для сравнения: те же месяцы, другой год
     # dat_list = ['1.2026', '2.2026', ...] -> ['1.2025', '2.2025', ...]
     prev_dat_list = []
     for dat in task.dat_list:
         try:
             m, y = dat.split(".")
-            prev_dat_list.append(f"{m}.{int(y) - 1}")
+            target_year = compare_year if compare_year else int(y) - 1
+            prev_dat_list.append(f"{m}.{target_year}")
         except Exception:
             continue
 
@@ -429,11 +434,11 @@ async def ensure_prev_cards(task: Task) -> Dict[str, Any]:
         task.prev_cards_loaded = True
         return {"ok": False, "error": "Не удалось вычислить прошлый период"}
 
-    # Формируем label прошлого периода
+    # Формируем label периода сравнения
     try:
         year = int(task.dat_list[0].split(".")[1])
-        prev_year = year - 1
-        prev_label = task.period_label.replace(str(year), str(prev_year))
+        target_year = compare_year if compare_year else year - 1
+        prev_label = task.period_label.replace(str(year), str(target_year))
     except Exception:
         prev_label = f"Прошлый период ({prev_dat_list[0]})"
 
