@@ -390,7 +390,7 @@ async def _h_change_data(update: Update, context: ContextTypes.DEFAULT_TYPE, dat
     query = update.callback_query
     # Полная очистка памяти при смене региона.
     # 1) Удаляем карточки старого региона из глобального data_cache
-    #    (это критично — analytics_cards и data_cache ссылаются
+    #    (это критично — analytics_cards и кэш ссылаются
     #    на одни и те же dict-объекты, поэтому очистка user_data
     #    без очистки кэша НЕ освобождает память).
     _old_reg_for_cache = context.user_data.get("reg_code")
@@ -399,13 +399,9 @@ async def _h_change_data(update: Update, context: ContextTypes.DEFAULT_TYPE, dat
     if _old_reg_for_cache:
         removed = await data_cache_invalidate_region_async(_old_reg_for_cache)
         logger.info(
-            f"Смена данных: из кэша удалено {removed} записей региона {_old_reg_for_cache}"
+            f"Смена данных: из кэша БД удалено {removed} записей региона {_old_reg_for_cache}"
         )
-    else:
-        # reg_code отсутствует — очищаем весь in-memory кэш на всякий случай.
-        # (БД не трогаем — там могут быть валидные записи других пользователей.)
-        data_cache.clear()
-        logger.info("Смена данных: reg_code отсутствует, кэш полностью очищен")
+    # In-memory кэш карточек удалён — очищать нечего.
 
     # 2) Очищаем user_data (карточки, полигоны, очаги, etc.)
     _clear_analytics_data(context.user_data)
