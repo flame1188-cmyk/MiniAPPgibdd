@@ -2464,9 +2464,13 @@ def find_nonsettlement_preclusters(
                 first_coords = _parse_coords(group_cards[0])
                 last_coords = _parse_coords(group_cards[-1])
 
+                # Если все ДТП в предочаге — перекрёстки, помечаем как перекрёсток
+                all_intersection = all(_is_intersection(c) for c in group_cards)
+                zone = "nonsettlement_intersection" if all_intersection else "nonsettlement"
+
                 all_preclusters.append(
                     _build_precluster(
-                        group_cards, coords or first_coords, "nonsettlement",
+                        group_cards, coords or first_coords, zone,
                         road_name=road_name,
                         start_pos=window_start,
                         end_pos=window_end,
@@ -2571,9 +2575,13 @@ def find_nonsettlement_concentration_points(cards: list[dict]) -> list[dict]:
                 first_coords = _parse_coords(group_cards[0])
                 last_coords = _parse_coords(group_cards[-1])
 
+                # Если все ДТП в очаге — перекрёстки, помечаем как перекрёсток
+                all_intersection = all(_is_intersection(c) for c in group_cards)
+                zone = "nonsettlement_intersection" if all_intersection else "nonsettlement"
+
                 all_clusters.append(
                     _build_cluster(
-                        group_cards, coords or first_coords, "nonsettlement",
+                        group_cards, coords or first_coords, zone,
                         road_name=road_name,
                         start_pos=window_start,
                         end_pos=window_end,
@@ -2594,6 +2602,7 @@ ZONE_TYPE_LABELS = {
     "settlement_intersection": "НП - Перекрёсток",
     "settlement_road": "НП - Участок дороги (пикетаж)",
     "settlement_segment": "НП - Участок дороги",
+    "nonsettlement_intersection": "Вне НП - Перекрёсток",
     "nonsettlement": "Вне НП",
 }
 
