@@ -237,9 +237,11 @@ async def start_llm_summary_endpoint(
 
     state = task.llm_summary_state
 
-    # Если уже выполнено с тем же провайдером — возвращаем готовое
+    # Если уже выполнено с тем же провайдером И не запрошена перегенерация —
+    # возвращаем готовое.
     if (
-        state.status == AnalysisStatus.DONE
+        not request.force_refresh
+        and state.status == AnalysisStatus.DONE
         and state.result
         and state.result.get("provider") == request.provider
     ):
@@ -257,9 +259,11 @@ async def start_llm_summary_endpoint(
         # Простая логика: пусть выполняется до конца, потом можно перезапустить
         return LLMSummaryResponse(state=_state_to_response(state))
 
-    # Перезапуск
+    # Перезапуск (включая при force_refresh=True)
     loop = asyncio.get_running_loop()
-    loop.create_task(start_llm_summary(task, provider=request.provider))
+    loop.create_task(start_llm_summary(
+        task, provider=request.provider, force_refresh=request.force_refresh,
+    ))
 
     return LLMSummaryResponse(state=_state_to_response(state))
 
