@@ -251,14 +251,25 @@ export function ClustersView({ task }: ClustersViewProps) {
     )
   }
 
-  // === Running ===
-  if (data?.state.status === 'running' || starting) {
-    const stage = data?.state.stage || 'Подготовка...'
-    const progress = data?.state.progress ?? 5
+  // === Running (включая пересчёт) ===
+  // refreshing=true — пользователь нажал «Пересчитать».
+  // data?.result ещё в кэше React Query (старый результат),
+  // но бэкенд уже сбросил state → карта вернёт 404.
+  // Поэтому при refreshing показываем прогресс, а не Done с картой.
+  if (data?.state.status === 'running' || starting || refreshing) {
+    const isActuallyRunning = data?.state.status === 'running'
+    const stage = isActuallyRunning
+      ? (data?.state.stage || 'Подготовка...')
+      : 'Перезапуск расчёта...'
+    const progress = isActuallyRunning
+      ? (data?.state.progress ?? 5)
+      : 5
     return (
       <div className="tg-card text-center py-6">
         <div className="text-3xl mb-2 animate-pulse">⏳</div>
-        <div className="font-medium mb-1">Расчёт очагов...</div>
+        <div className="font-medium mb-1">
+          {refreshing && !isActuallyRunning ? 'Пересчёт очагов...' : 'Расчёт очагов...'}
+        </div>
         <div className="text-xs opacity-70 mb-3">
           {stage}
         </div>
