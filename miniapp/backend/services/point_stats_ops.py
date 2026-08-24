@@ -95,7 +95,7 @@ async def generate_point_stats_map_html(
 
         # Загружаем прошлый год (если ещё нет)
         if not task.prev_cards_loaded:
-            await ensure_prev_cards(task)
+            await ensure_prev_cards(task, compare_year=task.compare_year)
         prev_cards = task.prev_cards or []
 
         # Камеры в радиусе

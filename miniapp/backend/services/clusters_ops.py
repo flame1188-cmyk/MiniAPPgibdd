@@ -192,7 +192,7 @@ async def start_clusters_calculation(task: Task) -> None:
         state.stage = "Загрузка данных за прошлый год..."
         _push_clusters_state_to_redis(task)  # Phase C.4: progress=10
         if not task.prev_cards_loaded:
-            await ensure_prev_cards(task)
+            await ensure_prev_cards(task, compare_year=task.compare_year)
         prev_cards = task.prev_cards or []
 
         async def progress_cb(text: str) -> None:

@@ -106,7 +106,7 @@ async def ensure_comparison(task: Task) -> Dict[str, Any]:
         return metrics
 
     async def _load_and_calc_prev():
-        prev_result = await ensure_prev_cards(task)
+        prev_result = await ensure_prev_cards(task, compare_year=task.compare_year)
         if not prev_result.get("ok") or not prev_result.get("prev_cards"):
             return None, prev_result
         prev_cards_id = id(task.prev_cards)
@@ -217,7 +217,7 @@ async def compute_point_stats(
     prev_cards = []
     prev_label = ""
     if not task.prev_cards_loaded:
-        await ensure_prev_cards(task)
+        await ensure_prev_cards(task, compare_year=task.compare_year)
     prev_cards = task.prev_cards or []
     prev_label = task.prev_label or ""
 

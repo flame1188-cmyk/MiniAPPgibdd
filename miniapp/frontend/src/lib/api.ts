@@ -199,6 +199,7 @@ export interface StructuredTaskRequest {
   region_name: string
   dat_list: string[]          // ['1.2025', '2.2025', ...]
   period_label: string         // '2025 год' / 'I квартал 2025'
+  compare_year?: number | null  // Год для сравнения (null = АППГ)
 }
 
 // ============================================================

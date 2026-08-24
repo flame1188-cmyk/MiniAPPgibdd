@@ -377,7 +377,7 @@ async def _run_llm_summary_inner(
 
     state.stage = "Загрузка данных за прошлый год..."
     if not task.prev_cards_loaded:
-        await ensure_prev_cards(task)
+        await ensure_prev_cards(task, compare_year=task.compare_year)
 
     state.progress = 20
     state.stage = "Расчёт сравнительных метрик..."
@@ -1032,7 +1032,7 @@ async def stream_llm_summary(
 
     state.stage = "Загрузка данных за прошлый год..."
     if not task.prev_cards_loaded:
-        await ensure_prev_cards(task)
+        await ensure_prev_cards(task, compare_year=task.compare_year)
 
     state.progress = 20
     state.stage = "Расчёт сравнительных метрик..."

@@ -76,6 +76,10 @@ class TaskCreateRequest(BaseModel):
         default=None,
         description="Человекочитаемая метка периода (например '2025 год').",
     )
+    compare_year: Optional[int] = Field(
+        default=None,
+        description="Год для сравнения (например 2024). По умолчанию АППГ (year-1).",
+    )
 
 
 class TaskCreateResponse(BaseModel):
@@ -190,6 +194,7 @@ async def create_dtp_task(
         period_label=period_label,
         dat_list=dat_list,
         raw_query=raw_query,
+        compare_year=request.compare_year,
     )
 
     # Hotfix Sprint 7: гарантированно persist'им метаданные задачи в БД
