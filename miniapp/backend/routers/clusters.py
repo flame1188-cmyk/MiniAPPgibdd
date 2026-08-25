@@ -186,17 +186,18 @@ async def start_clusters(
                 f"Task {task_id}: clusters state=DONE, но raw_clusters/"
                 f"raw_preclusters пусты — форсируем recompute (Sprint 3.2)"
             )
-            # Сбрасываем state и запускаем расчёт заново.
-            # После пересчёта state.result и raw_clusters заполнятся,
-            # а put_cached_clusters обновит запись в clusters_cache
-            # (теперь уже с raw_clusters). Следующий запрос вернёт DONE
-            # без recompute.
-            state.status = AnalysisStatus.IDLE
-            state.progress = 0
-            state.stage = "Запуск..."
-            state.started_at = None
-            state.finished_at = None
-            state.result = None
+            # Ставим RUNNING (не IDLE!), чтобы:
+            # 1. GET /clusters?wait=25 начал long-poll (ждёт только RUNNING)
+            # 2. GET /clusters/map вернул 404 (status != DONE) — frontend
+            #    не показывает карту во время пересчёта
+            # 3. Frontend polling продолжил опрос (refetchInterval
+            #    останавливается только на done/failed/idle)
+            state.status = AnalysisStatus.RUNNING
+            state.progress = 5
+            state.stage = "Пересчёт (восстановление данных)..."
+            state.error = None
+            # НЕ очищаем result — он всё равно не отдаётся при status != DONE,
+            # но позволяет map endpoint'у работать если фоновый таск ещё не стартовал
             # raw_clusters/raw_preclusters и так пустые
             loop = asyncio.get_running_loop()
             loop.create_task(start_clusters_calculation(task, force_refresh=True))
@@ -210,14 +211,23 @@ async def start_clusters(
     if state.status == AnalysisStatus.RUNNING:
         return ClustersResponse(state=_state_to_response(state))
 
-    # === Пересчёт (включая при force_refresh=True) ===
-    # Сбрасываем state, чтобы UI сразу увидел running, а не старый done.
-    state.status = AnalysisStatus.IDLE
-    state.progress = 0
-    state.stage = "Запуск..."
-    state.started_at = None
-    state.finished_at = None
-    state.result = None
+    # === Запуск / Пересчёт (включая при force_refresh=True) ===
+    # Ставим RUNNING сразу (не IDLE!), чтобы:
+    # 1. Frontend polling не остановился (refetchInterval: false только
+    #    при done/failed/idle — RUNNING продолжает опрос)
+    # 2. GET /clusters?wait=25 начал long-poll (ждёт только RUNNING)
+    # 3. GET /clusters/map вернул 404 (status != DONE) — frontend
+    #    не рендерит iframe пока идёт пересчёт
+    #
+    # start_clusters_calculation() тоже поставит RUNNING (idempotent)
+    # и очистит result — это безопасно.
+    state.status = AnalysisStatus.RUNNING
+    state.progress = 5
+    state.stage = "Запуск расчёта..."
+    state.error = None
+    # НЕ очищаем result — GET /clusters не отдаёт его при status != DONE,
+    # а map endpoint проверяет status != DONE и вернёт 404.
+    # Сохраняем старый результат на случай если кто-то уже имеет открытую карту.
     loop = asyncio.get_running_loop()
     loop.create_task(start_clusters_calculation(task, force_refresh=request.force_refresh))
 

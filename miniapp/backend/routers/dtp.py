@@ -791,12 +791,23 @@ async def compare_task_year(
     """
     from ..services.gibdd_service import get_task_async
     from ..services.analytics_ops import ensure_comparison
+    from ..services.gibdd_service import ensure_cards
 
     task = await get_task_async(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Задача не найдена")
     if task.user_id != user.id:
         raise HTTPException(status_code=403, detail="Нет доступа")
+
+    # Sprint 3.1: восстанавливаем task.cards из cards_cache, если
+    # задача была выгружена из in-memory LRU или после рестарта.
+    if not task.cards:
+        result = await ensure_cards(task)
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error", "Карточки текущего периода не загружены"),
+            )
     if not task.cards:
         raise HTTPException(
             status_code=400,
