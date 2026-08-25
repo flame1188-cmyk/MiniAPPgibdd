@@ -14,6 +14,10 @@
 Алкоголь и пешеходы ищутся в первую очередь через нормализованную таблицу
   gibdd_participants (надёжные индексированные столбцы alco / kt_uch).
   Fallback на JSONB-разбор raw_payload для периодов с неполной нормализацией.
+
+  ВАЖНО: PostgreSQL LOWER() не работает для кириллицы при C-коллейции
+  (по умолчанию). Поэтому сравнения kt_uch используют точный регистр
+  ('Водитель', 'Пешеход') вместо LOWER().
 """
 from __future__ import annotations
 
@@ -176,7 +180,7 @@ async def _compute_all(
                     WHERE c.reg_code = %(reg)s
                       AND c.dat_period = ANY(%(dats)s)
                       AND p.kt_uch IS NOT NULL
-                      AND LOWER(TRIM(p.kt_uch)) = 'водитель'
+                      AND TRIM(p.kt_uch) = 'Водитель'
                       AND p.alco IS NOT NULL
                       AND TRIM(p.alco) NOT IN ('00', '0', '')
                 """, {"reg": reg_code, "dats": dat_list})
@@ -200,7 +204,7 @@ async def _compute_all(
                                    jsonb_array_elements(
                                        COALESCE(ts->'ts_uch', '[]'::jsonb)
                                    ) AS uch
-                              WHERE LOWER(TRIM(uch->>'kt_uch')) = 'водитель'
+                              WHERE TRIM(uch->>'kt_uch') = 'Водитель'
                                 AND uch->>'alco' IS NOT NULL
                                 AND TRIM(uch->>'alco') NOT IN ('0', '00', '')
                           )
@@ -230,7 +234,7 @@ async def _compute_all(
                               FROM gibdd_participants p
                               WHERE p.card_id = c.id
                                 AND p.kt_uch IS NOT NULL
-                                AND LOWER(TRIM(p.kt_uch)) = 'пешеход'
+                                AND TRIM(p.kt_uch) = 'Пешеход'
                           )
                           OR c.dtpv ILIKE '%%пешеход%%'
                           OR c.dtpv ILIKE '%%сим%%'
@@ -252,7 +256,7 @@ async def _compute_all(
                                   FROM jsonb_array_elements(
                                       COALESCE(c.raw_payload->'uch_info', '[]'::jsonb)
                                   ) AS uch
-                                  WHERE LOWER(TRIM(uch->>'kt_uch')) = 'пешеход'
+                                  WHERE TRIM(uch->>'kt_uch') = 'Пешеход'
                               )
                               OR c.dtpv ILIKE '%%пешеход%%'
                               OR c.dtpv ILIKE '%%сим%%'

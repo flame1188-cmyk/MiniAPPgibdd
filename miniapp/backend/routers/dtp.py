@@ -784,8 +784,10 @@ async def compare_task_year(
 ):
     """Пересчитывает сравнение аналитики с указанным годом.
 
-    Использует SQL-агрегацию (calculate_metrics_from_db) — быстрый запрос
-    без загрузки сырых карточек. Текущие метрики берутся из кэша задачи.
+    SQL-агрегация за compare_year через calculate_metrics_from_db() —
+    быстрые индексированные запросы к gibdd_cards + gibdd_participants.
+    Python calculate_metrics() используется только для текущего периода
+    (у которого карточки уже в памяти).
 
     compare_year=None → АППГ (year-1, по умолчанию).
     """
@@ -859,10 +861,16 @@ async def compare_task_year(
     else:
         current_metrics = task.current_metrics
 
-    # Метрики за compare_year — через SQL (быстро, без RAM)
+    # Метрики за compare_year — SQL-агрегация (быстро, без загрузки карточек в RAM)
     from ..db.metrics import calculate_metrics_from_db
 
     prev_metrics = await calculate_metrics_from_db(task.region_code, prev_dat_list)
+    logger.info(
+        f"Task {task.id}: compare year={target_year} — "
+        f"SQL metrics, total={prev_metrics.get('total') if prev_metrics else 'N/A'}, "
+        f"alcohol={prev_metrics.get('alcohol', '?') if prev_metrics else 'N/A'}, "
+        f"pedestrians={prev_metrics.get('pedestrians', '?') if prev_metrics else 'N/A'}"
+    )
 
     if not prev_metrics:
         # Нет данных за этот год
