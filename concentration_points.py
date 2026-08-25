@@ -1570,102 +1570,6 @@ def classify_cards(
 
 
 # ========================
-# Причины ДТП (для обогащения очагов и LLM-контекста)
-# ========================
-
-# Ключевые слова для фильтрации сопутствующих нарушений ПДД
-_SOP_NPDD_FILTER_WORDS = ("опьянение", "лишенным", "имеющим")
-
-
-def _build_cause_counters(cards: list[dict]) -> dict[str, dict[str, int]]:
-    """Строит счётчики причин ДТП по всем карточкам очага.
-
-    Возвращает dict с 6 счётчиками:
-      npdd_counter  — Непосредственные нарушения ПДД
-      sop_npdd_counter — Сопутствующие нарушения (фильтр: опьянение/лишенным/имеющим)
-      ndu_counter   — Недостатки транспортно-эксплуатационного содержания
-      spch_counter  — Состояние проезжей части
-      factor_counter — Фактор режима движения
-      tn_counter    — Технические неисправности
-    """
-    npdd_counter: Counter = Counter()
-    sop_npdd_counter: Counter = Counter()
-    ndu_counter: Counter = Counter()
-    spch_counter: Counter = Counter()
-    factor_counter: Counter = Counter()
-    tn_counter: Counter = Counter()
-
-    for c in cards:
-        # --- dor_usl (уровень карточки) ---
-        dor_usl = c.get("dor_usl") or {}
-        if isinstance(dor_usl, dict):
-            for item in (dor_usl.get("ndu") or []):
-                s = str(item).strip()
-                if s:
-                    ndu_counter[s] += 1
-            spch_val = str(dor_usl.get("s_pch", "")).strip()
-            if spch_val:
-                spch_counter[spch_val] += 1
-            for item in (dor_usl.get("factor") or []):
-                s = str(item).strip()
-                if s:
-                    factor_counter[s] += 1
-
-        # --- ts_info → ts_uch (уровень участников-водителей) ---
-        for ts in (c.get("ts_info") or []):
-            # Технические неисправности ТС
-            tn_val = str(ts.get("t_n", "")).strip()
-            if tn_val:
-                tn_counter[tn_val] += 1
-            for uch in (ts.get("ts_uch") or []):
-                for v in (uch.get("npdd") or []):
-                    s = str(v).strip()
-                    if s:
-                        npdd_counter[s] += 1
-                for v in (uch.get("sop_npdd") or []):
-                    s = str(v).strip()
-                    if s and _matches_sop_filter(s):
-                        sop_npdd_counter[s] += 1
-
-        # --- uch_info (пешеходы и прочие участники) ---
-        for uch in (c.get("uch_info") or []):
-            for v in (uch.get("npdd") or []):
-                s = str(v).strip()
-                if s:
-                    npdd_counter[s] += 1
-            for v in (uch.get("sop_npdd") or []):
-                s = str(v).strip()
-                if s and _matches_sop_filter(s):
-                    sop_npdd_counter[s] += 1
-
-    return {
-        "npdd_counter": dict(npdd_counter),
-        "sop_npdd_counter": dict(sop_npdd_counter),
-        "ndu_counter": dict(ndu_counter),
-        "spch_counter": dict(spch_counter),
-        "factor_counter": dict(factor_counter),
-        "tn_counter": dict(tn_counter),
-    }
-
-
-def _matches_sop_filter(text: str) -> bool:
-    """Проверяет, содержит ли сопутствующее нарушение ключевые слова."""
-    lower = text.lower()
-    return any(w in lower for w in _SOP_NPDD_FILTER_WORDS)
-
-
-def _format_counter(counter: dict[str, int], top_n: int = 5) -> str:
-    """Форматирует счётчик в строку: "Значение 1 (5); Значение 2 (3)"."""
-    if not counter:
-        return ""
-    parts = [
-        f"{k} ({v})"
-        for k, v in sorted(counter.items(), key=lambda x: -x[1])[:top_n]
-    ]
-    return "; ".join(parts)
-
-
-# ========================
 # Алгоритм: НП (перекрёстки 50 м, участки 100 м)
 # ========================
 
@@ -1682,7 +1586,6 @@ def _build_cluster(
     total_injured = sum(_safe_int(c.get("ran")) for c in cards)
     dates = [_get_date(c) for c in cards]
     type_counter = Counter(_get_dtp_type(c) for c in cards)
-    cause_counters = _build_cause_counters(cards)
 
     dominant = None
     for t, cnt in type_counter.most_common():
@@ -1727,8 +1630,6 @@ def _build_cluster(
         # Реальные границы очага по ДТП (для определения "закрыт")
         "dtp_pk_min": dtp_pk_min,
         "dtp_pk_max": dtp_pk_max,
-        # Причины ДТП (счётчики для Excel и LLM)
-        **cause_counters,
     }
 
 
@@ -1745,7 +1646,6 @@ def _build_precluster(
     total_injured = sum(_safe_int(c.get("ran")) for c in cards)
     dates = [_get_date(c) for c in cards]
     type_counter = Counter(_get_dtp_type(c) for c in cards)
-    cause_counters = _build_cause_counters(cards)
 
     dominant = None
     for t, cnt in type_counter.most_common():
@@ -1798,8 +1698,6 @@ def _build_precluster(
         # Специфичные поля предочага
         "is_precluster": True,
         "precluster_criterion": criterion,
-        # Причины ДТП (счётчики для Excel и LLM)
-        **cause_counters,
     }
 
 
@@ -2957,13 +2855,6 @@ def build_concentration_excel_data(
             "Ранено": str(cluster["injured"]),
             "Дата первого ДТП": first_date,
             "Дата последнего ДТП": last_date,
-            # --- Причины ДТП ---
-            "Непосредственные нарушения ПДД": _format_counter(cluster.get("npdd_counter", {})),
-            "Сопутствующие нарушения ПДД (опьянение/лишение)": _format_counter(cluster.get("sop_npdd_counter", {})),
-            "Недостатки ТЭС": _format_counter(cluster.get("ndu_counter", {})),
-            "Состояние проезжей части": _format_counter(cluster.get("spch_counter", {})),
-            "Фактор режима движения": _format_counter(cluster.get("factor_counter", {})),
-            "Технические неисправности": _format_counter(cluster.get("tn_counter", {})),
             # --- Камеры фотовидеофиксации ---
             **_camera_row_fields(cluster),
         })
@@ -3024,13 +2915,6 @@ def build_precluster_excel_data(
             "Дата первого ДТП": first_date,
             "Дата последнего ДТП": last_date,
             "Критерий предочага": pc.get("precluster_criterion", ""),
-            # --- Причины ДТП ---
-            "Непосредственные нарушения ПДД": _format_counter(pc.get("npdd_counter", {})),
-            "Сопутствующие нарушения ПДД (опьянение/лишение)": _format_counter(pc.get("sop_npdd_counter", {})),
-            "Недостатки ТЭС": _format_counter(pc.get("ndu_counter", {})),
-            "Состояние проезжей части": _format_counter(pc.get("spch_counter", {})),
-            "Фактор режима движения": _format_counter(pc.get("factor_counter", {})),
-            "Технические неисправности": _format_counter(pc.get("tn_counter", {})),
             # --- Камеры фотовидеофиксации ---
             **_camera_row_fields(pc),
         })
