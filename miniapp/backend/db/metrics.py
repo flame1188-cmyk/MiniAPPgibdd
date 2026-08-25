@@ -11,8 +11,9 @@
 Основной индекс:
   - idx_cards_reg_dat (reg_code, dat_period)
 
-Алкоголь и пешеходы ищутся через raw_payload (JSONB),
-т.к. gibdd_participants может быть не заполнена для некоторых периодов.
+Алкоголь и пешеходы ищутся в первую очередь через нормализованную таблицу
+  gibdd_participants (надёжные индексированные столбцы alco / kt_uch).
+  Fallback на JSONB-разбор raw_payload для периодов с неполной нормализацией.
 """
 from __future__ import annotations
 
@@ -161,37 +162,63 @@ async def _compute_all(
     async def _q7_alcohol() -> int:
         """Количество ДТП с нетрезвыми водителями.
 
-        Ищет в raw_payload->ts_info[*].ts_uch[*], аналогично
-        _has_alcohol() из analytics.py. Не зависит от gibdd_participants.
+        Использует нормализованную таблицу gibdd_participants (alco + kt_uch)
+        с частичным индексом idx_participants_alco. Fallback на JSONB-разбор
+        raw_payload, если участники не были нормализованы при ETL.
         """
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
+                # Основной запрос через нормализованную таблицу участников
                 await cur.execute("""
-                    SELECT COUNT(DISTINCT c.id) AS cnt
-                    FROM gibdd_cards c
+                    SELECT COUNT(DISTINCT p.card_id) AS cnt
+                    FROM gibdd_participants p
+                    JOIN gibdd_cards c ON p.card_id = c.id
                     WHERE c.reg_code = %(reg)s
                       AND c.dat_period = ANY(%(dats)s)
-                      AND EXISTS (
-                          SELECT 1
-                          FROM jsonb_array_elements(c.raw_payload->'ts_info') AS ts,
-                               jsonb_array_elements(ts->'ts_uch') AS uch
-                          WHERE LOWER(TRIM(uch->>'kt_uch')) = 'водитель'
-                            AND uch->>'alco' IS NOT NULL
-                            AND TRIM(uch->>'alco') NOT IN ('0', '00', '')
-                      )
+                      AND p.kt_uch IS NOT NULL
+                      AND LOWER(TRIM(p.kt_uch)) = 'водитель'
+                      AND p.alco IS NOT NULL
+                      AND TRIM(p.alco) NOT IN ('00', '0', '')
                 """, {"reg": reg_code, "dats": dat_list})
                 r = await cur.fetchone()
-                return int(r["cnt"]) if r else 0
+                count = int(r["cnt"]) if r else 0
+
+                # Fallback: если через участников нашли 0, пробуем JSONB
+                # (на случай неполной нормализации при ETL)
+                if count == 0:
+                    await cur.execute("""
+                        SELECT COUNT(DISTINCT c.id) AS cnt
+                        FROM gibdd_cards c
+                        WHERE c.reg_code = %(reg)s
+                          AND c.dat_period = ANY(%(dats)s)
+                          AND c.raw_payload IS NOT NULL
+                          AND EXISTS (
+                              SELECT 1
+                              FROM jsonb_array_elements(
+                                  COALESCE(c.raw_payload->'ts_info', '[]'::jsonb)
+                              ) AS ts,
+                                   jsonb_array_elements(
+                                       COALESCE(ts->'ts_uch', '[]'::jsonb)
+                                   ) AS uch
+                              WHERE LOWER(TRIM(uch->>'kt_uch')) = 'водитель'
+                                AND uch->>'alco' IS NOT NULL
+                                AND TRIM(uch->>'alco') NOT IN ('0', '00', '')
+                          )
+                    """, {"reg": reg_code, "dats": dat_list})
+                    r2 = await cur.fetchone()
+                    count = int(r2["cnt"]) if r2 else 0
+
+                return count
 
     async def _q8_pedestrian() -> int:
         """Количество ДТП с пешеходами.
 
-        Ищет в raw_payload->uch_info[*].kt_uch ИЛИ по полю dtpv,
-        аналогично _has_pedestrian() из analytics.py.
-        Не зависит от gibdd_participants.
+        Использует нормализованную таблицу gibdd_participants (kt_uch)
+        + fallback по полю dtpv. Аналогично _has_pedestrian() из analytics.py.
         """
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
+                # Основной запрос через нормализованную таблицу участников
                 await cur.execute("""
                     SELECT COUNT(DISTINCT c.id) AS cnt
                     FROM gibdd_cards c
@@ -200,15 +227,41 @@ async def _compute_all(
                       AND (
                           EXISTS (
                               SELECT 1
-                              FROM jsonb_array_elements(c.raw_payload->'uch_info') AS uch
-                              WHERE LOWER(TRIM(uch->>'kt_uch')) = 'пешеход'
+                              FROM gibdd_participants p
+                              WHERE p.card_id = c.id
+                                AND p.kt_uch IS NOT NULL
+                                AND LOWER(TRIM(p.kt_uch)) = 'пешеход'
                           )
                           OR c.dtpv ILIKE '%%пешеход%%'
                           OR c.dtpv ILIKE '%%сим%%'
                       )
                 """, {"reg": reg_code, "dats": dat_list})
                 r = await cur.fetchone()
-                return int(r["cnt"]) if r else 0
+                count = int(r["cnt"]) if r else 0
+
+                # Fallback: если через участников нашли 0, пробуем JSONB
+                if count == 0:
+                    await cur.execute("""
+                        SELECT COUNT(DISTINCT c.id) AS cnt
+                        FROM gibdd_cards c
+                        WHERE c.reg_code = %(reg)s
+                          AND c.dat_period = ANY(%(dats)s)
+                          AND (
+                              EXISTS (
+                                  SELECT 1
+                                  FROM jsonb_array_elements(
+                                      COALESCE(c.raw_payload->'uch_info', '[]'::jsonb)
+                                  ) AS uch
+                                  WHERE LOWER(TRIM(uch->>'kt_uch')) = 'пешеход'
+                              )
+                              OR c.dtpv ILIKE '%%пешеход%%'
+                              OR c.dtpv ILIKE '%%сим%%'
+                          )
+                    """, {"reg": reg_code, "dats": dat_list})
+                    r2 = await cur.fetchone()
+                    count = int(r2["cnt"]) if r2 else 0
+
+                return count
 
     async def _q9_weather() -> list[dict]:
         """Группировка по погоде с тяжестью.
@@ -239,17 +292,35 @@ async def _compute_all(
                 """, {"reg": reg_code, "dats": dat_list})
                 return await cur.fetchall()
 
-    # Запускаем все запросы параллельно
+    # Запускаем все запросы параллельно.
+    # return_exceptions=True: если один запрос упадёт (например JSONB-парсинг),
+    # остальные всё равно вернут результат. Падавший запрос заменяется на
+    # дефолтное значение (0 / []).
+    _DEFAULTS = [None, [], [], [], [], [], 0, 0, []]
     results = await asyncio.gather(
         _q1_totals(), _q2_type(), _q3_hour(), _q4_weekday(),
         _q5_month(), _q6_road(), _q7_alcohol(), _q8_pedestrian(),
         _q9_weather(),
+        return_exceptions=True,
     )
+
+    # Заменяем исключения на дефолтные значения и логируем
+    safe_results = []
+    for i, r in enumerate(results):
+        if isinstance(r, BaseException):
+            logger.warning(f"SQL metrics query #{i} failed: {r}")
+            safe_results.append(_DEFAULTS[i])
+        else:
+            safe_results.append(r)
 
     (totals,
      type_rows, hour_rows, weekday_rows, month_rows, road_rows,
      alcohol_count, pedestrian_count,
-     weather_rows) = results
+     weather_rows) = safe_results
+
+    # Если базовые агрегаты не получили — возвращаем None целиком
+    if totals is None:
+        return None
     total, deaths, injured = totals
 
     # --- Постобработка: группировки (как в analytics.py) ---
