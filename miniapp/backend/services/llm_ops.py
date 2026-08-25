@@ -215,6 +215,13 @@ async def _check_llm_cache(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
+                # Причины ДТП (счётчики для LLM-рекомендаций)
+                "npdd_counter": c.get("npdd_counter", {}),
+                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
+                "ndu_counter": c.get("ndu_counter", {}),
+                "spch_counter": c.get("spch_counter", {}),
+                "factor_counter": c.get("factor_counter", {}),
+                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -424,6 +431,13 @@ async def _run_llm_summary_inner(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
+                # Причины ДТП (счётчики для LLM-рекомендаций)
+                "npdd_counter": c.get("npdd_counter", {}),
+                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
+                "ndu_counter": c.get("ndu_counter", {}),
+                "spch_counter": c.get("spch_counter", {}),
+                "factor_counter": c.get("factor_counter", {}),
+                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -839,6 +853,13 @@ async def ask_llm_question_stream(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
+                # Причины ДТП (счётчики для LLM-рекомендаций)
+                "npdd_counter": c.get("npdd_counter", {}),
+                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
+                "ndu_counter": c.get("ndu_counter", {}),
+                "spch_counter": c.get("spch_counter", {}),
+                "factor_counter": c.get("factor_counter", {}),
+                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -1069,6 +1090,13 @@ async def stream_llm_summary(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
+                # Причины ДТП (счётчики для LLM-рекомендаций)
+                "npdd_counter": c.get("npdd_counter", {}),
+                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
+                "ndu_counter": c.get("ndu_counter", {}),
+                "spch_counter": c.get("spch_counter", {}),
+                "factor_counter": c.get("factor_counter", {}),
+                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]

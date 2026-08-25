@@ -413,6 +413,13 @@ def _serialize_cluster(c: dict) -> dict:
         # Флаги для фильтрации на фронтенде/карте
         "is_lost": c.get("_is_lost", False),
         "is_prev_matched": c.get("_is_prev_matched", False),
+        # Причины ДТП (счётчики для Excel и LLM)
+        "npdd_counter": c.get("npdd_counter", {}),
+        "sop_npdd_counter": c.get("sop_npdd_counter", {}),
+        "ndu_counter": c.get("ndu_counter", {}),
+        "spch_counter": c.get("spch_counter", {}),
+        "factor_counter": c.get("factor_counter", {}),
+        "tn_counter": c.get("tn_counter", {}),
     }
 
 
