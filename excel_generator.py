@@ -616,6 +616,12 @@ def generate_concentration_dynamics_file(
         "Ранено": 8,
         "Дата первого ДТП": 14,
         "Дата последнего ДТП": 14,
+        "Непосредственные нарушения ПДД": 45,
+        "Сопутствующие нарушения ПДД (опьянение/лишение)": 45,
+        "Недостатки ТЭС": 40,
+        "Состояние проезжей части": 30,
+        "Фактор режима движения": 30,
+        "Технические неисправности": 35,
     }
     for col_idx, col_name in enumerate(current_year_columns, start=1):
         col_letter = ws1.cell(row=1, column=col_idx).column_letter
