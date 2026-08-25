@@ -38,7 +38,7 @@
  *  - График по погоде (сортировка по выбранной метрике)
  */
 import { useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Bar,
   BarChart,
@@ -194,6 +194,14 @@ export function AnalyticsView({ analytics, taskId }: AnalyticsViewProps) {
   const compareMutation = useMutation({
     mutationFn: (year: number | null) => api.compareTaskYear(taskId, year),
   })
+
+  // === Динамика по годам (autoload) ===
+  const multiYearQuery = useQuery({
+    queryKey: ['multi-year', taskId],
+    queryFn: () => api.multiYearDynamics(taskId),
+    staleTime: 5 * 60 * 1000,
+  })
+  const multiYearData = multiYearQuery.data?.years ?? []
 
   // Оверрайд-данные: если мутация успешна, используем их вместо оригинальных
   const overrideData = compareMutation.data
@@ -490,6 +498,66 @@ export function AnalyticsView({ analytics, taskId }: AnalyticsViewProps) {
           Все графики ниже отображают выбранную метрику
         </div>
       </div>
+
+      {/* === Динамика по годам === */}
+      {multiYearData.length >= 2 && (
+        <div className="tg-card">
+          <div className="tg-section-header mb-3">
+            Динамика по годам ({currentMetricLabel})
+          </div>
+          <div style={{ width: '100%', height: 220 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                data={multiYearData.map((d) => ({
+                  year: String(d.year),
+                  value: metric === 'dtp' ? d.total : metric === 'deaths' ? d.deaths : d.injured,
+                }))}
+                margin={{ top: 5, right: 10, bottom: 5, left: -15 }}
+              >
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  stroke="var(--tg-color-hint, #ccc)"
+                  strokeOpacity={0.3}
+                />
+                <XAxis
+                  dataKey="year"
+                  tick={{
+                    fontSize: 12,
+                    fill: 'var(--tg-color-hint, #999)',
+                  }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <YAxis
+                  tick={{
+                    fontSize: 10,
+                    fill: 'var(--tg-color-hint, #999)',
+                  }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={35}
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor:
+                      'var(--tg-color-section-bg, #fff)',
+                    border: 'none',
+                    borderRadius: 8,
+                    fontSize: 12,
+                  }}
+                  formatter={(value: any) => [value, currentMetricLabel]}
+                />
+                <Bar
+                  dataKey="value"
+                  fill={METRICS.find((m) => m.id === metric)?.color ?? '#2481cc'}
+                  radius={[4, 4, 0, 0]}
+                  barSize={32}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
 
       {/* === Динамика по месяцам vs АППГ === */}
       {monthData.length > 0 && (

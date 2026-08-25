@@ -893,3 +893,101 @@ async def compare_task_year(
         "previous": prev_metrics,
         "current": current_metrics,
     }
+
+
+@router.post("/tasks/{task_id}/multi-year")
+async def multi_year_dynamics(
+    task_id: str,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """Динамика по годам — параллельная SQL-агрегация за 4 года.
+
+    Возвращает массив {year, total, deaths, injured} за текущий + до 4
+    предыдущих лет. Используется для графика «Динамика по годам».
+    """
+    from ..services.gibdd_service import get_task_async
+    from ..db.metrics import calculate_metrics_from_db
+
+    task = await get_task_async(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if task.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Нет доступа")
+
+    # Определяем текущий год
+    try:
+        first_dat = task.dat_list[0]
+        _, current_year_str = first_dat.split(".")
+        current_year = int(current_year_str)
+    except (IndexError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось определить год из dat_list",
+        )
+
+    # Текущие метрики (уже в памяти или пересчитываем)
+    analytics_module = __import__("analytics", fromlist=["calculate_metrics"])
+    cards_id = id(task.cards) if task.cards else None
+    if task.cards and (task.current_metrics is None or task.current_metrics_cards_id != cards_id):
+        current_metrics = analytics_module.calculate_metrics(task.cards)
+        task.current_metrics = current_metrics
+        task.current_metrics_cards_id = cards_id
+    elif task.current_metrics is not None:
+        current_metrics = task.current_metrics
+    else:
+        current_metrics = await calculate_metrics_from_db(task.region_code, task.dat_list)
+
+    # Собираем годы: текущий + до 4 предыдущих
+    years = []
+    for y in range(current_year, max(current_year - 4, 2020), -1):
+        if y == current_year:
+            years.append((y, current_metrics))
+        else:
+            prev_dat_list = []
+            for dat in task.dat_list:
+                try:
+                    m, _ = dat.split(".")
+                    prev_dat_list.append(f"{m}.{y}")
+                except Exception:
+                    continue
+            if prev_dat_list:
+                years.append((y, prev_dat_list))
+
+    # Параллельно считаем SQL для предыдущих годов
+    async def _calc_year(year: int, dat_list_or_metrics):
+        if isinstance(dat_list_or_metrics, dict):
+            # Текущий год — метрики уже есть
+            m = dat_list_or_metrics
+        else:
+            m = await calculate_metrics_from_db(task.region_code, dat_list_or_metrics)
+        if m is None:
+            return None
+        return {
+            "year": year,
+            "total": m.get("total", 0),
+            "deaths": m.get("deaths", 0),
+            "injured": m.get("injured", 0),
+        }
+
+    results = await asyncio.gather(
+        *[_calc_year(y, dl) for y, dl in years],
+        return_exceptions=True,
+    )
+
+    data = []
+    for r in results:
+        if isinstance(r, BaseException):
+            logger.warning(f"multi-year: query failed: {r}")
+            continue
+        if r is not None:
+            data.append(r)
+
+    # Сортируем по году (возрастание)
+    data.sort(key=lambda x: x["year"])
+
+    logger.info(
+        f"Task {task.id}: multi-year dynamics — {len(data)} years, "
+        f"range {data[0]['year'] if data else '?'}-{data[-1]['year'] if data else '?'}"
+    )
+
+    return {"ok": True, "years": data}

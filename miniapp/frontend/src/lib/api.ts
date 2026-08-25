@@ -891,6 +891,18 @@ export const api = {
       body: JSON.stringify({ compare_year: compareYear }),
     }),
 
+  /**
+   * Динамика по годам — SQL-агрегация за текущий + 4 предыдущих года.
+   * Возвращает {years: [{year, total, deaths, injured}]}
+   */
+  multiYearDynamics: (taskId: string) =>
+    request<{
+      ok: boolean
+      years: { year: number; total: number; deaths: number; injured: number }[]
+    }>(`/api/dtp/tasks/${taskId}/multi-year`, {
+      method: 'POST',
+    }),
+
   // ============================================================
   // НП БДД
   // ============================================================
