@@ -1575,6 +1575,14 @@ def classify_cards(
 
 _SOP_NPDD_FILTER_WORDS = ("опьянение", "лишенным", "имеющим")
 
+# Значения, которые означают «нет данных» — не включаем в счётчики
+_CAUSE_SKIP_VALUES = frozenset({
+    "нет нарушений",
+    "не установлены",
+    "сведения отсутствуют",
+    "технические неисправности отсутствуют",
+})
+
 
 def _matches_sop_filter(text: str) -> bool:
     """Проверяет, содержит ли сопутствующее нарушение ключевые слова."""
@@ -1617,26 +1625,26 @@ def _build_cause_counters(cards: list[dict]) -> dict[str, dict[str, int]]:
         if isinstance(dor_usl, dict):
             for item in (dor_usl.get("ndu") or []):
                 s = str(item).strip()
-                if s:
+                if s and s.lower() not in _CAUSE_SKIP_VALUES:
                     ndu_counter[s] += 1
             spch_val = str(dor_usl.get("s_pch", "")).strip()
             if spch_val:
                 spch_counter[spch_val] += 1
             for item in (dor_usl.get("factor") or []):
                 s = str(item).strip()
-                if s:
+                if s and s.lower() not in _CAUSE_SKIP_VALUES:
                     factor_counter[s] += 1
 
         # --- ts_info → ts_uch (уровень участников-водителей) ---
         for ts in (c.get("ts_info") or []):
             # Технические неисправности ТС
             tn_val = str(ts.get("t_n", "")).strip()
-            if tn_val:
+            if tn_val and tn_val.lower() not in _CAUSE_SKIP_VALUES:
                 tn_counter[tn_val] += 1
             for uch in (ts.get("ts_uch") or []):
                 for v in (uch.get("npdd") or []):
                     s = str(v).strip()
-                    if s:
+                    if s and s.lower() not in _CAUSE_SKIP_VALUES:
                         npdd_counter[s] += 1
                 for v in (uch.get("sop_npdd") or []):
                     s = str(v).strip()
@@ -1647,7 +1655,7 @@ def _build_cause_counters(cards: list[dict]) -> dict[str, dict[str, int]]:
         for uch in (c.get("uch_info") or []):
             for v in (uch.get("npdd") or []):
                 s = str(v).strip()
-                if s:
+                if s and s.lower() not in _CAUSE_SKIP_VALUES:
                     npdd_counter[s] += 1
             for v in (uch.get("sop_npdd") or []):
                 s = str(v).strip()
@@ -2724,13 +2732,6 @@ CONCENTRATION_COLUMNS = [
     "Ранено",
     "Дата первого ДТП",
     "Дата последнего ДТП",
-    # --- Причины ДТП ---
-    "Непосредственные нарушения ПДД",
-    "Сопутствующие нарушения ПДД (опьянение/лишение)",
-    "Недостатки ТЭС",
-    "Состояние проезжей части",
-    "Фактор режима движения",
-    "Технические неисправности",
     # --- Камеры фотовидеофиксации ---
     "Статус покрытия камерой",
     "Камера: номер",
@@ -2772,13 +2773,6 @@ PRECLUSTER_COLUMNS = [
     "Дата первого ДТП",
     "Дата последнего ДТП",
     "Критерий предочага",
-    # --- Причины ДТП ---
-    "Непосредственные нарушения ПДД",
-    "Сопутствующие нарушения ПДД (опьянение/лишение)",
-    "Недостатки ТЭС",
-    "Состояние проезжей части",
-    "Фактор режима движения",
-    "Технические неисправности",
     # --- Камеры фотовидеофиксации ---
     "Статус покрытия камерой",
     "Камера: номер",
@@ -2970,13 +2964,6 @@ def build_concentration_excel_data(
             "Ранено": str(cluster["injured"]),
             "Дата первого ДТП": first_date,
             "Дата последнего ДТП": last_date,
-            # --- Причины ДТП ---
-            "Непосредственные нарушения ПДД": _format_counter(cluster.get("npdd_counter", {})),
-            "Сопутствующие нарушения ПДД (опьянение/лишение)": _format_counter(cluster.get("sop_npdd_counter", {})),
-            "Недостатки ТЭС": _format_counter(cluster.get("ndu_counter", {})),
-            "Состояние проезжей части": _format_counter(cluster.get("spch_counter", {})),
-            "Фактор режима движения": _format_counter(cluster.get("factor_counter", {})),
-            "Технические неисправности": _format_counter(cluster.get("tn_counter", {})),
             # --- Камеры фотовидеофиксации ---
             **_camera_row_fields(cluster),
         })
@@ -3037,13 +3024,6 @@ def build_precluster_excel_data(
             "Дата первого ДТП": first_date,
             "Дата последнего ДТП": last_date,
             "Критерий предочага": pc.get("precluster_criterion", ""),
-            # --- Причины ДТП ---
-            "Непосредственные нарушения ПДД": _format_counter(pc.get("npdd_counter", {})),
-            "Сопутствующие нарушения ПДД (опьянение/лишение)": _format_counter(pc.get("sop_npdd_counter", {})),
-            "Недостатки ТЭС": _format_counter(pc.get("ndu_counter", {})),
-            "Состояние проезжей части": _format_counter(pc.get("spch_counter", {})),
-            "Фактор режима движения": _format_counter(pc.get("factor_counter", {})),
-            "Технические неисправности": _format_counter(pc.get("tn_counter", {})),
             # --- Камеры фотовидеофиксации ---
             **_camera_row_fields(pc),
         })
@@ -3917,6 +3897,14 @@ DYNAMICS_DETAIL_COLUMNS = [
     "Долгота",
     "Погибло",
     "Ранено",
+    # --- Причины ДТП (по каждому ДТП) ---
+    "Непосредственные нарушения ПДД",
+    "Сопутствующие нарушения (опьянение/лишение)",
+    "Недостатки ТЭС",
+    "Состояние проезжей части",
+    "Фактор режима движения",
+    "Технические неисправности",
+    "Освещение",
 ]
 
 
@@ -4127,6 +4115,80 @@ def build_dynamics_excel_data(
     return rows
 
 
+def _get_card_cause_field(card: dict, field: str) -> str:
+    """Извлекает одно значение причины из карточки для листа детализации.
+
+    Для списков (npdd, ndu, factor) — объединяет через '; ' с фильтром мусора.
+    Для строк (s_pch, t_n) — возвращает как есть.
+    Для sop_npdd — с фильтром по ключевым словам.
+    """
+    dor_usl = card.get("dor_usl") or {}
+    if not isinstance(dor_usl, dict):
+        return ""
+
+    if field == "npdd":
+        parts = []
+        for ts in (card.get("ts_info") or []):
+            for uch in (ts.get("ts_uch") or []):
+                for v in (uch.get("npdd") or []):
+                    s = str(v).strip()
+                    if s and s.lower() not in _CAUSE_SKIP_VALUES:
+                        parts.append(s)
+        for uch in (card.get("uch_info") or []):
+            for v in (uch.get("npdd") or []):
+                s = str(v).strip()
+                if s and s.lower() not in _CAUSE_SKIP_VALUES:
+                    parts.append(s)
+        return "; ".join(parts)
+
+    if field == "sop_npdd":
+        parts = []
+        for ts in (card.get("ts_info") or []):
+            for uch in (ts.get("ts_uch") or []):
+                for v in (uch.get("sop_npdd") or []):
+                    s = str(v).strip()
+                    if s and _matches_sop_filter(s):
+                        parts.append(s)
+        for uch in (card.get("uch_info") or []):
+            for v in (uch.get("sop_npdd") or []):
+                s = str(v).strip()
+                if s and _matches_sop_filter(s):
+                    parts.append(s)
+        return "; ".join(parts)
+
+    if field == "ndu":
+        parts = []
+        for item in (dor_usl.get("ndu") or []):
+            s = str(item).strip()
+            if s and s.lower() not in _CAUSE_SKIP_VALUES:
+                parts.append(s)
+        return "; ".join(parts)
+
+    if field == "spch":
+        return str(dor_usl.get("s_pch", "")).strip()
+
+    if field == "factor":
+        parts = []
+        for item in (dor_usl.get("factor") or []):
+            s = str(item).strip()
+            if s and s.lower() not in _CAUSE_SKIP_VALUES:
+                parts.append(s)
+        return "; ".join(parts)
+
+    if field == "tn":
+        parts = []
+        for ts in (card.get("ts_info") or []):
+            s = str(ts.get("t_n", "")).strip()
+            if s and s.lower() not in _CAUSE_SKIP_VALUES:
+                parts.append(s)
+        return "; ".join(parts)
+
+    if field == "osv":
+        return str(dor_usl.get("osv", "")).strip()
+
+    return ""
+
+
 def build_dynamics_detail_data(
     clusters: list[dict],
     current_label: str = "",
@@ -4169,6 +4231,14 @@ def build_dynamics_detail_data(
                 "Долгота": lon_str,
                 "Погибло": str(_safe_int(card.get("pog"))),
                 "Ранено": str(_safe_int(card.get("ran"))),
+                # --- Причины ДТП ---
+                "Непосредственные нарушения ПДД": _get_card_cause_field(card, "npdd"),
+                "Сопутствующие нарушения (опьянение/лишение)": _get_card_cause_field(card, "sop_npdd"),
+                "Недостатки ТЭС": _get_card_cause_field(card, "ndu"),
+                "Состояние проезжей части": _get_card_cause_field(card, "spch"),
+                "Фактор режима движения": _get_card_cause_field(card, "factor"),
+                "Технические неисправности": _get_card_cause_field(card, "tn"),
+                "Освещение": _get_card_cause_field(card, "osv"),
             })
 
     return rows
