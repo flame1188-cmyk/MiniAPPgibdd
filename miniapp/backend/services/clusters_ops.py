@@ -410,13 +410,6 @@ def _serialize_cluster(c: dict) -> dict:
         # - prev_total, prev_deaths, prev_injured — суммы по сматченным
         "dynamics": c.get("dynamics", {}),
         "camera_match": c.get("camera_match"),
-        # Причины ДТП (cause counters из concentration_points)
-        "npdd_counter": c.get("npdd_counter", {}),
-        "sop_npdd_counter": c.get("sop_npdd_counter", {}),
-        "ndu_counter": c.get("ndu_counter", {}),
-        "spch_counter": c.get("spch_counter", {}),
-        "factor_counter": c.get("factor_counter", {}),
-        "tn_counter": c.get("tn_counter", {}),
         # Флаги для фильтрации на фронтенде/карте
         "is_lost": c.get("_is_lost", False),
         "is_prev_matched": c.get("_is_prev_matched", False),
@@ -447,6 +440,41 @@ async def generate_clusters_map_html(task: Task) -> Optional[str]:
         raw_clusters = task.raw_clusters or []
         # Raw предочаги (сохранены отдельно — могут быть, даже если очагов нет)
         raw_preclusters = task.raw_preclusters or []
+        if not raw_clusters and not raw_preclusters:
+            # После рестарта in-memory raw-данные потеряны, но clusters_cache
+            # в PostgreSQL их сохранил. Пробуем восстановить оттуда.
+            try:
+                prev_dat_list_for_cache: List[str] = []
+                for dat in task.dat_list:
+                    try:
+                        m, y = dat.split(".")
+                        prev_dat_list_for_cache.append(f"{m}.{int(y) - 1}")
+                    except Exception:
+                        continue
+                from ..db.clusters_cache import get_cached_clusters
+                cached = await get_cached_clusters(
+                    reg_code=task.region_code,
+                    current_dat_list=task.dat_list,
+                    prev_dat_list=prev_dat_list_for_cache or None,
+                )
+                if cached is not None:
+                    rc = cached.get("raw_clusters")
+                    rpc = cached.get("raw_preclusters")
+                    if rc is not None:
+                        task.raw_clusters = rc
+                        raw_clusters = rc
+                    if rpc is not None:
+                        task.raw_preclusters = rpc
+                        raw_preclusters = rpc
+                    logger.info(
+                        f"Task {task.id}: raw_clusters/raw_preclusters "
+                        f"восстановлены из clusters_cache для карты"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    f"Task {task.id}: clusters_cache restore for map failed: {exc}"
+                )
+
         if not raw_clusters and not raw_preclusters:
             # Нет ни очагов, ни предочагов — простая карта покажет заглушку
             logger.warning(
