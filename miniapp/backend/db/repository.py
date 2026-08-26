@@ -337,7 +337,8 @@ async def list_user_tasks_from_db(
         from ..services.task_registry import _register_task as _reg_register
     except Exception:
         _reg_tasks = {}  # type: ignore[assignment]
-        _reg_register = lambda t: None  # type: ignore[assignment]
+        async def _noop(t): pass  # type: ignore[assignment]
+        _reg_register = _noop
 
     # Phase C.3 hotfix: lazy cleanup ghost-задач (TTL-protected)
     try:
@@ -415,7 +416,7 @@ async def list_user_tasks_from_db(
                 if row["updated_at"]:
                     task.updated_at = row["updated_at"]
 
-                _reg_register(task)
+                await _reg_register(task)
                 tasks.append(task)
 
             return tasks
@@ -656,7 +657,7 @@ async def delete_task(
     # → свежая → вставить в начало").
     try:
         from ..services.task_registry import unregister_task
-        if unregister_task(task_id, user_id=user_id):
+        if await unregister_task(task_id, user_id=user_id):
             deleted = True
     except Exception as exc:
         logger.warning(f"delete_task({task_id}) unregister_task failed: {exc}")

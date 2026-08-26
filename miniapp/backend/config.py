@@ -98,13 +98,11 @@ class Settings(BaseSettings):
     )
     db_pool_min: int = Field(default=2, description="Минимальный размер пула")
     db_pool_max: int = Field(
-        default=30,
+        default=20,
         description=(
             "Максимальный размер пула соединений PostgreSQL. "
-            "Раньше было 5 (Phase 1: 15) — критично мало при 10+ "
-            "одновременных пользователях: long-poll эндпоинты держат "
-            "соединение по 25-60 сек. Для 10 пользователей — 15, "
-            "для 30 — 30 (Phase 2 default), для 50+ — 40-50."
+            "Для 10-30 пользователей на shared-хостинге достаточно 20 "
+            "(каждое соединение ~2-3 MB на стороне PostgreSQL)."
         ),
     )
     db_connect_timeout: int = Field(

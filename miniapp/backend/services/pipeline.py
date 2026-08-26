@@ -72,7 +72,7 @@ except Exception:
 _EXECUTE_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
 
-def create_task(
+async def create_task(
     user_id: int,
     region_code: str,
     region_name: str,
@@ -106,7 +106,7 @@ def create_task(
         dat_list=dat_list,
         raw_query=raw_query,
     )
-    _register_task(task)
+    await _register_task(task)
 
     # Task уже в task_registry._tasks через _register_task() выше —
     # отдельная запись в repository._TASKS_MEMORY не нужна (удалено

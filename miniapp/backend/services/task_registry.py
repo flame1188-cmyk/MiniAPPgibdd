@@ -15,7 +15,7 @@ import logging
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
-from threading import Lock
+import gc
 from typing import List, Optional
 
 from . import _imports
@@ -48,10 +48,10 @@ try:
 except Exception:
     MAX_INMEMORY_TASKS: int = 20
 _tasks: "OrderedDict[str, Task]" = OrderedDict()
-_tasks_lock = Lock()
+_tasks_lock = asyncio.Lock()
 
 
-def _register_task(task: Task) -> None:
+async def _register_task(task: Task) -> None:
     """Добавляет задачу в _tasks с LRU-eviction.
 
     Если превышен лимит MAX_INMEMORY_TASKS — вытесняет самую старую задачу
@@ -59,7 +59,7 @@ def _register_task(task: Task) -> None:
     (fire-and-forget через asyncio.create_task), чтобы метаданные не
     потерялись и были доступны через get_task_async().
     """
-    with _tasks_lock:
+    async with _tasks_lock:
         # Если задача уже есть — обновляем позицию (move_to_end)
         if task.id in _tasks:
             _tasks.move_to_end(task.id)
@@ -67,11 +67,6 @@ def _register_task(task: Task) -> None:
             return
 
         # Вытесняем самые старые, если превышен лимит.
-        # ВНИМАНИЕ: читаем лимит через lazy-import фасада gibdd_service, а не
-        # через локальный binding MAX_INMEMORY_TASKS — иначе monkeypatch на
-        # gibdd_service.MAX_INMEMORY_TASKS в тестах не сработает (патч на
-        # фасаде не доходит до локальной копии в task_registry). Аналогично
-        # паттерну с _imports._import_module.
         try:
             from . import gibdd_service as _facade
             _limit = getattr(_facade, "MAX_INMEMORY_TASKS", MAX_INMEMORY_TASKS)
@@ -80,10 +75,7 @@ def _register_task(task: Task) -> None:
         while len(_tasks) >= _limit:
             evicted_id, evicted_task = _tasks.popitem(last=False)
 
-            # N1: синхронно очищаем _TASKS_HEAVY_STATE — без этого тяжёлые поля
-            # (cards ~8 MB, raw_clusters, prev_cards) накапливаются без
-            # лимита до periodic cleanup (раз в 2 часа). При 10-30 юзерах
-            # это 200-700 MB утечки.
+            # N1: синхронно очищаем _TASKS_HEAVY_STATE
             try:
                 from ..db.repository import drop_heavy_state
                 drop_heavy_state(evicted_id)
@@ -99,9 +91,6 @@ def _register_task(task: Task) -> None:
                 f"возраст={evicted_task.created_at.isoformat()}) — "
                 f"данные сохранены в БД, доступны через get_task_async()"
             )
-            # Fire-and-forget persist в БД (если БД недоступна — теряем,
-            # но это acceptable: задача старая, пользователь вряд ли
-            # вернётся к ней в течение 24 часов)
             try:
                 from ..db.repository import save_task
                 asyncio.create_task(save_task(evicted_task))
@@ -109,6 +98,9 @@ def _register_task(task: Task) -> None:
                 logger.debug(
                     f"_register_task: persist evicted {evicted_id} failed: {exc}"
                 )
+
+            # Немедленно освобождаем RAM после eviction
+            gc.collect()
 
         _tasks[task.id] = task
 
@@ -162,7 +154,7 @@ async def get_task_async(task_id: str) -> Optional[Task]:
         task = await load_task(task_id, _task_factory)
         if task is not None:
             attach_heavy_state(task)
-            _register_task(task)  # добавляем в LRU-кэш
+            await _register_task(task)  # добавляем в LRU-кэш
             # Sprint 6: восстанавливаем llm_summary_state + llm_qa_history
             # из llm_sessions (если они не были восстановлены через
             # attach_heavy_state из _TASKS_HEAVY_STATE).
@@ -471,18 +463,18 @@ async def list_user_tasks(user_id: int, limit: int = 20) -> List[Task]:
         return user_tasks_in_memory[:limit]
 
 
-def _touch_task_lru(task_id: str) -> None:
+async def _touch_task_lru(task_id: str) -> None:
     """Помечает задачу как недавно использованную (LRU update).
 
     Используется внешними модулями (pipeline, analytics_ops) после
     обновления полей задачи — чтобы LRU не вытеснил активную задачу.
     """
-    with _tasks_lock:
+    async with _tasks_lock:
         if task_id in _tasks:
             _tasks.move_to_end(task_id)
 
 
-def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
+async def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
     """Удаляет задачу из in-memory LRU-кэша _tasks.
 
     Используется repository.delete_task() — после удаления задачи из БД
@@ -503,12 +495,11 @@ def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
         True если задача была в кэше и удалена, False если её там не было
         или user_id не совпал.
     """
-    with _tasks_lock:
+    async with _tasks_lock:
         task = _tasks.get(task_id)
         if task is None:
             return False
         if user_id is not None and task.user_id != user_id:
-            # Race condition: задача уже вытеснена/перезаписана — не трогаем.
             logger.warning(
                 f"unregister_task({task_id}): user_id mismatch "
                 f"(expected={user_id}, actual={task.user_id}) — пропускаем"
