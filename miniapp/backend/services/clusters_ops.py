@@ -410,16 +410,16 @@ def _serialize_cluster(c: dict) -> dict:
         # - prev_total, prev_deaths, prev_injured — суммы по сматченным
         "dynamics": c.get("dynamics", {}),
         "camera_match": c.get("camera_match"),
-        # Флаги для фильтрации на фронтенде/карте
-        "is_lost": c.get("_is_lost", False),
-        "is_prev_matched": c.get("_is_prev_matched", False),
-        # Причины ДТП (счётчики для Excel и LLM)
+        # Причины ДТП (cause counters из concentration_points)
         "npdd_counter": c.get("npdd_counter", {}),
         "sop_npdd_counter": c.get("sop_npdd_counter", {}),
         "ndu_counter": c.get("ndu_counter", {}),
         "spch_counter": c.get("spch_counter", {}),
         "factor_counter": c.get("factor_counter", {}),
         "tn_counter": c.get("tn_counter", {}),
+        # Флаги для фильтрации на фронтенде/карте
+        "is_lost": c.get("_is_lost", False),
+        "is_prev_matched": c.get("_is_prev_matched", False),
     }
 
 
