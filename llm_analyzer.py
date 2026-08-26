@@ -846,6 +846,24 @@ def format_clusters_for_prompt(
             if types_str:
                 out.append(f"  Виды ДТП: {types_str}")
 
+            # --- Причины ДТП (cause counters) ---
+            cause_labels = [
+                ("npdd_counter", "Нарушения ПДД"),
+                ("sop_npdd_counter", "Сопутствующие нарушения (опьянение/лишение)"),
+                ("ndu_counter", "Недостатки УДС"),
+                ("spch_counter", "Состояние проезжей части"),
+                ("factor_counter", "Факторы режима движения"),
+                ("tn_counter", "Технические неисправности"),
+            ]
+            for counter_key, label in cause_labels:
+                counter = c.get(counter_key)
+                if not counter:
+                    continue
+                top = sorted(counter.items(), key=lambda x: -x[1])[:5]
+                if top:
+                    parts = ", ".join(f"{v} ({cnt})" for v, cnt in top)
+                    out.append(f"  {label}: {parts}")
+
             start_pos = c.get("start_pos")
             end_pos = c.get("end_pos")
             if start_pos is not None and end_pos is not None:
