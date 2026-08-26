@@ -415,7 +415,7 @@ async def list_user_tasks_from_db(
                 if row["updated_at"]:
                     task.updated_at = row["updated_at"]
 
-                _reg_register(task)
+                await _reg_register(task)
                 tasks.append(task)
 
             return tasks
