@@ -11,11 +11,11 @@ facade'ом gibdd_service и тестами. Внешний код получа�
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
-import gc
 from typing import List, Optional
 
 from . import _imports
@@ -67,6 +67,11 @@ async def _register_task(task: Task) -> None:
             return
 
         # Вытесняем самые старые, если превышен лимит.
+        # ВНИМАНИЕ: читаем лимит через lazy-import фасада gibdd_service, а не
+        # через локальный binding MAX_INMEMORY_TASKS — иначе monkeypatch на
+        # gibdd_service.MAX_INMEMORY_TASKS в тестах не сработает (патч на
+        # фасаде не доходит до локальной копии в task_registry). Аналогично
+        # паттерну с _imports._import_module.
         try:
             from . import gibdd_service as _facade
             _limit = getattr(_facade, "MAX_INMEMORY_TASKS", MAX_INMEMORY_TASKS)
@@ -75,7 +80,10 @@ async def _register_task(task: Task) -> None:
         while len(_tasks) >= _limit:
             evicted_id, evicted_task = _tasks.popitem(last=False)
 
-            # N1: синхронно очищаем _TASKS_HEAVY_STATE
+            # N1: синхронно очищаем _TASKS_HEAVY_STATE — без этого тяжёлые поля
+            # (cards ~8 MB, raw_clusters, prev_cards) накапливаются без
+            # лимита до periodic cleanup (раз в 2 часа). При 10-30 юзерах
+            # это 200-700 MB утечки.
             try:
                 from ..db.repository import drop_heavy_state
                 drop_heavy_state(evicted_id)
@@ -91,6 +99,9 @@ async def _register_task(task: Task) -> None:
                 f"возраст={evicted_task.created_at.isoformat()}) — "
                 f"данные сохранены в БД, доступны через get_task_async()"
             )
+            # Fire-and-forget persist в БД (если БД недоступна — теряем,
+            # но это acceptable: задача старая, пользователь вряд ли
+            # вернётся к ней в течение 24 часов)
             try:
                 from ..db.repository import save_task
                 asyncio.create_task(save_task(evicted_task))
@@ -99,7 +110,9 @@ async def _register_task(task: Task) -> None:
                     f"_register_task: persist evicted {evicted_id} failed: {exc}"
                 )
 
-            # Немедленно освобождаем RAM после eviction
+            # gc.collect() после освобождения тяжёлых данных: вытесненная
+            # задача держала cards (~8 MB), raw_clusters, prev_cards —
+            # без явного сборщика Python не возвращает RAM ОС сразу.
             gc.collect()
 
         _tasks[task.id] = task
@@ -132,7 +145,7 @@ async def get_task_async(task_id: str) -> Optional[Task]:
     # Сначала in-memory (быстро + есть тяжёлые поля)
     if task_id in _tasks:
         # LRU: обновляем позицию как "недавно использованную"
-        with _tasks_lock:
+        async with _tasks_lock:
             if task_id in _tasks:
                 _tasks.move_to_end(task_id)
         task = _tasks[task_id]
@@ -500,6 +513,7 @@ async def unregister_task(task_id: str, user_id: Optional[int] = None) -> bool:
         if task is None:
             return False
         if user_id is not None and task.user_id != user_id:
+            # Race condition: задача уже вытеснена/перезаписана — не трогаем.
             logger.warning(
                 f"unregister_task({task_id}): user_id mismatch "
                 f"(expected={user_id}, actual={task.user_id}) — пропускаем"

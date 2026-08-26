@@ -138,7 +138,7 @@ class RateLimitASGIMiddleware:
         # Применяем лимит
         try:
             key = _get_user_key(request)
-            limiter._check_request_limit(request, DEFAULT_LIMIT, key, True)
+            limiter._check_request_limit(request, DEFAULT_LIMIT, key)
         except RateLimitExceeded as exc:
             logger.warning(
                 f"Rate limit exceeded: {key} on {path} — {exc.detail}"
@@ -187,7 +187,7 @@ async def rate_limit_middleware(request: Request, call_next: Callable):
 
     try:
         key = _get_user_key(request)
-        limiter._check_request_limit(request, DEFAULT_LIMIT, key, True)
+        limiter._check_request_limit(request, DEFAULT_LIMIT, key)
     except RateLimitExceeded as exc:
         logger.warning(
             f"Rate limit exceeded: {key} on {path} — {exc.detail}"

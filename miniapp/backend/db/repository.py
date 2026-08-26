@@ -337,8 +337,7 @@ async def list_user_tasks_from_db(
         from ..services.task_registry import _register_task as _reg_register
     except Exception:
         _reg_tasks = {}  # type: ignore[assignment]
-        async def _noop(t): pass  # type: ignore[assignment]
-        _reg_register = _noop
+        _reg_register = lambda t: None  # type: ignore[assignment]
 
     # Phase C.3 hotfix: lazy cleanup ghost-задач (TTL-protected)
     try:
@@ -416,7 +415,7 @@ async def list_user_tasks_from_db(
                 if row["updated_at"]:
                     task.updated_at = row["updated_at"]
 
-                await _reg_register(task)
+                _reg_register(task)
                 tasks.append(task)
 
             return tasks

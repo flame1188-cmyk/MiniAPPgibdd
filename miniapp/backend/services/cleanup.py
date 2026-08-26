@@ -45,7 +45,7 @@ async def cleanup_old_tasks(max_age_hours: int = 24) -> int:
     # в repository отработал не полностью)
     now = datetime.now(timezone.utc)
     cutoff = now.timestamp() - max_age_hours * 3600
-    with _tasks_lock:
+    async with _tasks_lock:
         to_delete = [
             tid for tid, task in _tasks.items()
             if task.created_at.timestamp() < cutoff
