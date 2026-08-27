@@ -757,6 +757,31 @@ body {
   box-shadow: 0 2px 6px rgba(0,0,0,0.3);
   transform: rotate(-10deg);
 }
+/* PAP MarkerCluster override */
+.pap-cluster-small {
+  background: rgba(21,101,192,0.7) !important;
+}
+.pap-cluster-small div {
+  background: rgba(21,101,192,0.85) !important;
+  color: #fff !important;
+  font-weight: 700;
+}
+.pap-cluster-medium {
+  background: rgba(21,101,192,0.6) !important;
+}
+.pap-cluster-medium div {
+  background: rgba(21,101,192,0.8) !important;
+  color: #fff !important;
+  font-weight: 700;
+}
+.pap-cluster-large {
+  background: rgba(21,101,192,0.5) !important;
+}
+.pap-cluster-large div {
+  background: rgba(21,101,192,0.75) !important;
+  color: #fff !important;
+  font-weight: 700;
+}
 .pap-popup {
   font-size: 13px;
   line-height: 1.4;
@@ -770,7 +795,8 @@ body {
 }
 .pap-repeat {
   color: #e65100;
-  font-size: 12px;
+  font-size: 11px;
+  font-style: italic;
 }
 .pap-table {
   border-collapse: collapse;
@@ -789,6 +815,10 @@ body {
   padding: 2px 6px;
   font-size: 12px;
   border-bottom: 1px solid #e0e0e0;
+}
+.pap-table .repeat-cell {
+  color: #e65100;
+  font-size: 11px;
 }
 """
 
@@ -1392,8 +1422,25 @@ var dtpData = {dtp_geojson};
 var cameraDataFull = {camera_markers_js};
 var papData = {pap_data_js};
 
-// --- Слой ПАП ---
-var papGroup = L.layerGroup();
+// --- Слой ПАП (с кластеризацией) ---
+var papCluster = L.markerClusterGroup({{
+    maxClusterRadius: 50,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    iconCreateFunction: function(cluster) {{
+        var count = cluster.getChildCount();
+        var size = count < 10 ? 'small' : count < 100 ? 'medium' : 'large';
+        return L.divIcon({{
+            html: '<div><span>' + count + '</span></div>',
+            className: 'marker-cluster pap-cluster-' + size,
+            iconSize: L.point(36, 36)
+        }});
+    }}
+}});
+var papFlatGroup = L.layerGroup();
+var papClusteringEnabled = true;
+var _papToggleLock = false;
+
 (function() {{
     var papIcon = L.divIcon({{
         className: 'pap-marker-icon',
@@ -1404,19 +1451,57 @@ var papGroup = L.layerGroup();
     }});
     papData.forEach(function(p) {{
         var h = '<div class="pap-popup">';
-        h += '<div class="pap-popup-title">ПАП: <b>' + p.total + '</b>';
-        if (p.repeat > 0) h += ' <span class="pap-repeat">(повторных: ' + p.repeat + ')</span>';
+        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.';
+        if (p.repeat > 0) h += ' <span class="pap-repeat">(из них повтор. наруш.: ' + p.repeat + ')</span>';
         h += '</div>';
         if (p.articles && p.articles.length > 0) {{
             h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
             p.articles.forEach(function(a) {{
-                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
+                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0);
+                if (a.repeat > 0) h += ' <span class="repeat-cell">(' + a.repeat + ' повтор.)</span>';
+                h += '</td></tr>';
             }});
             h += '</table>';
         }}
         h += '</div>';
-        L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 300}}).addTo(papGroup);
+        var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
+        papCluster.addLayer(m);
+        papFlatGroup.addLayer(m);
     }});
+}})();
+
+// Переключатель кластеризации ПАП
+var papToggleDiv = L.DomUtil.create('div', '');
+papToggleDiv.style.cssText = 'display:none;margin-top:4px;';
+papToggleDiv.innerHTML = '<button class="cam-cluster-toggle-btn pap-cluster-toggle-btn" onclick="togglePapClustering()" style="font-size:11px;padding:3px 8px;cursor:pointer;border-radius:3px;border:1px solid #1565c0;background:#e3f2fd;color:#1565c0;">Разгруппировать ПАП</button>';
+
+function togglePapClustering() {{
+    if (!map.hasLayer(papCluster) && !map.hasLayer(papFlatGroup)) return;
+    _papToggleLock = true;
+    if (papClusteringEnabled) {{
+        var _m = [];
+        papCluster.eachLayer(function(m) {{ _m.push(m); }});
+        _mcgClear(papCluster);
+        for (var i = 0; i < _m.length; i++) papFlatGroup.addLayer(_m[i]);
+        if (!map.hasLayer(papFlatGroup)) papFlatGroup.addTo(map);
+    }} else {{
+        var _m = [];
+        papFlatGroup.eachLayer(function(m) {{ _m.push(m); }});
+        papFlatGroup.clearLayers();
+        if (map.hasLayer(papFlatGroup)) map.removeLayer(papFlatGroup);
+        for (var i = 0; i < _m.length; i++) papCluster.addLayer(_m[i]);
+    }}
+    papClusteringEnabled = !papClusteringEnabled;
+    setTimeout(function() {{ map.invalidateSize(); }}, 0);
+    _papToggleLock = false;
+}}
+
+// Помещаем кнопку в панель фильтров
+(function() {{
+    var filterPanel = document.getElementById('filter-panel');
+    if (filterPanel) {{
+        filterPanel.appendChild(papToggleDiv);
+    }}
 }})();
 
 // --- MarkerCluster для ДТП ---
@@ -1674,26 +1759,34 @@ if ({str(has_cameras).lower()}) {{
     overlayLayers["Камеры"] = cameraCluster;
 }}
 if (papData.length > 0) {{
-    overlayLayers["ПАП"] = papGroup;
+    overlayLayers["ПАП"] = papCluster;
 }}
 var layersControl = L.control.layers({{}}, overlayLayers, {{collapsed: true}}).addTo(map);
 
-// Синхронизация кнопки группировки камер с контроем слоёв
-map.on('overlayremove', function(e) {{
-    if (e.name === 'Камеры' && !_camToggleLock) {{
-        if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
-        var btn = document.querySelector('.cam-cluster-toggle-btn');
-        if (btn) btn.classList.add('clusters-toggle-disabled');
-    }}
-}});
+// Показываем/прячем кнопку переключения ПАП
 map.on('overlayadd', function(e) {{
+    if (e.name === 'ПАП') {{
+        papToggleDiv.style.display = 'block';
+    }}
     if (e.name === 'Камеры' && !_camToggleLock) {{
-        var btn = document.querySelector('.cam-cluster-toggle-btn');
+        var btn = document.querySelector('.cam-cluster-toggle-btn:not(.pap-cluster-toggle-btn)');
         if (btn) btn.classList.remove('clusters-toggle-disabled');
         if (!cameraClusteringEnabled) {{
             _mcgClear(cameraCluster);
             cameraFlatGroup.addTo(map);
         }}
+    }}
+}});
+map.on('overlayremove', function(e) {{
+    if (e.name === 'ПАП') {{
+        papToggleDiv.style.display = 'none';
+        // Убираем плоский слой если он был показан
+        if (map.hasLayer(papFlatGroup)) map.removeLayer(papFlatGroup);
+    }}
+    if (e.name === 'Камеры' && !_camToggleLock) {{
+        if (map.hasLayer(cameraFlatGroup)) map.removeLayer(cameraFlatGroup);
+        var btn = document.querySelector('.cam-cluster-toggle-btn:not(.pap-cluster-toggle-btn)');
+        if (btn) btn.classList.add('clusters-toggle-disabled');
     }}
 }});
 """

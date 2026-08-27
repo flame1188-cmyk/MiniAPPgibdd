@@ -89,29 +89,64 @@ async def fetch_pap_for_map(
         return []
 
     sql = """
+    -- Шаг 1: агрегируем по (lat, lon, article_num, viol_group)
+    WITH per_article AS (
+        SELECT
+            lat,
+            lon,
+            article_num,
+            viol_group,
+            SUM(pap_cnt)::int    AS cnt,
+            SUM(repeat_cnt)::int AS repeat
+        FROM pap_points
+        WHERE app_region_code = %(region_code)s
+          AND date >= %(min_date)s
+          AND date < %(max_date)s
+          AND koap_id IS NOT NULL AND koap_id != -1
+        GROUP BY lat, lon, article_num, viol_group
+    ),
+    -- Шаг 2: агрегируем по (lat, lon)
+    point_agg AS (
+        SELECT
+            lat,
+            lon,
+            SUM(cnt)::int    AS total_pap,
+            SUM(repeat)::int  AS total_repeat
+        FROM per_article
+        GROUP BY lat, lon
+    ),
+    -- Шаг 3: статьи как JSON для каждой точки
+    point_articles AS (
+        SELECT
+            pa.lat,
+            pa.lon,
+            COALESCE(
+                json_agg(
+                    json_build_object(
+                        'article', per.article_num,
+                        'group', per.viol_group,
+                        'cnt', per.cnt,
+                        'repeat', per.repeat
+                    )
+                    ORDER BY per.cnt DESC
+                ),
+                '[]'::json
+            ) AS articles
+        FROM point_agg pa
+        LEFT JOIN per_article per
+            ON per.lat = pa.lat AND per.lon = pa.lon
+        GROUP BY pa.lat, pa.lon
+    )
     SELECT
-        lat,
-        lon,
-        SUM(pap_cnt)::int            AS total_pap,
-        SUM(repeat_cnt)::int          AS total_repeat,
-        COALESCE(
-            json_agg(
-                json_build_object(
-                    'article', article_num,
-                    'group', viol_group,
-                    'cnt', pap_cnt,
-                    'repeat', repeat_cnt
-                )
-                ORDER BY pap_cnt DESC
-            ) FILTER (WHERE koap_id IS NOT NULL AND koap_id != -1),
-            '[]'::json
-        ) AS articles
-    FROM pap_points
-    WHERE app_region_code = %(region_code)s
-      AND date >= %(min_date)s
-      AND date < %(max_date)s
-    GROUP BY lat, lon
-    ORDER BY total_pap DESC
+        pa.lat,
+        pa.lon,
+        pa.total_pap,
+        pa.total_repeat,
+        COALESCE(part.articles, '[]'::json) AS articles
+    FROM point_agg pa
+    LEFT JOIN point_articles part
+        ON part.lat = pa.lat AND part.lon = pa.lon
+    ORDER BY pa.total_pap DESC
     """
 
     try:
