@@ -67,10 +67,6 @@ from miniapp.backend.db.connection import (
     close_pool as db_close_pool,
     is_db_ready as db_is_ready,
 )
-from miniapp.backend.db.pap_connection import (
-    init_pap_pool as pap_init_pool,
-    close_pap_pool as pap_close_pool,
-)
 
 
 # ============================================================
@@ -249,6 +245,9 @@ async def lifespan(app: FastAPI):
     # Если DATABASE_URL задан — создаём пул и применяем схему.
     # Если нет или не удалось подключиться — приложение продолжает работу
     # с in-memory хранилищем (см. db/repository.py).
+    #
+    # ПАП данные читаются из таблицы pap_points в этой же БД.
+    # Заполнение: scripts/sync_pap.py (запускается вручную с VPN).
     try:
         db_ready = await db_init_pool()
         if db_ready:
@@ -262,14 +261,6 @@ async def lifespan(app: FastAPI):
         logger.warning(
             f"PostgreSQL init failed: {exc} — продолжаем с in-memory fallback"
         )
-
-    # === Инициализация пула ПАП БД (gibdd_db — отдельный сервер) ===
-    try:
-        pap_ready = await pap_init_pool()
-        if pap_ready:
-            logger.info("PAP DB (gibdd_db): пул готов, слой ПАП на карте доступен")
-    except Exception as exc:
-        logger.warning(f"PAP DB init failed: {exc} — слой ПАП недоступен")
 
     # === Sprint 5: Task recovery на startup ===
     # После рестарта сервера in-flight задачи (status='fetching'/'parsing'/
@@ -440,12 +431,6 @@ async def lifespan(app: FastAPI):
         await db_close_pool()
     except Exception as exc:
         logger.warning(f"Ошибка при закрытии пула БД: {exc}")
-
-    # Закрываем пул ПАП БД
-    try:
-        await pap_close_pool()
-    except Exception as exc:
-        logger.warning(f"Ошибка при закрытии пула ПАП БД: {exc}")
 
     if tg_app:
         try:
