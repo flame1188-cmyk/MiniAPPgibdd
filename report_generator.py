@@ -793,11 +793,7 @@ body {
 .pap-popup-title b {
   color: #1565c0;
 }
-.pap-repeat {
-  color: #e65100;
-  font-size: 11px;
-  font-style: italic;
-}
+
 .pap-table {
   border-collapse: collapse;
   width: 100%;
@@ -816,10 +812,7 @@ body {
   font-size: 12px;
   border-bottom: 1px solid #e0e0e0;
 }
-.pap-table .repeat-cell {
-  color: #e65100;
-  font-size: 11px;
-}
+
 """
 
     @staticmethod
@@ -1451,15 +1444,11 @@ var _papToggleLock = false;
     }});
     papData.forEach(function(p) {{
         var h = '<div class="pap-popup">';
-        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.';
-        if (p.repeat > 0) h += ' <span class="pap-repeat">(из них повтор. наруш.: ' + p.repeat + ')</span>';
-        h += '</div>';
+        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
         if (p.articles && p.articles.length > 0) {{
             h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
             p.articles.forEach(function(a) {{
-                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0);
-                if (a.repeat > 0) h += ' <span class="repeat-cell">(' + a.repeat + ' повтор.)</span>';
-                h += '</td></tr>';
+                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
             }});
             h += '</table>';
         }}

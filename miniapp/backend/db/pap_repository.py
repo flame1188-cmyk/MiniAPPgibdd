@@ -71,9 +71,8 @@ async def fetch_pap_for_map(
             "lat": 56.847,
             "lon": 60.608,
             "total": 184,
-            "repeat": 1,
             "articles": [
-                {"article": "12.6", "group": "Ремни", "cnt": 150, "repeat": 1},
+                {"article": "12.6", "group": "Ремни", "cnt": 150},
                 ...
             ]
         }, ...]
@@ -96,8 +95,7 @@ async def fetch_pap_for_map(
             lon,
             article_num,
             viol_group,
-            SUM(pap_cnt)::int    AS cnt,
-            SUM(repeat_cnt)::int AS repeat
+            SUM(pap_cnt)::int    AS cnt
         FROM pap_points
         WHERE app_region_code = %(region_code)s
           AND date >= %(min_date)s
@@ -110,8 +108,7 @@ async def fetch_pap_for_map(
         SELECT
             lat,
             lon,
-            SUM(cnt)::int    AS total_pap,
-            SUM(repeat)::int  AS total_repeat
+            SUM(cnt)::int    AS total_pap
         FROM per_article
         GROUP BY lat, lon
     ),
@@ -125,8 +122,7 @@ async def fetch_pap_for_map(
                     json_build_object(
                         'article', per.article_num,
                         'group', per.viol_group,
-                        'cnt', per.cnt,
-                        'repeat', per.repeat
+                        'cnt', per.cnt
                     )
                     ORDER BY per.cnt DESC
                 ),
@@ -141,7 +137,6 @@ async def fetch_pap_for_map(
         pa.lat,
         pa.lon,
         pa.total_pap,
-        pa.total_repeat,
         COALESCE(part.articles, '[]'::json) AS articles
     FROM point_agg pa
     LEFT JOIN point_articles part
@@ -174,7 +169,6 @@ async def fetch_pap_for_map(
             "lat": float(row["lat"]),
             "lon": float(row["lon"]),
             "total": row["total_pap"],
-            "repeat": row["total_repeat"],
             "articles": articles_raw or [],
         })
 
