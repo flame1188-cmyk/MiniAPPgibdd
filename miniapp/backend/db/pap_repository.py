@@ -21,27 +21,38 @@ logger = logging.getLogger(__name__)
 
 def _dat_list_to_date_range(dat_list: list[str]) -> tuple[str, str]:
     """
-    Преобразует список ['2025-01', '2025-02', ...] в (min_date, max_date_exclusive).
+    Преобразует список месяцев в (min_date, max_date_exclusive).
+
+    Поддерживает два формата:
+      ['1.2026', '2.2026', ...]  — формат приложения (M.YYYY)
+      ['2026-01', '2026-02', ...] — ISO-формат (YYYY-MM)
 
     Возвращает:
-        ('2025-01-01', '2025-07-01') — для SQL WHERE date >= ... AND date < ...
+        ('2026-01-01', '2026-08-01') — для SQL WHERE date >= ... AND date < ...
     """
     if not dat_list:
         return "", ""
 
-    months = sorted(dat_list)
-    first = months[0]  # '2025-01'
-    last = months[-1]   # '2025-06'
+    def _parse(s: str) -> tuple[int, int]:
+        """Парсит 'M.YYYY' или 'YYYY-MM' в (year, month)."""
+        if "." in s:
+            m, y = s.split(".")
+            return int(y), int(m)
+        else:
+            y, m = s.split("-")
+            return int(y), int(m)
 
-    min_date = f"{first}-01"
+    months = sorted(dat_list, key=_parse)
+    first_y, first_m = _parse(months[0])
+    last_y, last_m = _parse(months[-1])
 
-    year = int(last.split("-")[0])
-    month = int(last.split("-")[1])
-    month += 1
-    if month > 12:
-        month = 1
-        year += 1
-    max_date = f"{year:04d}-{month:02d}-01"
+    min_date = f"{first_y:04d}-{first_m:02d}-01"
+
+    last_m += 1
+    if last_m > 12:
+        last_m = 1
+        last_y += 1
+    max_date = f"{last_y:04d}-{last_m:02d}-01"
 
     return min_date, max_date
 

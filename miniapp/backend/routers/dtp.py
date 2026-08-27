@@ -705,7 +705,7 @@ async def _generate_map_html(task: Task) -> Optional[str]:
             from ..db.pap_repository import fetch_pap_for_map
             pap_data = await fetch_pap_for_map(task.region_code, task.dat_list)
         except Exception as exc:
-            logger.debug(f"Task {task.id}: PAP data unavailable: {exc}")
+            logger.warning(f"Task {task.id}: PAP data unavailable: {exc}")
 
         html_content = generator.generate_dtp_map(
             task.cards,
