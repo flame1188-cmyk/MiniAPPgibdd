@@ -88,31 +88,48 @@ async def fetch_pap_for_map(
         return []
 
     sql = """
-    -- Шаг 1: агрегируем по (lat, lon, article_num, viol_group)
-    WITH per_article AS (
+    -- Шаг 1: агрегируем по (lat, lon, article_num, viol_group, месяц)
+    WITH per_article_month AS (
         SELECT
             lat,
             lon,
             article_num,
             viol_group,
-            SUM(pap_cnt)::int    AS cnt
+            to_char(date, 'YYYY-MM') AS month,
+            SUM(pap_cnt)::int AS cnt
         FROM pap_points
         WHERE app_region_code = %(region_code)s
           AND date >= %(min_date)s
           AND date < %(max_date)s
           AND koap_id IS NOT NULL AND koap_id != -1
-        GROUP BY lat, lon, article_num, viol_group
+        GROUP BY lat, lon, article_num, viol_group, to_char(date, 'YYYY-MM')
     ),
-    -- Шаг 2: агрегируем по (lat, lon)
-    point_agg AS (
+    -- Шаг 2: по (lat, lon, article, group) — итоговый cnt + разбивка по месяцам
+    per_article AS (
         SELECT
             lat,
             lon,
-            SUM(cnt)::int    AS total_pap
+            article_num,
+            viol_group,
+            SUM(cnt)::int AS cnt,
+            json_object_agg(month, cnt) AS monthly
+        FROM per_article_month
+        GROUP BY lat, lon, article_num, viol_group
+    ),
+    -- Шаг 2b: уникальные месяцы для каждой точки
+    point_months AS (
+        SELECT lat, lon,
+            array_agg(DISTINCT month ORDER BY month) AS months
+        FROM per_article_month
+        GROUP BY lat, lon
+    ),
+    -- Шаг 3: итого по точке
+    point_agg AS (
+        SELECT lat, lon, SUM(cnt)::int AS total_pap
         FROM per_article
         GROUP BY lat, lon
     ),
-    -- Шаг 3: статьи как JSON для каждой точки
+    -- Шаг 4: статьи как JSON для каждой точки
     point_articles AS (
         SELECT
             pa.lat,
@@ -122,7 +139,8 @@ async def fetch_pap_for_map(
                     json_build_object(
                         'article', per.article_num,
                         'group', per.viol_group,
-                        'cnt', per.cnt
+                        'cnt', per.cnt,
+                        'monthly', per.monthly
                     )
                     ORDER BY per.cnt DESC
                 ),
@@ -137,10 +155,13 @@ async def fetch_pap_for_map(
         pa.lat,
         pa.lon,
         pa.total_pap,
-        COALESCE(part.articles, '[]'::json) AS articles
+        COALESCE(part.articles, '[]'::json) AS articles,
+        COALESCE(pm.months, ARRAY[]::TEXT[]) AS months
     FROM point_agg pa
     LEFT JOIN point_articles part
         ON part.lat = pa.lat AND part.lon = pa.lon
+    LEFT JOIN point_months pm
+        ON pm.lat = pa.lat AND pm.lon = pa.lon
     ORDER BY pa.total_pap DESC
     """
 
@@ -170,6 +191,7 @@ async def fetch_pap_for_map(
             "lon": float(row["lon"]),
             "total": row["total_pap"],
             "articles": articles_raw or [],
+            "months": list(row["months"]) if row["months"] else [],
         })
 
     logger.info(

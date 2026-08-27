@@ -1561,28 +1561,91 @@ var papFlatGroup = L.layerGroup();
 var papClusteringEnabled = true;
 var _papToggleLock = false;
 
-(function() {{
-    var papIcon = L.divIcon({{
-        className: 'pap-marker-icon',
-        html: '<div class="pap-marker-inner">&#128220;</div>',
-        iconSize: [28, 28],
-        iconAnchor: [14, 28],
-        popupAnchor: [0, -28]
-    }});
-    papData.forEach(function(p) {{
-        var h = '<div class="pap-popup">';
-        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
-        if (p.articles && p.articles.length > 0) {{
-            h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
-            p.articles.forEach(function(a) {{
-                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
-            }});
-            h += '</table>';
+// --- Общие помощники ПАП ---
+var _papIcon = L.divIcon({{
+    className: 'pap-marker-icon',
+    html: '<div class="pap-marker-inner">&#128220;</div>',
+    iconSize: [28, 28],
+    iconAnchor: [14, 28],
+    popupAnchor: [0, -28]
+}});
+
+function _buildPapPopup(total, articles) {{
+    var h = '<div class="pap-popup">';
+    h += '<div class="pap-popup-title">&#128220; <b>' + total + '</b> пост.</div>';
+    if (articles && articles.length > 0) {{
+        h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
+        articles.forEach(function(a) {{
+            h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a._fc != null ? a._fc : a.cnt) + '</td></tr>';
+        }});
+        h += '</table>';
+    }}
+    h += '</div>';
+    return h;
+}}
+
+function _createPapMarker(p, popupHtml) {{
+    var m = L.marker([p.lat, p.lon], {{icon: _papIcon}}).bindPopup(popupHtml, {{maxWidth: 320}});
+    papCluster.addLayer(m);
+    papFlatGroup.addLayer(m);
+}}
+
+function _filterPapPoint(p, selArts, fromYM, toYM) {{
+    var arts = (p.articles || []).slice();
+    if (selArts.length > 0) {{
+        arts = arts.filter(function(a) {{ return selArts.indexOf(a.article) !== -1; }});
+    }}
+    var hasDate = fromYM || toYM;
+    var out = [], total = 0;
+    for (var i = 0; i < arts.length; i++) {{
+        var a = arts[i], cnt;
+        if (hasDate && a.monthly) {{
+            cnt = 0;
+            for (var k in a.monthly) {{
+                if (fromYM && k < fromYM) continue;
+                if (toYM && k > toYM) continue;
+                cnt += (a.monthly[k] || 0);
+            }}
+        }} else {{
+            cnt = a.cnt || 0;
         }}
-        h += '</div>';
-        var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
-        papCluster.addLayer(m);
-        papFlatGroup.addLayer(m);
+        if (cnt > 0) {{
+            out.push({{article: a.article, group: a.group, _fc: cnt}});
+            total += cnt;
+        }}
+    }}
+    out.sort(function(x, y) {{ return y._fc - x._fc; }});
+    return total > 0 ? {{total: total, articles: out}} : null;
+}}
+
+function applyPapFilter() {{
+    var sel = getSelectedArticles();
+    updatePapArticleLabel();
+    var dFrom = document.getElementById('filter_date_from').value;
+    var dTo   = document.getElementById('filter_date_to').value;
+    var fromYM = dFrom ? dFrom.substring(0, 7) : '';
+    var toYM   = dTo   ? dTo.substring(0, 7)   : '';
+    _mcgClear(papCluster);
+    papFlatGroup.clearLayers();
+    var n = 0;
+    for (var i = 0; i < papData.length; i++) {{
+        var r = _filterPapPoint(papData[i], sel, fromYM, toYM);
+        if (!r) continue;
+        _createPapMarker(papData[i], _buildPapPopup(r.total, r.articles));
+        n++;
+    }}
+    if (!papClusteringEnabled && map.hasLayer(papFlatGroup)) papFlatGroup.addTo(map);
+    var el = document.getElementById('pap_filter_count');
+    if (el) {{
+        var active = sel.length > 0 || dFrom || dTo;
+        el.textContent = active ? (n + ' из ' + papData.length) : '';
+    }}
+}}
+
+// Первичная отрисовка ПАП
+(function() {{
+    papData.forEach(function(p) {{
+        _createPapMarker(p, _buildPapPopup(p.total, p.articles));
     }});
 }})();
 
@@ -1691,23 +1754,6 @@ function toggleDtpClustering() {{
 renderDtp(dtpData);
 dtpCluster.addTo(map);
 
-// --- Вспомогательная: проверка ПАП по датам ---
-function _papMatchesDateFilter(p) {{
-    var dFrom = document.getElementById('filter_date_from').value;
-    var dTo   = document.getElementById('filter_date_to').value;
-    if (!dFrom && !dTo) return true;
-    var fromYM = dFrom ? dFrom.substring(0, 7) : '';
-    var toYM   = dTo   ? dTo.substring(0, 7)   : '';
-    var ms = p.months || [];
-    if (!ms.length) return true;
-    for (var i = 0; i < ms.length; i++) {{
-        if (fromYM && ms[i] < fromYM) continue;
-        if (toYM   && ms[i] > toYM)   continue;
-        return true;
-    }}
-    return false;
-}}
-
 // --- Фильтр ДТП + ПАП ---
 function applyDtpFilter() {{
     var typeVal = document.getElementById('filter_type').value;
@@ -1733,52 +1779,7 @@ function applyDtpFilter() {{
         filtered.features.length + ' ДТП';
 
     // Применяем тот же фильтр дат к ПАП
-    applyPapDateFilter();
-}}
-
-function applyPapDateFilter() {{
-    var selected = getSelectedArticles();
-    _mcgClear(papCluster);
-    papFlatGroup.clearLayers();
-    var papIcon = L.divIcon({{
-        className: 'pap-marker-icon',
-        html: '<div class="pap-marker-inner">&#128220;</div>',
-        iconSize: [28, 28],
-        iconAnchor: [14, 28],
-        popupAnchor: [0, -28]
-    }});
-    var filteredCount = 0;
-    papData.forEach(function(p) {{
-        if (!_papMatchesDateFilter(p)) return;
-        if (selected.length > 0 && !_papHasArticle(p, selected)) return;
-        var h = '<div class="pap-popup">';
-        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
-        if (p.articles && p.articles.length > 0) {{
-            h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
-            p.articles.forEach(function(a) {{
-                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
-            }});
-            h += '</table>';
-        }}
-        h += '</div>';
-        var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
-        papCluster.addLayer(m);
-        papFlatGroup.addLayer(m);
-        filteredCount++;
-    }});
-    if (!papClusteringEnabled && map.hasLayer(papFlatGroup)) {{
-        papFlatGroup.addTo(map);
-    }}
-    var cntEl = document.getElementById('pap_filter_count');
-    if (cntEl) {{
-        var hasDateFilter = document.getElementById('filter_date_from').value || document.getElementById('filter_date_to').value;
-        var hasArtFilter = selected.length > 0;
-        if (hasDateFilter || hasArtFilter) {{
-            cntEl.textContent = filteredCount + ' из ' + papData.length;
-        }} else {{
-            cntEl.textContent = '';
-        }}
-    }}
+    applyPapFilter();
 }}
 
 document.getElementById('filter_apply').addEventListener('click', applyDtpFilter);
@@ -1790,8 +1791,8 @@ document.getElementById('filter_reset').addEventListener('click', function() {{
     renderDtp(dtpData);
     document.getElementById('filter_count').textContent =
         dtpData.features.length + ' ДТП';
-    // Сбросить фильтр ПАП (перестроить с учётом статей, но без дат)
-    applyPapDateFilter();
+    // Сбросить фильтр ПАП
+    applyPapFilter();
 }});
 
 // --- Кнопка группировки ДТП ---
@@ -1952,16 +1953,7 @@ function updatePapArticleLabel() {{
     }}
 }}
 function applyPapArticleFilter() {{
-    updatePapArticleLabel();
-    // applyPapDateFilter учитывает и статьи, и даты
-    applyPapDateFilter();
-}}
-function _papHasArticle(p, selected) {{
-    if (!p.articles || !p.articles.length) return false;
-    for (var i = 0; i < p.articles.length; i++) {{
-        if (selected.indexOf(p.articles[i].article) !== -1) return true;
-    }}
-    return false;
+    applyPapFilter();
 }}
 
 // --- Управление слоями ---
@@ -2065,32 +2057,11 @@ function _loadYearData(year) {{
 }}
 
 function _rebuildPapLayer(newPapData) {{
-    // Удаляем текущие маркеры ПАП
     _mcgClear(papCluster);
     papFlatGroup.clearLayers();
     if (map.hasLayer(papFlatGroup)) map.removeLayer(papFlatGroup);
-
-    var papIcon = L.divIcon({{
-        className: 'pap-marker-icon',
-        html: '<div class="pap-marker-inner">&#128220;</div>',
-        iconSize: [28, 28],
-        iconAnchor: [14, 28],
-        popupAnchor: [0, -28]
-    }});
     (newPapData || []).forEach(function(p) {{
-        var h = '<div class="pap-popup">';
-        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
-        if (p.articles && p.articles.length > 0) {{
-            h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
-            p.articles.forEach(function(a) {{
-                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
-            }});
-            h += '</table>';
-        }}
-        h += '</div>';
-        var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
-        papCluster.addLayer(m);
-        papFlatGroup.addLayer(m);
+        _createPapMarker(p, _buildPapPopup(p.total, p.articles));
     }});
 
     // Если ПАП слой был включён — обновляем его на карте
