@@ -6,6 +6,7 @@
 - GET  /api/dtp/tasks              — список задач пользователя
 - GET  /api/dtp/tasks/{id}         — статус задачи (для polling)
 - GET  /api/dtp/tasks/{id}/map     — HTML-карта (генерируется лениво при первом запросе)
+- GET  /api/dtp/tasks/{id}/map-data — JSON-данные карты для переключения года
 - POST /api/dtp/tasks/{id}/generate-excel — ленивая генерация Excel для существующей задачи
 - GET  /api/dtp/tasks/{id}/download/{file_type} — скачать ранее сгенерированный файл
 - POST /api/dtp/export-only        — выгрузка файлов без аналитики (отдельная вкладка)
@@ -19,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -352,30 +353,15 @@ async def delete_task_endpoint(
 @router.get("/tasks/{task_id}/map", response_class=HTMLResponse)
 async def get_task_map(
     task_id: str,
-    refresh: bool = False,
     user: TelegramUser = Depends(get_current_user),
 ):
     """
     Отдаёт HTML-карту (inline Leaflet с кластеризацией).
     Генерируется лениво при первом запросе и кэшируется в task.files.
-    Параметр ?refresh=true — удалить кэш и перегенерировать.
     """
     task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
-
-    # При refresh=True — удаляем кэш-файл с диска и из task.files
-    if refresh:
-        map_file = next(
-            (f for f in task.files if f["type"] == "map_html"),
-            None,
-        )
-        if map_file:
-            path = Path(map_file["path"])
-            if path.exists():
-                path.unlink(missing_ok=True)
-            task.files = [f for f in task.files if f["type"] != "map_html"]
-            logger.info(f"Task {task.id}: map cache deleted (refresh)")
 
     # Ищем уже сгенерированную карту
     map_file = next(
@@ -408,100 +394,276 @@ async def get_task_map(
 
 
 # ============================================================
-# JSON-данные карты по году (для переключения года без перезагрузки)
+# JSON-данные карты для переключения года
 # ============================================================
 @router.get("/tasks/{task_id}/map-data")
-async def get_map_data_for_year(
+async def get_map_data(
     task_id: str,
-    year: int,
+    year: int = Query(..., description="Год для загрузки данных (полный год, 12 месяцев)"),
     user: TelegramUser = Depends(get_current_user),
 ):
-    """
-    Возвращает JSON с данными ДТП и ПАП за указанный год.
-    Используется для переключения года на карте без полной перезагрузки.
+    """Возвращает JSON с данными карты за указанный год.
 
-    Возвращает:
-        { dtp_geojson: {...}, pap_data: [...], summary: {total, deaths, injured, no_coords} }
+    Используется фронтендом для переключения года на карте ДТП
+    без перезагрузки страницы. Возвращает:
+    - dtp_geojson: GeoJSON FeatureCollection с маркерами ДТП
+    - pap_data: массив точек ПАП с нарушениями по статьям КоАП
+    - summary: {total, deaths, injured}
+
+    Данные загружаются за ПОЛНЫЙ год (январь-декабрь),
+    независимо от периода исходной задачи.
     """
     task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Определяем текущий год из dat_list
+    reg_code = task.region_code
+
+    # Формируем dat_list на полный год (1-12 месяцев)
+    year_dat_list = [f"{m}.{year}" for m in range(1, 13)]
+
+    from ..db.connection import get_pool, is_db_ready
+
+    if not is_db_ready():
+        raise HTTPException(
+            status_code=503,
+            detail="База данных недоступна для загрузки данных за другой год",
+        )
+
+    pool = get_pool()
+    if pool is None:
+        raise HTTPException(
+            status_code=503,
+            detail="База данных недоступна",
+        )
+
     try:
-        first_dat = task.dat_list[0]
-        _, current_year_str = first_dat.split(".")
-        current_year = int(current_year_str)
-    except (IndexError, ValueError):
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось определить год из dat_list",
+        # 1. Асинхронные SQL-запросы
+        dtp_rows, summary, pap_rows = await _fetch_map_data_from_db(
+            pool, reg_code, year_dat_list, year
         )
-
-    if year == current_year:
-        raise HTTPException(
-            status_code=400,
-            detail="Запрошенный год совпадает с текущим периодом задачи",
+        # 2. CPU-bound обработка (построение GeoJSON + попапов + ПАП)
+        dtp_geojson, pap_data = await asyncio.to_thread(
+            _build_geojson_and_pap, dtp_rows, pap_rows, year
         )
-
-    # Строим dat_list для целевого года (те же месяцы)
-    target_dat_list = []
-    for dat in task.dat_list:
-        try:
-            m, _ = dat.split(".")
-            target_dat_list.append(f"{m}.{year}")
-        except Exception:
-            continue
-
-    if not target_dat_list:
-        raise HTTPException(
-            status_code=400,
-            detail="Не удалось вычислить период для запрошенного года",
-        )
-
-    # Загружаем карточки ДТП из архива БД
-    from ..db.archive import get_cards_from_archive
-    from ..db.pap_repository import fetch_pap_for_map
-    from ..services import _imports
-
-    cards = await get_cards_from_archive(task.region_code, target_dat_list)
-    if cards is None:
-        cards = []
-
-    # Загружаем ПАП
-    try:
-        pap_data = await fetch_pap_for_map(task.region_code, target_dat_list)
     except Exception as exc:
-        logger.warning(f"Task {task.id}: PAP data for year {year} unavailable: {exc}")
-        pap_data = []
-
-    # Строим GeoJSON через report_generator
-    try:
-        rg_module = _imports._import_module("report_generator")
-        gen = rg_module.ReportGenerator(
-            region_name=task.region_name,
-            period_label=task.period_label,
+        logger.exception(f"get_map_data({task_id}, year={year}) failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка загрузки данных: {exc}",
         )
-        dtp_geojson = gen._build_dtp_geojson(cards)
-    except Exception as exc:
-        logger.warning(f"Task {task.id}: GeoJSON generation for year {year} failed: {exc}")
-        dtp_geojson = '{"type":"FeatureCollection","features":[]}'
-
-    # Сводная статистика
-    cards_with_coords = [c for c in cards if rg_module._parse_coords(c) is not None] if cards else []
-    summary = {
-        "total": len(cards),
-        "deaths": sum(int(c.get("pog", 0) or 0) for c in cards),
-        "injured": sum(int(c.get("ran", 0) or 0) for c in cards),
-        "no_coords": len(cards) - len(cards_with_coords),
-        "year": year,
-    }
 
     return {
-        "dtp_geojson": json.loads(dtp_geojson) if isinstance(dtp_geojson, str) else dtp_geojson,
-        "pap_data": pap_data or [],
+        "dtp_geojson": dtp_geojson,
+        "pap_data": pap_data,
         "summary": summary,
     }
+
+
+async def _fetch_map_data_from_db(
+    pool, reg_code: str, dat_list: list[str], year: int
+) -> tuple[list[dict], dict, list[dict]]:
+    """Асинхронно выполняет SQL-запросы для DTP и ПАП.
+
+    Возвращает (dtp_rows, summary, pap_rows).
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # Сводка за полный год
+            await cur.execute("""
+                SELECT COUNT(*) AS total,
+                       COALESCE(SUM(pog), 0) AS deaths,
+                       COALESCE(SUM(ran), 0) AS injured
+                FROM gibdd_cards
+                WHERE reg_code = %(reg)s AND dat_period = ANY(%(dats)s)
+            """, {"reg": reg_code, "dats": dat_list})
+            row = await cur.fetchone()
+            summary = {
+                "total": int(row["total"]),
+                "deaths": int(row["deaths"]),
+                "injured": int(row["injured"]),
+            }
+
+            # Карточки с координатами
+            await cur.execute("""
+                SELECT id, coord_w, coord_l, date_dtp, time,
+                       dtpv, pog, ran, k_ts, empt_number,
+                       dor, km, m, np, street, house, district,
+                       raw_payload
+                FROM gibdd_cards
+                WHERE reg_code = %(reg)s
+                  AND dat_period = ANY(%(dats)s)
+                  AND coord_w IS NOT NULL AND coord_w != 0
+                  AND coord_l IS NOT NULL AND coord_l != 0
+                ORDER BY date_dtp
+            """, {"reg": reg_code, "dats": dat_list})
+            dtp_rows = await cur.fetchall()
+
+            # ПАП: извлекаем нарушения ПДД из raw_payload → ts_info → ts_uch → npdd.
+            # npdd содержит текстовые описания вида "ст. 12.15 ч.1 КоАП РФ".
+            # Извлекаем номер статьи regex'ом из текста.
+            await cur.execute("""
+                WITH per_card AS (
+                    SELECT
+                        ROUND(coord_w::numeric, 5) AS lat,
+                        ROUND(coord_l::numeric, 5) AS lon,
+                        EXTRACT(MONTH FROM date_dtp)::int AS mon,
+                        raw_payload
+                    FROM gibdd_cards
+                    WHERE reg_code = %(reg)s
+                      AND dat_period = ANY(%(dats)s)
+                      AND coord_w IS NOT NULL AND coord_w != 0
+                      AND coord_l IS NOT NULL AND coord_l != 0
+                      AND raw_payload IS NOT NULL
+                ),
+                extracted AS (
+                    SELECT
+                        pc.lat,
+                        pc.lon,
+                        pc.mon,
+                        -- Извлекаем номер статьи (например "12.15") из текста npdd
+                        -- Форматы: "ст. 12.15 ч.1", "12.15", "ст.12.15"
+                        CASE
+                            WHEN uch_elem ~ 'ст\.?\s*(\d+\.\d+)'
+                                THEN REGEXP_REPLACE(uch_elem, '.*ст\.?\s*(\d+\.\d+).*', '\\1')
+                            WHEN uch_elem ~ '(\d{2,3}\.\d+)'
+                                THEN REGEXP_REPLACE(uch_elem, '.*(\d{2,3}\.\d+).*', '\\1')
+                            ELSE ''
+                        END AS article_num
+                    FROM per_card pc
+                    CROSS JOIN LATERAL jsonb_array_elements(
+                        COALESCE(pc.raw_payload->'ts_info', '[]'::jsonb)
+                    ) AS ts,
+                    LATERAL jsonb_array_elements(
+                        COALESCE(ts->'ts_uch', '[]'::jsonb)
+                    ) AS uch,
+                    LATERAL jsonb_array_elements_text(
+                        COALESCE(uch->'npdd', '[]'::jsonb)
+                    ) AS uch_elem
+                )
+                SELECT
+                    lat, lon, article_num, mon,
+                    COUNT(*) AS cnt
+                FROM extracted
+                WHERE article_num != ''
+                GROUP BY lat, lon, article_num, mon
+                ORDER BY lat, lon, article_num, mon
+            """, {"reg": reg_code, "dats": dat_list})
+            pap_rows = await cur.fetchall()
+
+    return dtp_rows, summary, pap_rows
+
+
+def _build_geojson_and_pap(
+    dtp_rows: list[dict], pap_rows: list[dict], year: int
+) -> tuple[dict, list[dict]]:
+    """CPU-bound: строит GeoJSON с попапами и массив ПАП-точек.
+
+    Вызывается через asyncio.to_thread() для неблокирующей обработки.
+    """
+    from report_generator import _severity_color, _card_popup_html
+
+    features = []
+    for r in dtp_rows:
+        lat = float(r["coord_w"])
+        lon = float(r["coord_l"])
+
+        # Восстанавливаем карточку-словарь для popup
+        card = dict(r)
+        card["date_dtp"] = r["date_dtp"].isoformat() if r["date_dtp"] else ""
+        card["time"] = r["time"].isoformat() if r["time"] else ""
+
+        # Извлекаем ts_info и dor_usl из raw_payload для popup
+        raw = r.get("raw_payload") or {}
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        card["ts_info"] = raw.get("ts_info", [])
+        card["dor_usl"] = raw.get("dor_usl", {})
+
+        popup_html = _card_popup_html(card)
+
+        pog = int(r["pog"] or 0)
+        ran = int(r["ran"] or 0)
+        if pog > 0:
+            severity = "fatal"
+        elif ran > 0:
+            severity = "injured"
+        else:
+            severity = "material"
+
+        date_dtp = r["date_dtp"]
+        date_sort = date_dtp.strftime("%Y%m%d") if date_dtp else ""
+
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "popup": popup_html,
+                "color": _severity_color(card),
+                "dtpv": r["dtpv"] or "",
+                "severity": severity,
+                "date_sort": date_sort,
+            },
+            "geometry": {
+                "type": "Point",
+                "coordinates": [lon, lat],
+            },
+        })
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+
+    # --- ПАП ---
+    # pap_rows: [{lat, lon, article_num, mon, cnt}]
+    # viol_group недоступен из SQL (npdd — текст), оставляем пустым
+    points: dict[tuple, dict] = {}
+    for r in pap_rows:
+        key = (float(r["lat"]), float(r["lon"]))
+        article = str(r["article_num"]).strip()
+        mon = int(r["mon"])
+        cnt = int(r["cnt"])
+
+        if key not in points:
+            points[key] = {"lat": key[0], "lon": key[1], "_arts": {}}
+
+        if article not in points[key]["_arts"]:
+            points[key]["_arts"][article] = {
+                "article": article,
+                "group": "",
+                "monthly": {},
+            }
+
+        ym_key = f"{year}-{mon:02d}"
+        points[key]["_arts"][article]["monthly"][ym_key] = cnt
+
+    pap_data = []
+    for pt in points.values():
+        arts = []
+        total = 0
+        for a in pt["_arts"].values():
+            cnt = sum(a["monthly"].values())
+            if cnt > 0:
+                arts.append({
+                    "article": a["article"],
+                    "group": a["group"],
+                    "cnt": cnt,
+                    "monthly": a["monthly"],
+                })
+                total += cnt
+        if total > 0:
+            arts.sort(key=lambda x: -x["cnt"])
+            pap_data.append({
+                "lat": pt["lat"],
+                "lon": pt["lon"],
+                "total": total,
+                "articles": arts,
+            })
+
+    return geojson, pap_data
 
 
 # ============================================================
@@ -811,22 +973,11 @@ async def _generate_map_html(task: Task) -> Optional[str]:
         )
 
         prev_cards_for_map = task.prev_cards or None
-
-        # Загружаем данные ПАП (если БД доступна)
-        pap_data = None
-        try:
-            from ..db.pap_repository import fetch_pap_for_map
-            pap_data = await fetch_pap_for_map(task.region_code, task.dat_list)
-        except Exception as exc:
-            logger.warning(f"Task {task.id}: PAP data unavailable: {exc}")
-
         html_content = generator.generate_dtp_map(
             task.cards,
             cameras=cameras,
             prev_cards=prev_cards_for_map,
             prev_label=task.prev_label,
-            pap_data=pap_data,
-            task_id=task.id,
         )
 
         # Кэшируем на диск
