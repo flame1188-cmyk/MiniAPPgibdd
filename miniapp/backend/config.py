@@ -132,6 +132,43 @@ class Settings(BaseSettings):
         ),
     )
 
+    # === PAP Database (gibdd_db — отдельный сервер) ===
+    pap_db_host: str = Field(
+        default="", description="Хост БД gibdd_db (ПАП данные)"
+    )
+    pap_db_port: int = Field(
+        default=5440, description="Порт БД gibdd_db"
+    )
+    pap_db_name: str = Field(
+        default="gibdd_db", description="Имя базы данных gibdd_db"
+    )
+    pap_db_user: str = Field(
+        default="", description="Пользователь БД gibdd_db"
+    )
+    pap_db_password: str = Field(
+        default="", description="Пароль БД gibdd_db"
+    )
+    pap_db_pool_min: int = Field(
+        default=1, description="Мин. размер пула ПАП БД"
+    )
+    pap_db_pool_max: int = Field(
+        default=5, description="Макс. размер пула ПАП БД"
+    )
+
+    @property
+    def pap_db_enabled(self) -> bool:
+        """True если PAP_DB_HOST задан — пул к gibdd_db будет создан."""
+        return bool(self.pap_db_host.strip())
+
+    @property
+    def pap_db_url(self) -> str:
+        """Строит connection string для psycopg 3."""
+        return (
+            f"host={self.pap_db_host} port={self.pap_db_port} "
+            f"dbname={self.pap_db_name} user={self.pap_db_user} "
+            f"password={self.pap_db_password}"
+        )
+
     @property
     def db_enabled(self) -> bool:
         """True если DATABASE_URL задан и пул должен быть создан."""

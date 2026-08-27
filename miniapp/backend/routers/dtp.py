@@ -698,11 +698,21 @@ async def _generate_map_html(task: Task) -> Optional[str]:
         )
 
         prev_cards_for_map = task.prev_cards or None
+
+        # Загружаем данные ПАП (если БД доступна)
+        pap_data = None
+        try:
+            from ..db.pap_repository import fetch_pap_for_map
+            pap_data = await fetch_pap_for_map(task.region_code, task.dat_list)
+        except Exception as exc:
+            logger.debug(f"Task {task.id}: PAP data unavailable: {exc}")
+
         html_content = generator.generate_dtp_map(
             task.cards,
             cameras=cameras,
             prev_cards=prev_cards_for_map,
             prev_label=task.prev_label,
+            pap_data=pap_data,
         )
 
         # Кэшируем на диск

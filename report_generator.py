@@ -740,6 +740,56 @@ body {
   opacity: 0.4 !important;
   pointer-events: none !important;
 }
+/* ПАП маркеры */
+.pap-marker-icon {
+  background: none !important;
+  border: none !important;
+}
+.pap-marker-inner {
+  width: 28px;
+  height: 28px;
+  background: #1565c0;
+  border-radius: 50% 50% 50% 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  transform: rotate(-10deg);
+}
+.pap-popup {
+  font-size: 13px;
+  line-height: 1.4;
+}
+.pap-popup-title {
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+.pap-popup-title b {
+  color: #1565c0;
+}
+.pap-repeat {
+  color: #e65100;
+  font-size: 12px;
+}
+.pap-table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-top: 4px;
+}
+.pap-table th {
+  background: #e3f2fd;
+  padding: 3px 6px;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  border-bottom: 1px solid #90caf9;
+}
+.pap-table td {
+  padding: 2px 6px;
+  font-size: 12px;
+  border-bottom: 1px solid #e0e0e0;
+}
 """
 
     @staticmethod
@@ -761,10 +811,11 @@ body {
         cameras: list[dict] | None = None,
         prev_cards: list[dict] | None = None,
         prev_label: str | None = None,
+        pap_data: list[dict] | None = None,
     ) -> str:
         """
         Генерирует HTML-файл с картой всех ДТП.
-        Опционально с маркерами камер и сравнением с АППГ в сводке.
+        Опционально с маркерами камер, слоем ПАП и сравнением с АППГ в сводке.
         """
         # Фильтруем карточки с координатами
         cards_with_coords = [
@@ -819,6 +870,7 @@ body {
         # Данные для карты
         dtp_geojson = self._build_dtp_geojson(cards_with_coords)
         camera_markers = self._build_camera_markers_js(cameras) if cameras else "[]"
+        pap_data_js = json.dumps(pap_data or [], ensure_ascii=False)
         center = self._calc_center(cards_with_coords)
         zoom = self._calc_zoom(cards_with_coords)
 
@@ -826,6 +878,7 @@ body {
         map_js = self._dtp_map_js(
             center, zoom, dtp_geojson, camera_markers,
             has_cameras=cameras is not None,
+            pap_data_js=pap_data_js,
         )
 
         body = f"""
@@ -1191,8 +1244,9 @@ function clearCoordSearch() {
         dtp_geojson: str,
         camera_markers_js: str,
         has_cameras: bool,
+        pap_data_js: str = "[]",
     ) -> str:
-        """JavaScript-код карты ДТП с фильтрами."""
+        """JavaScript-код карты ДТП с фильтрами и слоем ПАП."""
         return f"""
 var map = L.map('map', {{attributionControl: false}}).setView([{center[0]}, {center[1]}], {zoom});
 
@@ -1336,6 +1390,34 @@ clearBtn.addTo(map);
 // --- Данные ---
 var dtpData = {dtp_geojson};
 var cameraDataFull = {camera_markers_js};
+var papData = {pap_data_js};
+
+// --- Слой ПАП ---
+var papGroup = L.layerGroup();
+(function() {{
+    var papIcon = L.divIcon({{
+        className: 'pap-marker-icon',
+        html: '<div class="pap-marker-inner">&#128220;</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 28],
+        popupAnchor: [0, -28]
+    }});
+    papData.forEach(function(p) {{
+        var h = '<div class="pap-popup">';
+        h += '<div class="pap-popup-title">ПАП: <b>' + p.total + '</b>';
+        if (p.repeat > 0) h += ' <span class="pap-repeat">(повторных: ' + p.repeat + ')</span>';
+        h += '</div>';
+        if (p.articles && p.articles.length > 0) {{
+            h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
+            p.articles.forEach(function(a) {{
+                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
+            }});
+            h += '</table>';
+        }}
+        h += '</div>';
+        L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 300}}).addTo(papGroup);
+    }});
+}})();
 
 // --- MarkerCluster для ДТП ---
 var dtpCluster = L.markerClusterGroup({{
@@ -1590,6 +1672,9 @@ function applyDtpCameraFilter() {{
 var overlayLayers = {{"ДТП": dtpCluster}};
 if ({str(has_cameras).lower()}) {{
     overlayLayers["Камеры"] = cameraCluster;
+}}
+if (papData.length > 0) {{
+    overlayLayers["ПАП"] = papGroup;
 }}
 var layersControl = L.control.layers({{}}, overlayLayers, {{collapsed: true}}).addTo(map);
 
