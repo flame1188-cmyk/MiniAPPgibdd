@@ -260,7 +260,7 @@ def _make_report_generator_stub() -> types.ModuleType:
             self.region_name = region_name
             self.period_label = period_label
 
-        def generate_dtp_map(self, cards, cameras=None, prev_cards=None, prev_label=None):
+        def generate_dtp_map(self, cards, cameras=None, prev_cards=None, prev_label=None, pap_data=None, task_id=""):
             return f"<html><body>Fake map for {len(cards)} cards in {self.region_name}</body></html>"
 
     report_gen.ReportGenerator = FakeReportGenerator

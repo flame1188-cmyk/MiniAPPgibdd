@@ -523,19 +523,73 @@ body {
 .filter-panel {
   background: white;
   border-radius: 8px;
-  padding: 12px 16px;
+  padding: 0 16px;
   margin-bottom: 12px;
   box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  font-size: 13px;
+}
+.filter-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.filter-panel-header:hover {
+  opacity: 0.8;
+}
+.filter-panel-header .filter-title {
+  font-weight: 600;
+  font-size: 14px;
+  margin: 0;
+}
+.filter-chevron {
+  font-size: 12px;
+  transition: transform 0.2s ease;
+  color: #757575;
+}
+.filter-panel.collapsed .filter-chevron {
+  transform: rotate(-90deg);
+}
+.filter-body {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+  padding-bottom: 12px;
+}
+.filter-panel.collapsed .filter-body {
+  display: none;
+}
+.year-selector {
+  background: white;
+  border-radius: 8px;
+  padding: 8px 16px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 13px;
 }
-.filter-panel .filter-title {
+.year-label {
   font-weight: 600;
-  margin-right: 4px;
   font-size: 14px;
+  white-space: nowrap;
+}
+.year-selector select {
+  padding: 5px 8px;
+  border: 1px solid #bdbdbd;
+  border-radius: 4px;
+  font-size: 13px;
+  background: #fafafa;
+  cursor: pointer;
+}
+.year-selector select:focus {
+  outline: none;
+  border-color: #1565c0;
 }
 .filter-group {
   display: flex;
@@ -835,11 +889,25 @@ body {
         prev_cards: list[dict] | None = None,
         prev_label: str | None = None,
         pap_data: list[dict] | None = None,
+        task_id: str = "",
     ) -> str:
         """
         Генерирует HTML-файл с картой всех ДТП.
         Опционально с маркерами камер, слоем ПАП и сравнением с АППГ в сводке.
         """
+        # Определяем текущий год из period_label
+        import re
+        current_year = None
+        year_match = re.search(r'\b(20\d{2})\b', self.period_label or '')
+        if year_match:
+            current_year = int(year_match.group(1))
+        # Список доступных лет для переключения
+        available_years = []
+        if current_year:
+            for y in range(current_year - 5, current_year):
+                available_years.append(y)
+            available_years.reverse()  # от нового к старому
+
         # Фильтруем карточки с координатами
         cards_with_coords = [
             c for c in cards if _parse_coords(c) is not None
@@ -883,10 +951,17 @@ body {
         cam_models = sorted(set(
             c.get("model", "") for c in (cameras or []) if c.get("model")
         )) if cameras else []
+        # Уникальные статьи КоАП для фильтра ПАП
+        pap_articles = sorted(set(
+            a.get("article", "")
+            for p in (pap_data or [])
+            for a in (p.get("articles") or [])
+            if a.get("article")
+        ))
 
         # Панель фильтров
         filter_html = self._build_filter_panel(
-            dtp_types, cam_models,
+            dtp_types, cam_models, pap_articles,
             total_on_map=len(cards_with_coords),
         )
 
@@ -897,22 +972,40 @@ body {
         center = self._calc_center(cards_with_coords)
         zoom = self._calc_zoom(cards_with_coords)
 
+        # HTML селектора года (если есть предыдущие годы и есть task_id)
+        year_selector_html = ""
+        if available_years and task_id:
+            year_opts = f'<option value="">{self._esc(self.period_label)}</option>'
+            for y in available_years:
+                year_opts += f'<option value="{y}">{y}</option>'
+            year_selector_html = f"""
+<div class="year-selector" id="year-selector">
+  <span class="year-label">📅 Период:</span>
+  <select id="year_select" onchange="onYearChange(this.value)">
+    {year_opts}
+  </select>
+  <span class="year-hint" id="year-loading" style="display:none;color:#1565c0;font-size:12px;margin-left:8px;">⏳ Загрузка...</span>
+</div>"""
+
         # JS-код карты
         map_js = self._dtp_map_js(
             center, zoom, dtp_geojson, camera_markers,
             has_cameras=cameras is not None,
             pap_data_js=pap_data_js,
+            current_year=current_year or 0,
+            task_id=task_id,
         )
 
         body = f"""
 {summary_html}
-{legend_html}
 {filter_html}
 {self._build_coord_search_html()}
+{year_selector_html}
 <div class="map-container">
-  <div class="map-title">Карта ДТП — {self._esc(self.region_name)}</div>
+  <div class="map-title" id="map-title">Карта ДТП — {self._esc(self.region_name)}<span id="map-title-year"></span></div>
   <div id="map"></div>
 </div>
+{legend_html}
 <script>
 {map_js}
 </script>
@@ -1089,6 +1182,7 @@ body {
         self,
         dtp_types: list[str],
         cam_models: list[str] | None = None,
+        pap_articles: list[str] | None = None,
         total_on_map: int = 0,
     ) -> str:
         """Строит HTML-панель фильтров для карты ДТП."""
@@ -1098,10 +1192,14 @@ body {
             type_opts += f'<option value="{self._esc(t)}">{self._esc(t)}</option>'
 
         html = f"""
-<div class="filter-panel">
-  <span class="filter-title">🔍 Фильтр ДТП:</span>
+<div class="filter-panel collapsed" id="filter-panel">
+  <div class="filter-panel-header" onclick="this.parentElement.classList.toggle('collapsed')">
+    <span class="filter-title">🔍 Фильтры</span>
+    <span class="filter-chevron">▼</span>
+  </div>
+  <div class="filter-body">
   <div class="filter-group">
-    <label>Вид:</label>
+    <label>Вид ДТП:</label>
     <select id="filter_type">{type_opts}</select>
   </div>
   <div class="filter-group">
@@ -1144,7 +1242,26 @@ body {
   </div>
   <span class="filter-count" id="camera_filter_count"></span>"""
 
-        html += "\n</div>"
+        # Фильтр ПАП по статьям КоАП
+        if pap_articles:
+            art_items = ""
+            for art in pap_articles:
+                art_items += f'<label><input type="checkbox" value="{self._esc(art)}" onchange="applyPapArticleFilter()"> {self._esc(art)}</label>\n    '
+            html += f"""
+  <span class="filter-divider"></span>
+  <span class="filter-title">📋 Статьи КоАП:</span>
+  <div class="multi-select" id="pap_article_multi">
+    <div class="multi-select-trigger" onclick="toggleMultiSelect('pap_article_multi')">
+      <span class="multi-select-label">Все статьи</span>
+      <span class="multi-select-arrow">▼</span>
+    </div>
+    <div class="multi-select-dropdown">
+    {art_items}
+    </div>
+  </div>
+  <span class="filter-count" id="pap_filter_count"></span>"""
+
+        html += "\n  </div>\n</div>"
         return html
 
     @staticmethod
@@ -1268,10 +1385,19 @@ function clearCoordSearch() {
         camera_markers_js: str,
         has_cameras: bool,
         pap_data_js: str = "[]",
+        current_year: int = 0,
+        task_id: str = "",
     ) -> str:
         """JavaScript-код карты ДТП с фильтрами и слоем ПАП."""
         return f"""
 var map = L.map('map', {{attributionControl: false}}).setView([{center[0]}, {center[1]}], {zoom});
+
+// --- Конфигурация для переключения года ---
+var _mapTaskId = "{task_id}";
+var _mapCurrentYear = {current_year};
+var _mapTgInitData = new URLSearchParams(window.location.search).get('tg_init_data') || '';
+var _mapOriginalDtpData = null; // сохраняем оригинальные данные для возврата
+var _mapOriginalPapData = null;
 
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
     attribution: false,
@@ -1485,11 +1611,11 @@ function togglePapClustering() {{
     _papToggleLock = false;
 }}
 
-// Помещаем кнопку в панель фильтров
+// Помещаем кнопку в тело панели фильтров
 (function() {{
-    var filterPanel = document.getElementById('filter-panel');
-    if (filterPanel) {{
-        filterPanel.appendChild(papToggleDiv);
+    var filterBody = document.querySelector('#filter-panel .filter-body');
+    if (filterBody) {{
+        filterBody.appendChild(papToggleDiv);
     }}
 }})();
 
@@ -1742,6 +1868,66 @@ function applyDtpCameraFilter() {{
     if (cntEl) cntEl.textContent = filtered.length + ' из ' + cameraDataFull.length;
 }}
 
+// --- Фильтр ПАП по статьям КоАП ---
+function getSelectedArticles() {{
+    var cbs = document.querySelectorAll('#pap_article_multi .multi-select-dropdown input:checked');
+    return Array.from(cbs).map(function(cb) {{ return cb.value; }});
+}}
+function updatePapArticleLabel() {{
+    var sel = getSelectedArticles();
+    var lbl = document.querySelector('#pap_article_multi .multi-select-label');
+    if (!lbl) return;
+    if (sel.length === 0) {{
+        lbl.textContent = 'Все статьи';
+    }} else {{
+        lbl.textContent = sel.length + ' выбрано';
+    }}
+}}
+function applyPapArticleFilter() {{
+    updatePapArticleLabel();
+    var selected = getSelectedArticles();
+    _mcgClear(papCluster);
+    papFlatGroup.clearLayers();
+    var papIcon = L.divIcon({{
+        className: 'pap-marker-icon',
+        html: '<div class="pap-marker-inner">&#128220;</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 28],
+        popupAnchor: [0, -28]
+    }});
+    var filteredCount = 0;
+    papData.forEach(function(p) {{
+        if (selected.length === 0 || _papHasArticle(p, selected)) {{
+            var h = '<div class="pap-popup">';
+            h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
+            if (p.articles && p.articles.length > 0) {{
+                h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
+                p.articles.forEach(function(a) {{
+                    h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
+                }});
+                h += '</table>';
+            }}
+            h += '</div>';
+            var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
+            papCluster.addLayer(m);
+            papFlatGroup.addLayer(m);
+            filteredCount++;
+        }}
+    }});
+    if (!papClusteringEnabled && map.hasLayer(papFlatGroup)) {{
+        papFlatGroup.addTo(map);
+    }}
+    var cntEl = document.getElementById('pap_filter_count');
+    if (cntEl) cntEl.textContent = selected.length > 0 ? (filteredCount + ' из ' + papData.length) : '';
+}}
+function _papHasArticle(p, selected) {{
+    if (!p.articles || !p.articles.length) return false;
+    for (var i = 0; i < p.articles.length; i++) {{
+        if (selected.indexOf(p.articles[i].article) !== -1) return true;
+    }}
+    return false;
+}}
+
 // --- Управление слоями ---
 var overlayLayers = {{"ДТП": dtpCluster}};
 if ({str(has_cameras).lower()}) {{
@@ -1778,6 +1964,144 @@ map.on('overlayremove', function(e) {{
         if (btn) btn.classList.add('clusters-toggle-disabled');
     }}
 }});
+
+// --- Сохраняем оригинальные данные для возврата к текущему году ---
+_mapOriginalDtpData = JSON.parse(JSON.stringify(dtpData));
+_mapOriginalPapData = JSON.parse(JSON.stringify(papData));
+// Сохраняем оригинальную сводку
+_mapOriginalSummary = {{}};
+document.querySelectorAll('.summary-card').forEach(function(card, i) {{
+    var v = card.querySelector('.value');
+    var l = card.querySelector('.label');
+    if (v) _mapOriginalSummary['val_' + i] = v.textContent;
+    if (l) _mapOriginalSummary['lbl_' + i] = l.textContent;
+}});
+
+// --- Переключение года ---
+function onYearChange(val) {{
+    if (!val) {{
+        // Возврат к текущему году
+        renderDtp(_mapOriginalDtpData);
+        _rebuildPapLayer(_mapOriginalPapData);
+        dtpData = _mapOriginalDtpData;
+        papData = _mapOriginalPapData;
+        _restoreOriginalSummary();
+        _updateTitleForYear(null);
+        document.getElementById('filter_count').textContent = _mapOriginalDtpData.features.length + ' ДТП';
+        return;
+    }}
+    var year = parseInt(val);
+    if (isNaN(year) || year === _mapCurrentYear) return;
+    _loadYearData(year);
+}}
+
+function _loadYearData(year) {{
+    var loadingEl = document.getElementById('year-loading');
+    if (loadingEl) loadingEl.style.display = 'inline';
+    var selectEl = document.getElementById('year_select');
+    if (selectEl) selectEl.disabled = true;
+
+    var url = '/api/dtp/tasks/' + _mapTaskId + '/map-data?year=' + year;
+    if (_mapTgInitData) url += '&tg_init_data=' + encodeURIComponent(_mapTgInitData);
+
+    fetch(url, {{headers: {{'Accept': 'application/json'}}}})
+        .then(function(r) {{
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        }})
+        .then(function(data) {{
+            renderDtp(data.dtp_geojson);
+            dtpData = data.dtp_geojson;
+            _rebuildPapLayer(data.pap_data);
+            papData = data.pap_data || [];
+            _updateSummaryForYear(data.summary);
+            _updateTitleForYear(year);
+            document.getElementById('filter_count').textContent = data.dtp_geojson.features.length + ' ДТП';
+        }})
+        .catch(function(err) {{
+            console.error('Year load error:', err);
+            alert('Не удалось загрузить данные за ' + year + ' год: ' + err.message);
+        }})
+        .finally(function() {{
+            if (loadingEl) loadingEl.style.display = 'none';
+            if (selectEl) selectEl.disabled = false;
+        }});
+}}
+
+function _rebuildPapLayer(newPapData) {{
+    // Удаляем текущие маркеры ПАП
+    _mcgClear(papCluster);
+    papFlatGroup.clearLayers();
+    if (map.hasLayer(papFlatGroup)) map.removeLayer(papFlatGroup);
+
+    var papIcon = L.divIcon({{
+        className: 'pap-marker-icon',
+        html: '<div class="pap-marker-inner">&#128220;</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 28],
+        popupAnchor: [0, -28]
+    }});
+    (newPapData || []).forEach(function(p) {{
+        var h = '<div class="pap-popup">';
+        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
+        if (p.articles && p.articles.length > 0) {{
+            h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
+            p.articles.forEach(function(a) {{
+                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
+            }});
+            h += '</table>';
+        }}
+        h += '</div>';
+        var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
+        papCluster.addLayer(m);
+        papFlatGroup.addLayer(m);
+    }});
+
+    // Если ПАП слой был включён — обновляем его на карте
+    if (map.hasLayer(papCluster)) {{
+        map.removeLayer(papCluster);
+        papCluster.addTo(map);
+    }}
+}}
+
+function _updateSummaryForYear(summary) {{
+    var cards = document.querySelectorAll('.summary-card');
+    if (!summary) {{ _restoreOriginalSummary(); return; }}
+    // total
+    if (cards[0]) {{
+        var v = cards[0].querySelector('.value');
+        if (v) v.textContent = summary.total || 0;
+        var d = cards[0].querySelector('.delta'); if (d) d.style.display = 'none';
+    }}
+    // deaths
+    if (cards[1]) {{
+        var v = cards[1].querySelector('.value');
+        if (v) v.textContent = summary.deaths || 0;
+        var d = cards[1].querySelector('.delta'); if (d) d.style.display = 'none';
+    }}
+    // injured
+    if (cards[2]) {{
+        var v = cards[2].querySelector('.value');
+        if (v) v.textContent = summary.injured || 0;
+        var d = cards[2].querySelector('.delta'); if (d) d.style.display = 'none';
+    }}
+}}
+
+function _restoreOriginalSummary() {{
+    var cards = document.querySelectorAll('.summary-card');
+    cards.forEach(function(card, i) {{
+        var v = card.querySelector('.value');
+        var d = card.querySelector('.delta');
+        if (v && _mapOriginalSummary['val_' + i] !== undefined) v.textContent = _mapOriginalSummary['val_' + i];
+        if (d) d.style.display = '';
+    }});
+}}
+
+function _updateTitleForYear(year) {{
+    var titleYear = document.getElementById('map-title-year');
+    if (!titleYear) return;
+    titleYear.textContent = year ? ' (' + year + ')' : '';
+}}
 """
 
     # --------------------------------------------------

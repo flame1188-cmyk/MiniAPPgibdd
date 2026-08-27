@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -351,15 +352,30 @@ async def delete_task_endpoint(
 @router.get("/tasks/{task_id}/map", response_class=HTMLResponse)
 async def get_task_map(
     task_id: str,
+    refresh: bool = False,
     user: TelegramUser = Depends(get_current_user),
 ):
     """
     Отдаёт HTML-карту (inline Leaflet с кластеризацией).
     Генерируется лениво при первом запросе и кэшируется в task.files.
+    Параметр ?refresh=true — удалить кэш и перегенерировать.
     """
     task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # При refresh=True — удаляем кэш-файл с диска и из task.files
+    if refresh:
+        map_file = next(
+            (f for f in task.files if f["type"] == "map_html"),
+            None,
+        )
+        if map_file:
+            path = Path(map_file["path"])
+            if path.exists():
+                path.unlink(missing_ok=True)
+            task.files = [f for f in task.files if f["type"] != "map_html"]
+            logger.info(f"Task {task.id}: map cache deleted (refresh)")
 
     # Ищем уже сгенерированную карту
     map_file = next(
@@ -389,6 +405,103 @@ async def get_task_map(
         )
 
     return HTMLResponse(content=html_content)
+
+
+# ============================================================
+# JSON-данные карты по году (для переключения года без перезагрузки)
+# ============================================================
+@router.get("/tasks/{task_id}/map-data")
+async def get_map_data_for_year(
+    task_id: str,
+    year: int,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """
+    Возвращает JSON с данными ДТП и ПАП за указанный год.
+    Используется для переключения года на карте без полной перезагрузки.
+
+    Возвращает:
+        { dtp_geojson: {...}, pap_data: [...], summary: {total, deaths, injured, no_coords} }
+    """
+    task = await get_task_async(task_id)
+    if not task or task.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Определяем текущий год из dat_list
+    try:
+        first_dat = task.dat_list[0]
+        _, current_year_str = first_dat.split(".")
+        current_year = int(current_year_str)
+    except (IndexError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось определить год из dat_list",
+        )
+
+    if year == current_year:
+        raise HTTPException(
+            status_code=400,
+            detail="Запрошенный год совпадает с текущим периодом задачи",
+        )
+
+    # Строим dat_list для целевого года (те же месяцы)
+    target_dat_list = []
+    for dat in task.dat_list:
+        try:
+            m, _ = dat.split(".")
+            target_dat_list.append(f"{m}.{year}")
+        except Exception:
+            continue
+
+    if not target_dat_list:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось вычислить период для запрошенного года",
+        )
+
+    # Загружаем карточки ДТП из архива БД
+    from ..db.archive import get_cards_from_archive
+    from ..db.pap_repository import fetch_pap_for_map
+    from ..services import _imports
+
+    cards = await get_cards_from_archive(task.region_code, target_dat_list)
+    if cards is None:
+        cards = []
+
+    # Загружаем ПАП
+    try:
+        pap_data = await fetch_pap_for_map(task.region_code, target_dat_list)
+    except Exception as exc:
+        logger.warning(f"Task {task.id}: PAP data for year {year} unavailable: {exc}")
+        pap_data = []
+
+    # Строим GeoJSON через report_generator
+    try:
+        rg_module = _imports._import_module("report_generator")
+        gen = rg_module.ReportGenerator(
+            region_name=task.region_name,
+            period_label=task.period_label,
+        )
+        dtp_geojson = gen._build_dtp_geojson(cards)
+    except Exception as exc:
+        logger.warning(f"Task {task.id}: GeoJSON generation for year {year} failed: {exc}")
+        dtp_geojson = '{"type":"FeatureCollection","features":[]}'
+
+    # Сводная статистика
+    cards_with_coords = [c for c in cards if rg_module._parse_coords(c) is not None] if cards else []
+    summary = {
+        "total": len(cards),
+        "deaths": sum(int(c.get("pog", 0) or 0) for c in cards),
+        "injured": sum(int(c.get("ran", 0) or 0) for c in cards),
+        "no_coords": len(cards) - len(cards_with_coords),
+        "year": year,
+    }
+
+    return {
+        "dtp_geojson": json.loads(dtp_geojson) if isinstance(dtp_geojson, str) else dtp_geojson,
+        "pap_data": pap_data or [],
+        "summary": summary,
+    }
 
 
 # ============================================================
@@ -713,6 +826,7 @@ async def _generate_map_html(task: Task) -> Optional[str]:
             prev_cards=prev_cards_for_map,
             prev_label=task.prev_label,
             pap_data=pap_data,
+            task_id=task.id,
         )
 
         # Кэшируем на диск

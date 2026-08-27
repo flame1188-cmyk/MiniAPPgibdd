@@ -153,7 +153,7 @@ class TestExecuteTaskEdgeCases:
         class FailingReportGenerator:
             def __init__(self, region_name="", period_label=""):
                 pass
-            def generate_dtp_map(self, cards, cameras=None, prev_cards=None, prev_label=None):
+            def generate_dtp_map(self, cards, cameras=None, prev_cards=None, prev_label=None, pap_data=None, task_id=""):
                 raise RuntimeError("map generation boom")
 
         stubs["report_generator"].ReportGenerator = FailingReportGenerator
