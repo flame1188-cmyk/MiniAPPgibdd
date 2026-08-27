@@ -1106,6 +1106,7 @@ body {
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#d32f2f"></span></td><td>ДТП с погибшими</td></tr>
     <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#f57c00"></span></td><td>ДТП с ранеными</td></tr>
     <tr><td style="padding:2px 8px 2px 0;font-size:16px;">📷</td><td>Камера фотовидеофиксации</td></tr>
+    <tr><td style="padding:2px 8px 2px 0;"><span class="legend-dot" style="background:#1565c0"></span></td><td>ПАП (административные правонарушения)</td></tr>
   </table>
   <div style="margin-top:6px;color:#757575;font-size:12px;">Нажмите на маркер для подробностей. Колёсико мыши / +/- — масштаб.</div>
 </div>"""
@@ -1690,7 +1691,24 @@ function toggleDtpClustering() {{
 renderDtp(dtpData);
 dtpCluster.addTo(map);
 
-// --- Фильтр ДТП ---
+// --- Вспомогательная: проверка ПАП по датам ---
+function _papMatchesDateFilter(p) {{
+    var dFrom = document.getElementById('filter_date_from').value;
+    var dTo   = document.getElementById('filter_date_to').value;
+    if (!dFrom && !dTo) return true;
+    var fromYM = dFrom ? dFrom.substring(0, 7) : '';
+    var toYM   = dTo   ? dTo.substring(0, 7)   : '';
+    var ms = p.months || [];
+    if (!ms.length) return true;
+    for (var i = 0; i < ms.length; i++) {{
+        if (fromYM && ms[i] < fromYM) continue;
+        if (toYM   && ms[i] > toYM)   continue;
+        return true;
+    }}
+    return false;
+}}
+
+// --- Фильтр ДТП + ПАП ---
 function applyDtpFilter() {{
     var typeVal = document.getElementById('filter_type').value;
     var sevVal  = document.getElementById('filter_severity').value;
@@ -1713,6 +1731,54 @@ function applyDtpFilter() {{
     renderDtp(filtered);
     document.getElementById('filter_count').textContent =
         filtered.features.length + ' ДТП';
+
+    // Применяем тот же фильтр дат к ПАП
+    applyPapDateFilter();
+}}
+
+function applyPapDateFilter() {{
+    var selected = getSelectedArticles();
+    _mcgClear(papCluster);
+    papFlatGroup.clearLayers();
+    var papIcon = L.divIcon({{
+        className: 'pap-marker-icon',
+        html: '<div class="pap-marker-inner">&#128220;</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 28],
+        popupAnchor: [0, -28]
+    }});
+    var filteredCount = 0;
+    papData.forEach(function(p) {{
+        if (!_papMatchesDateFilter(p)) return;
+        if (selected.length > 0 && !_papHasArticle(p, selected)) return;
+        var h = '<div class="pap-popup">';
+        h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
+        if (p.articles && p.articles.length > 0) {{
+            h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
+            p.articles.forEach(function(a) {{
+                h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
+            }});
+            h += '</table>';
+        }}
+        h += '</div>';
+        var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
+        papCluster.addLayer(m);
+        papFlatGroup.addLayer(m);
+        filteredCount++;
+    }});
+    if (!papClusteringEnabled && map.hasLayer(papFlatGroup)) {{
+        papFlatGroup.addTo(map);
+    }}
+    var cntEl = document.getElementById('pap_filter_count');
+    if (cntEl) {{
+        var hasDateFilter = document.getElementById('filter_date_from').value || document.getElementById('filter_date_to').value;
+        var hasArtFilter = selected.length > 0;
+        if (hasDateFilter || hasArtFilter) {{
+            cntEl.textContent = filteredCount + ' из ' + papData.length;
+        }} else {{
+            cntEl.textContent = '';
+        }}
+    }}
 }}
 
 document.getElementById('filter_apply').addEventListener('click', applyDtpFilter);
@@ -1724,6 +1790,8 @@ document.getElementById('filter_reset').addEventListener('click', function() {{
     renderDtp(dtpData);
     document.getElementById('filter_count').textContent =
         dtpData.features.length + ' ДТП';
+    // Сбросить фильтр ПАП (перестроить с учётом статей, но без дат)
+    applyPapDateFilter();
 }});
 
 // --- Кнопка группировки ДТП ---
@@ -1885,40 +1953,8 @@ function updatePapArticleLabel() {{
 }}
 function applyPapArticleFilter() {{
     updatePapArticleLabel();
-    var selected = getSelectedArticles();
-    _mcgClear(papCluster);
-    papFlatGroup.clearLayers();
-    var papIcon = L.divIcon({{
-        className: 'pap-marker-icon',
-        html: '<div class="pap-marker-inner">&#128220;</div>',
-        iconSize: [28, 28],
-        iconAnchor: [14, 28],
-        popupAnchor: [0, -28]
-    }});
-    var filteredCount = 0;
-    papData.forEach(function(p) {{
-        if (selected.length === 0 || _papHasArticle(p, selected)) {{
-            var h = '<div class="pap-popup">';
-            h += '<div class="pap-popup-title">&#128220; <b>' + p.total + '</b> пост.</div>';
-            if (p.articles && p.articles.length > 0) {{
-                h += '<table class="pap-table"><tr><th>Статья</th><th>Группа</th><th style="text-align:right">Кол-во</th></tr>';
-                p.articles.forEach(function(a) {{
-                    h += '<tr><td>' + (a.article || '') + '</td><td>' + (a.group || '') + '</td><td style="text-align:right">' + (a.cnt || 0) + '</td></tr>';
-                }});
-                h += '</table>';
-            }}
-            h += '</div>';
-            var m = L.marker([p.lat, p.lon], {{icon: papIcon}}).bindPopup(h, {{maxWidth: 320}});
-            papCluster.addLayer(m);
-            papFlatGroup.addLayer(m);
-            filteredCount++;
-        }}
-    }});
-    if (!papClusteringEnabled && map.hasLayer(papFlatGroup)) {{
-        papFlatGroup.addTo(map);
-    }}
-    var cntEl = document.getElementById('pap_filter_count');
-    if (cntEl) cntEl.textContent = selected.length > 0 ? (filteredCount + ' из ' + papData.length) : '';
+    // applyPapDateFilter учитывает и статьи, и даты
+    applyPapDateFilter();
 }}
 function _papHasArticle(p, selected) {{
     if (!p.articles || !p.articles.length) return false;
