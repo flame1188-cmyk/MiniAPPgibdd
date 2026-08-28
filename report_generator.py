@@ -2033,8 +2033,10 @@ var _mapInitialSummary = {{}};
 document.querySelectorAll('.summary-card').forEach(function(card, i) {{
     var v = card.querySelector('.value');
     var l = card.querySelector('.label');
+    var d = card.querySelector('.delta');
     if (v) _mapInitialSummary['val_' + i] = v.textContent;
     if (l) _mapInitialSummary['lbl_' + i] = l.textContent;
+    if (d) _mapInitialSummary['delta_' + i] = d.style.display;
 }});
 // _mapOriginalSummary — текущая «базовая» сводка (меняется при смене года)
 var _mapOriginalSummary = JSON.parse(JSON.stringify(_mapInitialSummary));
@@ -2103,8 +2105,10 @@ function _loadYearData(year) {{
             document.querySelectorAll('.summary-card').forEach(function(card, i) {{
                 var v = card.querySelector('.value');
                 var l = card.querySelector('.label');
+                var d = card.querySelector('.delta');
                 if (v) _mapOriginalSummary['val_' + i] = v.textContent;
                 if (l) _mapOriginalSummary['lbl_' + i] = l.textContent;
+                if (d) _mapOriginalSummary['delta_' + i] = d.style.display;
             }});
         }})
         .catch(function(err) {{
@@ -2191,7 +2195,10 @@ function _restoreOriginalSummary() {{
         var v = card.querySelector('.value');
         var d = card.querySelector('.delta');
         if (v && _mapOriginalSummary['val_' + i] !== undefined) v.textContent = _mapOriginalSummary['val_' + i];
-        if (d) d.style.display = '';
+        if (d) {{
+            var saved = _mapOriginalSummary['delta_' + i];
+            d.style.display = (saved !== undefined) ? saved : '';
+        }}
     }});
 }}
 

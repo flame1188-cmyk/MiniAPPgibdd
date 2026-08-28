@@ -859,16 +859,14 @@ def _build_excel_data_sync(gibdd_parser, cards):
 async def _fetch_initial_pap_data(task: Task) -> list[dict]:
     """Извлекает ПАП-данные для начальной загрузки карты.
 
-    Использует dat_period из карточек задачи (не полный год).
+    Использует task.dat_list (периоды задачи), а не карточки,
+    потому что cards из архива не содержат поле dat_period.
     Делегирует запрос pap_repository.fetch_pap_for_map(),
     который читает из таблицы pap_points.
     """
     from ..db.pap_repository import fetch_pap_for_map
 
-    # Собираем уникальные dat_period из карточек задачи
-    dat_periods = sorted(set(
-        c.get("dat_period", "") for c in task.cards if c.get("dat_period")
-    ))
+    dat_periods = getattr(task, 'dat_list', None) or []
     if not dat_periods:
         return []
 
