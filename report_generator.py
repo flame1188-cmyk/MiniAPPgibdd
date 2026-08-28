@@ -803,13 +803,15 @@ body {
   width: 28px;
   height: 28px;
   background: #1565c0;
-  border-radius: 50% 50% 50% 4px;
+  border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1;
   box-shadow: 0 2px 6px rgba(0,0,0,0.3);
-  transform: rotate(-10deg);
+  text-shadow: 0 1px 2px rgba(0,0,0,0.3);
 }
 /* PAP MarkerCluster override */
 .pap-cluster-small {
@@ -1550,10 +1552,12 @@ var papCluster = L.markerClusterGroup({{
     spiderfyOnMaxZoom: true,
     showCoverageOnHover: false,
     iconCreateFunction: function(cluster) {{
-        var count = cluster.getChildCount();
-        var size = count < 10 ? 'small' : count < 100 ? 'medium' : 'large';
+        var sum = 0;
+        cluster.getAllChildMarkers().forEach(function(m) {{ sum += (m._papTotal || 0); }});
+        var txt = _formatPapNum(sum);
+        var size = sum < 500 ? 'small' : sum < 5000 ? 'medium' : 'large';
         return L.divIcon({{
-            html: '<div><span>' + count + '</span></div>',
+            html: '<div><span>' + txt + '</span></div>',
             className: 'marker-cluster pap-cluster-' + size,
             iconSize: L.point(36, 36)
         }});
@@ -1564,13 +1568,22 @@ var papClusteringEnabled = true;
 var _papToggleLock = false;
 
 // --- Общие помощники ПАП ---
-var _papIcon = L.divIcon({{
-    className: 'pap-marker-icon',
-    html: '<div class="pap-marker-inner">&#128220;</div>',
-    iconSize: [28, 28],
-    iconAnchor: [14, 28],
-    popupAnchor: [0, -28]
-}});
+function _formatPapNum(n) {{
+    if (n >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
+    return String(n);
+}}
+
+function _makePapIcon(total) {{
+    var txt = _formatPapNum(total);
+    var fs = txt.length <= 2 ? 11 : txt.length <= 3 ? 10 : txt.length <= 4 ? 9 : 8;
+    return L.divIcon({{
+        className: 'pap-marker-icon',
+        html: '<div class="pap-marker-inner" style="font-size:' + fs + 'px">' + txt + '</div>',
+        iconSize: [28, 28],
+        iconAnchor: [14, 28],
+        popupAnchor: [0, -28]
+    }});
+}}
 
 function _buildPapPopup(total, articles) {{
     var h = '<div class="pap-popup">';
@@ -1586,8 +1599,10 @@ function _buildPapPopup(total, articles) {{
     return h;
 }}
 
-function _createPapMarker(p, popupHtml) {{
-    var m = L.marker([p.lat, p.lon], {{icon: _papIcon}}).bindPopup(popupHtml, {{maxWidth: 320}});
+function _createPapMarker(p, popupHtml, filteredTotal) {{
+    var displayTotal = (filteredTotal != null) ? filteredTotal : p.total;
+    var m = L.marker([p.lat, p.lon], {{icon: _makePapIcon(displayTotal)}}).bindPopup(popupHtml, {{maxWidth: 320}});
+    m._papTotal = displayTotal;
     papCluster.addLayer(m);
     papFlatGroup.addLayer(m);
 }}
@@ -1633,7 +1648,7 @@ function applyPapFilter() {{
     for (var i = 0; i < papData.length; i++) {{
         var r = _filterPapPoint(papData[i], sel, fromYM, toYM);
         if (!r) continue;
-        _createPapMarker(papData[i], _buildPapPopup(r.total, r.articles));
+        _createPapMarker(papData[i], _buildPapPopup(r.total, r.articles), r.total);
         n++;
     }}
     if (!papClusteringEnabled && map.hasLayer(papFlatGroup)) papFlatGroup.addTo(map);
@@ -1647,7 +1662,7 @@ function applyPapFilter() {{
 // Первичная отрисовка ПАП
 (function() {{
     papData.forEach(function(p) {{
-        _createPapMarker(p, _buildPapPopup(p.total, p.articles));
+        _createPapMarker(p, _buildPapPopup(p.total, p.articles), p.total);
     }});
 }})();
 
@@ -2107,7 +2122,7 @@ function _rebuildPapLayer(newPapData) {{
     papFlatGroup.clearLayers();
     if (map.hasLayer(papFlatGroup)) map.removeLayer(papFlatGroup);
     (newPapData || []).forEach(function(p) {{
-        _createPapMarker(p, _buildPapPopup(p.total, p.articles));
+        _createPapMarker(p, _buildPapPopup(p.total, p.articles), p.total);
     }});
 
     // Если кластер на карте — он обновится автоматически (маркеры уже внутри).
