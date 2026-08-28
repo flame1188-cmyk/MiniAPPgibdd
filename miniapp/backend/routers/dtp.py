@@ -438,14 +438,17 @@ async def get_map_data(
         )
 
     try:
-        # 1. Асинхронные SQL-запросы
-        dtp_rows, summary, pap_rows = await _fetch_map_data_from_db(
-            pool, reg_code, year_dat_list, year
+        # 1. DTP: SQL-запросы (сводка + карточки)
+        dtp_rows, summary = await _fetch_map_data_from_db(
+            pool, reg_code, year_dat_list
         )
-        # 2. CPU-bound обработка (построение GeoJSON + попапов + ПАП)
-        dtp_geojson, pap_data = await asyncio.to_thread(
-            _build_geojson_and_pap, dtp_rows, pap_rows, year
+        # 2. CPU-bound обработка (построение GeoJSON + попапов)
+        dtp_geojson = await asyncio.to_thread(
+            _build_dtp_geojson, dtp_rows
         )
+        # 3. ПАП из отдельной таблицы pap_points
+        from ..db.pap_repository import fetch_pap_for_map
+        pap_data = await fetch_pap_for_map(reg_code, year_dat_list)
     except Exception as exc:
         logger.exception(f"get_map_data({task_id}, year={year}) failed")
         raise HTTPException(
@@ -461,11 +464,12 @@ async def get_map_data(
 
 
 async def _fetch_map_data_from_db(
-    pool, reg_code: str, dat_list: list[str], year: int
-) -> tuple[list[dict], dict, list[dict]]:
-    """Асинхронно выполняет SQL-запросы для DTP и ПАП.
+    pool, reg_code: str, dat_list: list[str]
+) -> tuple[list[dict], dict]:
+    """Асинхронно выполняет SQL-запросы для DTP (сводка + карточки).
 
-    Возвращает (dtp_rows, summary, pap_rows).
+    Возвращает (dtp_rows, summary).
+    ПАП загружается отдельно через pap_repository.fetch_pap_for_map().
     """
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -499,67 +503,16 @@ async def _fetch_map_data_from_db(
             """, {"reg": reg_code, "dats": dat_list})
             dtp_rows = await cur.fetchall()
 
-            # ПАП: извлекаем нарушения ПДД из raw_payload → ts_info → ts_uch → npdd.
-            # npdd содержит текстовые описания вида "ст. 12.15 ч.1 КоАП РФ".
-            # Извлекаем номер статьи regex'ом из текста.
-            await cur.execute("""
-                WITH per_card AS (
-                    SELECT
-                        ROUND(coord_w::numeric, 5) AS lat,
-                        ROUND(coord_l::numeric, 5) AS lon,
-                        EXTRACT(MONTH FROM date_dtp)::int AS mon,
-                        raw_payload
-                    FROM gibdd_cards
-                    WHERE reg_code = %(reg)s
-                      AND dat_period = ANY(%(dats)s)
-                      AND coord_w IS NOT NULL AND coord_w != 0
-                      AND coord_l IS NOT NULL AND coord_l != 0
-                      AND raw_payload IS NOT NULL
-                ),
-                extracted AS (
-                    SELECT
-                        pc.lat,
-                        pc.lon,
-                        pc.mon,
-                        -- Извлекаем номер статьи (например "12.15") из текста npdd
-                        -- Форматы: "ст. 12.15 ч.1", "12.15", "ст.12.15"
-                        CASE
-                            WHEN uch_elem ~ 'ст\.?\s*(\d+\.\d+)'
-                                THEN REGEXP_REPLACE(uch_elem, '.*ст\.?\s*(\d+\.\d+).*', '\\1')
-                            WHEN uch_elem ~ '(\d{2,3}\.\d+)'
-                                THEN REGEXP_REPLACE(uch_elem, '.*(\d{2,3}\.\d+).*', '\\1')
-                            ELSE ''
-                        END AS article_num
-                    FROM per_card pc
-                    CROSS JOIN LATERAL jsonb_array_elements(
-                        COALESCE(pc.raw_payload->'ts_info', '[]'::jsonb)
-                    ) AS ts,
-                    LATERAL jsonb_array_elements(
-                        COALESCE(ts->'ts_uch', '[]'::jsonb)
-                    ) AS uch,
-                    LATERAL jsonb_array_elements_text(
-                        COALESCE(uch->'npdd', '[]'::jsonb)
-                    ) AS uch_elem
-                )
-                SELECT
-                    lat, lon, article_num, mon,
-                    COUNT(*) AS cnt
-                FROM extracted
-                WHERE article_num != ''
-                GROUP BY lat, lon, article_num, mon
-                ORDER BY lat, lon, article_num, mon
-            """, {"reg": reg_code, "dats": dat_list})
-            pap_rows = await cur.fetchall()
-
-    return dtp_rows, summary, pap_rows
+    return dtp_rows, summary
 
 
-def _build_geojson_and_pap(
-    dtp_rows: list[dict], pap_rows: list[dict], year: int
-) -> tuple[dict, list[dict]]:
-    """CPU-bound: строит GeoJSON с попапами и массив ПАП-точек.
+def _build_dtp_geojson(
+    dtp_rows: list[dict]
+) -> dict:
+    """CPU-bound: строит GeoJSON с попапами из строк карточек ДТП.
 
     Вызывается через asyncio.to_thread() для неблокирующей обработки.
+    ПАП обрабатывается отдельно через pap_repository.fetch_pap_for_map().
     """
     from report_generator import _severity_color, _card_popup_html
 
@@ -605,6 +558,8 @@ def _build_geojson_and_pap(
                 "dtpv": r["dtpv"] or "",
                 "severity": severity,
                 "date_sort": date_sort,
+                "pog": int(r["pog"] or 0),
+                "ran": int(r["ran"] or 0),
             },
             "geometry": {
                 "type": "Point",
@@ -612,58 +567,10 @@ def _build_geojson_and_pap(
             },
         })
 
-    geojson = {
+    return {
         "type": "FeatureCollection",
         "features": features,
     }
-
-    # --- ПАП ---
-    # pap_rows: [{lat, lon, article_num, mon, cnt}]
-    # viol_group недоступен из SQL (npdd — текст), оставляем пустым
-    points: dict[tuple, dict] = {}
-    for r in pap_rows:
-        key = (float(r["lat"]), float(r["lon"]))
-        article = str(r["article_num"]).strip()
-        mon = int(r["mon"])
-        cnt = int(r["cnt"])
-
-        if key not in points:
-            points[key] = {"lat": key[0], "lon": key[1], "_arts": {}}
-
-        if article not in points[key]["_arts"]:
-            points[key]["_arts"][article] = {
-                "article": article,
-                "group": "",
-                "monthly": {},
-            }
-
-        ym_key = f"{year}-{mon:02d}"
-        points[key]["_arts"][article]["monthly"][ym_key] = cnt
-
-    pap_data = []
-    for pt in points.values():
-        arts = []
-        total = 0
-        for a in pt["_arts"].values():
-            cnt = sum(a["monthly"].values())
-            if cnt > 0:
-                arts.append({
-                    "article": a["article"],
-                    "group": a["group"],
-                    "cnt": cnt,
-                    "monthly": a["monthly"],
-                })
-                total += cnt
-        if total > 0:
-            arts.sort(key=lambda x: -x["cnt"])
-            pap_data.append({
-                "lat": pt["lat"],
-                "lon": pt["lon"],
-                "total": total,
-                "articles": arts,
-            })
-
-    return geojson, pap_data
 
 
 # ============================================================
@@ -949,6 +856,25 @@ def _build_excel_data_sync(gibdd_parser, cards):
     return file1_data, file2_data
 
 
+async def _fetch_initial_pap_data(task: Task) -> list[dict]:
+    """Извлекает ПАП-данные для начальной загрузки карты.
+
+    Использует dat_period из карточек задачи (не полный год).
+    Делегирует запрос pap_repository.fetch_pap_for_map(),
+    который читает из таблицы pap_points.
+    """
+    from ..db.pap_repository import fetch_pap_for_map
+
+    # Собираем уникальные dat_period из карточек задачи
+    dat_periods = sorted(set(
+        c.get("dat_period", "") for c in task.cards if c.get("dat_period")
+    ))
+    if not dat_periods:
+        return []
+
+    return await fetch_pap_for_map(task.region_code, dat_periods)
+
+
 async def _generate_map_html(task: Task) -> Optional[str]:
     """Генерирует HTML-карту и кэширует в task.files."""
     from ..services import _imports
@@ -967,6 +893,13 @@ async def _generate_map_html(task: Task) -> Optional[str]:
         except Exception:
             cameras = None
 
+        # Подгружаем ПАП-данные из таблицы pap_points (если доступна)
+        pap_data = None
+        try:
+            pap_data = await _fetch_initial_pap_data(task)
+        except Exception:
+            logger.warning(f"Task {task.id}: PAP data fetch failed, skipping")
+
         generator = report_gen_module.ReportGenerator(
             region_name=task.region_name,
             period_label=task.period_label,
@@ -978,6 +911,8 @@ async def _generate_map_html(task: Task) -> Optional[str]:
             cameras=cameras,
             prev_cards=prev_cards_for_map,
             prev_label=task.prev_label,
+            pap_data=pap_data,
+            task_id=task.id,
         )
 
         # Кэшируем на диск

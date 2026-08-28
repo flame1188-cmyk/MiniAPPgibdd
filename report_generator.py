@@ -1151,6 +1151,8 @@ body {
                     "dtpv": card.get("dtpv", ""),
                     "severity": severity,
                     "date_sort": date_sort,
+                    "pog": pog,
+                    "ran": ran,
                 },
                 "geometry": {
                     "type": "Point",
@@ -1778,6 +1780,14 @@ function applyDtpFilter() {{
     document.getElementById('filter_count').textContent =
         filtered.features.length + ' ДТП';
 
+    // Обновляем верхнюю строку сводки под фильтр
+    var hasFilter = typeVal || sevVal || dFrom || dTo;
+    if (hasFilter) {{
+        _updateFilteredSummary(filtered.features);
+    }} else {{
+        _restoreOriginalSummary();
+    }}
+
     // Применяем тот же фильтр дат к ПАП
     applyPapFilter();
 }}
@@ -1788,9 +1798,17 @@ document.getElementById('filter_reset').addEventListener('click', function() {{
     document.getElementById('filter_severity').value = '';
     document.getElementById('filter_date_from').value = '';
     document.getElementById('filter_date_to').value = '';
+    // Сбрасываем чекбоксы статей ПАП
+    document.querySelectorAll('#pap_article_multi .multi-select-dropdown input[type="checkbox"]').forEach(function(cb) {{ cb.checked = false; }});
+    var papLbl = document.querySelector('#pap_article_multi .multi-select-label');
+    if (papLbl) papLbl.textContent = 'Все статьи';
+    var papEl = document.getElementById('pap_filter_count');
+    if (papEl) papEl.textContent = '';
     renderDtp(dtpData);
     document.getElementById('filter_count').textContent =
         dtpData.features.length + ' ДТП';
+    // Восстанавливаем оригинальную сводку
+    _restoreOriginalSummary();
     // Сбросить фильтр ПАП
     applyPapFilter();
 }});
@@ -1961,9 +1979,8 @@ var overlayLayers = {{"ДТП": dtpCluster}};
 if ({str(has_cameras).lower()}) {{
     overlayLayers["Камеры"] = cameraCluster;
 }}
-if (papData.length > 0) {{
-    overlayLayers["ПАП"] = papCluster;
-}}
+// ПАП добавляем всегда, чтобы при смене года слой был доступен в контроле
+overlayLayers["ПАП"] = papCluster;
 var layersControl = L.control.layers({{}}, overlayLayers, {{collapsed: true}}).addTo(map);
 
 // Показываем/прячем кнопку переключения ПАП
@@ -1996,26 +2013,36 @@ map.on('overlayremove', function(e) {{
 // --- Сохраняем оригинальные данные для возврата к текущему году ---
 _mapOriginalDtpData = JSON.parse(JSON.stringify(dtpData));
 _mapOriginalPapData = JSON.parse(JSON.stringify(papData));
-// Сохраняем оригинальную сводку
-_mapOriginalSummary = {{}};
+// Сохраняем оригинальную сводку (только для возврата к начальному периоду)
+var _mapInitialSummary = {{}};
 document.querySelectorAll('.summary-card').forEach(function(card, i) {{
     var v = card.querySelector('.value');
     var l = card.querySelector('.label');
-    if (v) _mapOriginalSummary['val_' + i] = v.textContent;
-    if (l) _mapOriginalSummary['lbl_' + i] = l.textContent;
+    if (v) _mapInitialSummary['val_' + i] = v.textContent;
+    if (l) _mapInitialSummary['lbl_' + i] = l.textContent;
 }});
+// _mapOriginalSummary — текущая «базовая» сводка (меняется при смене года)
+var _mapOriginalSummary = JSON.parse(JSON.stringify(_mapInitialSummary));
 
 // --- Переключение года ---
 function onYearChange(val) {{
     if (!val) {{
-        // Возврат к текущему году
+        // Возврат к начальному году
         renderDtp(_mapOriginalDtpData);
         _rebuildPapLayer(_mapOriginalPapData);
         dtpData = _mapOriginalDtpData;
         papData = _mapOriginalPapData;
+        // Восстанавливаем оригинальную сводку
+        _mapOriginalSummary = JSON.parse(JSON.stringify(_mapInitialSummary));
         _restoreOriginalSummary();
         _updateTitleForYear(null);
         document.getElementById('filter_count').textContent = _mapOriginalDtpData.features.length + ' ДТП';
+        // Сбрасываем чекбоксы статей ПАП
+        document.querySelectorAll('#pap_article_multi .multi-select-dropdown input[type="checkbox"]').forEach(function(cb) {{ cb.checked = false; }});
+        var papLbl = document.querySelector('#pap_article_multi .multi-select-label');
+        if (papLbl) papLbl.textContent = 'Все статьи';
+        var papEl = document.getElementById('pap_filter_count');
+        if (papEl) papEl.textContent = '';
         return;
     }}
     var year = parseInt(val);
@@ -2045,6 +2072,25 @@ function _loadYearData(year) {{
             _updateSummaryForYear(data.summary);
             _updateTitleForYear(year);
             document.getElementById('filter_count').textContent = data.dtp_geojson.features.length + ' ДТП';
+            // Сбрасываем фильтры при смене года
+            document.getElementById('filter_type').value = '';
+            document.getElementById('filter_severity').value = '';
+            document.getElementById('filter_date_from').value = '';
+            document.getElementById('filter_date_to').value = '';
+            // Сбрасываем чекбоксы статей ПАП
+            document.querySelectorAll('#pap_article_multi .multi-select-dropdown input[type="checkbox"]').forEach(function(cb) {{ cb.checked = false; }});
+            var papLbl = document.querySelector('#pap_article_multi .multi-select-label');
+            if (papLbl) papLbl.textContent = 'Все статьи';
+            var papEl = document.getElementById('pap_filter_count');
+            if (papEl) papEl.textContent = '';
+            // Обновляем «оригинальную» сводку под текущий год
+            _mapOriginalSummary = {{}};
+            document.querySelectorAll('.summary-card').forEach(function(card, i) {{
+                var v = card.querySelector('.value');
+                var l = card.querySelector('.label');
+                if (v) _mapOriginalSummary['val_' + i] = v.textContent;
+                if (l) _mapOriginalSummary['lbl_' + i] = l.textContent;
+            }});
         }})
         .catch(function(err) {{
             console.error('Year load error:', err);
@@ -2064,10 +2110,40 @@ function _rebuildPapLayer(newPapData) {{
         _createPapMarker(p, _buildPapPopup(p.total, p.articles));
     }});
 
-    // Если ПАП слой был включён — обновляем его на карте
-    if (map.hasLayer(papCluster)) {{
-        map.removeLayer(papCluster);
-        papCluster.addTo(map);
+    // Если кластер на карте — он обновится автоматически (маркеры уже внутри).
+    // Если был включён плоский режим — показать плоский слой.
+    if (!papClusteringEnabled && map.hasLayer(papCluster)) {{
+        papFlatGroup.addTo(map);
+    }}
+}}
+
+function _calcSummaryFromFeatures(features) {{
+    var total = features.length, deaths = 0, injured = 0;
+    for (var i = 0; i < features.length; i++) {{
+        var p = features[i].properties;
+        deaths += (p.pog || 0);
+        injured += (p.ran || 0);
+    }}
+    return {{total: total, deaths: deaths, injured: injured}};
+}}
+
+function _updateFilteredSummary(features) {{
+    var s = _calcSummaryFromFeatures(features);
+    var cards = document.querySelectorAll('.summary-card');
+    if (cards[0]) {{
+        var v = cards[0].querySelector('.value');
+        if (v) v.textContent = s.total;
+        var d = cards[0].querySelector('.delta'); if (d) d.style.display = 'none';
+    }}
+    if (cards[1]) {{
+        var v = cards[1].querySelector('.value');
+        if (v) v.textContent = s.deaths;
+        var d = cards[1].querySelector('.delta'); if (d) d.style.display = 'none';
+    }}
+    if (cards[2]) {{
+        var v = cards[2].querySelector('.value');
+        if (v) v.textContent = s.injured;
+        var d = cards[2].querySelector('.delta'); if (d) d.style.display = 'none';
     }}
 }}
 
