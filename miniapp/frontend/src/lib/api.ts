@@ -669,6 +669,9 @@ export const api = {
   getMapUrl: (taskId: string) =>
     `${API_BASE}/api/dtp/tasks/${taskId}/map?tg_init_data=${encodeURIComponent(getInitData())}`,
 
+  getRefreshMapUrl: (taskId: string) =>
+    `${API_BASE}/api/dtp/tasks/${taskId}/map?refresh=true&tg_init_data=${encodeURIComponent(getInitData())}`,
+
   /**
    * Ленивая генерация Excel-файла для задачи.
    * Первый запрос генерирует оба файла (~5-8 сек), повторные — мгновенно.
