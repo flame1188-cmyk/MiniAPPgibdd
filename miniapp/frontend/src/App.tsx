@@ -14,15 +14,24 @@
  *  - Вкладка «НП БДД»:
  *      - NpBddView (KPI + 2 графика + заморозка)
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { StructuredForm } from '@/components/StructuredForm'
 import { CamerasWidget } from '@/components/CamerasWidget'
 import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
-import { ExportView } from '@/components/ExportView'
-import { NpBddView } from '@/components/NpBddView'
 import { VersionBanner } from '@/components/VersionBanner'
+
+const ExportView = lazy(() => import('@/components/ExportView').then(m => ({ default: m.ExportView })))
+const NpBddView = lazy(() => import('@/components/NpBddView').then(m => ({ default: m.NpBddView })))
+
+function TabSpinner() {
+  return (
+    <div className="tg-card flex items-center justify-center py-8">
+      <div className="text-xs opacity-50">Загрузка...</div>
+    </div>
+  )
+}
 import { useTaskPolling } from '@/hooks/useTaskPolling'
 import { useVersionCheck } from '@/hooks/useVersionCheck'
 import { haptic } from '@/lib/telegram'
@@ -239,10 +248,18 @@ export default function App() {
         )}
 
         {/* --- Вкладка «Выгрузка файлов» --- */}
-        {tab === 'export' && <ExportView />}
+        {tab === 'export' && (
+          <Suspense fallback={<TabSpinner />}>
+            <ExportView />
+          </Suspense>
+        )}
 
         {/* --- Вкладка «НП БДД» --- */}
-        {tab === 'np-bdd' && <NpBddView />}
+        {tab === 'np-bdd' && (
+          <Suspense fallback={<TabSpinner />}>
+            <NpBddView />
+          </Suspense>
+        )}
 
         {/* Подвал */}
         <footer className="text-center text-xs opacity-40 pt-4">

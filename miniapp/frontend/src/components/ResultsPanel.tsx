@@ -1,14 +1,26 @@
 /**
  * Панель результатов: показывает карту, аналитику и кнопки выгрузки файлов.
+ *
+ * Тяжёлые компоненты (AnalyticsView, ClustersView, LLMAnalysisView, PointStatsView)
+ * загружаются через React.lazy — уменьшает initial bundle на ~200 KB.
  */
-import { useState } from 'react'
+import { useState, lazy, Suspense } from 'react'
 import { api, type TaskStatusResponse } from '@/lib/api'
 import { haptic, showAlert } from '@/lib/telegram'
 import { MapFrame } from './MapFrame'
-import { AnalyticsView } from './AnalyticsView'
-import { ClustersView } from './ClustersView'
-import { PointStatsView } from './PointStatsView'
-import { LLMAnalysisView } from './LLMAnalysisView'
+
+const AnalyticsView = lazy(() => import('./AnalyticsView').then(m => ({ default: m.AnalyticsView })))
+const ClustersView = lazy(() => import('./ClustersView').then(m => ({ default: m.ClustersView })))
+const PointStatsView = lazy(() => import('./PointStatsView').then(m => ({ default: m.PointStatsView })))
+const LLMAnalysisView = lazy(() => import('./LLMAnalysisView').then(m => ({ default: m.LLMAnalysisView })))
+
+function ViewSpinner() {
+  return (
+    <div className="tg-card flex items-center justify-center py-8">
+      <div className="text-xs opacity-50">Загрузка...</div>
+    </div>
+  )
+}
 
 interface ResultsPanelProps {
   task: TaskStatusResponse
@@ -86,14 +98,28 @@ export function ResultsPanel({ task }: ResultsPanelProps) {
       {tab === 'map' && <MapFrame taskId={task.task_id} />}
 
       {tab === 'analytics' && task.analytics && (
-        <AnalyticsView analytics={task.analytics} taskId={task.task_id} />
+        <Suspense fallback={<ViewSpinner />}>
+          <AnalyticsView analytics={task.analytics} taskId={task.task_id} />
+        </Suspense>
       )}
 
-      {tab === 'clusters' && <ClustersView task={task} />}
+      {tab === 'clusters' && (
+        <Suspense fallback={<ViewSpinner />}>
+          <ClustersView task={task} />
+        </Suspense>
+      )}
 
-      {tab === 'point' && <PointStatsView task={task} />}
+      {tab === 'point' && (
+        <Suspense fallback={<ViewSpinner />}>
+          <PointStatsView task={task} />
+        </Suspense>
+      )}
 
-      {tab === 'llm' && <LLMAnalysisView task={task} />}
+      {tab === 'llm' && (
+        <Suspense fallback={<ViewSpinner />}>
+          <LLMAnalysisView task={task} />
+        </Suspense>
+      )}
 
       {tab === 'files' && <FilesList taskId={task.task_id} />}
     </div>

@@ -39,12 +39,13 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false,
     // Telegram Mini App загружается в WebView — критичен размер бандла
-    chunkSizeWarningLimit: 500,
+    chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {
         manualChunks: {
           'react-vendor': ['react', 'react-dom'],
           'query-vendor': ['@tanstack/react-query'],
+          'recharts-vendor': ['recharts'],
         },
       },
     },
