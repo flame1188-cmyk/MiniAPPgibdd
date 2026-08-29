@@ -367,6 +367,10 @@ async def calculate_concentration_dynamics(
     Returns:
         (очаги_с_dynamics, settlement_polygons) — полигоны для переиспользования.
     """
+    # Ленивый импорт: calculate_concentration_points определена в __init__.py,
+    # который импортирует текущий модуль → module-level импорт создаёт цикл.
+    from . import calculate_concentration_points as _calc_cp
+
     # --- Готовим карточки с координатами из обоих периодов ---
     current_filtered = [
         c for c in current_cards
@@ -415,7 +419,7 @@ async def calculate_concentration_dynamics(
     # --- Очаги текущего периода ---
     if progress_callback:
         await progress_callback("Расчёт очагов текущего периода...")
-    current_clusters, current_preclusters, _polys = await calculate_concentration_points(
+    current_clusters, current_preclusters, _polys = await _calc_cp(
         current_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,
@@ -447,7 +451,7 @@ async def calculate_concentration_dynamics(
         await progress_callback(
             f"Расчёт очагов за прошлый год ({len(prev_cards)} ДТП)..."
         )
-    prev_clusters, prev_preclusters, _polys = await calculate_concentration_points(
+    prev_clusters, prev_preclusters, _polys = await _calc_cp(
         prev_cards,
         progress_callback,
         settlement_polygons=settlement_polygons,
