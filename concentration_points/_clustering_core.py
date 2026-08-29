@@ -19,7 +19,7 @@ from ._card_accessors import (
     _get_dtp_type, _get_road_name, _get_date, _get_km_m, _has_road_and_piketazh,
     _max_gps_spread,
 )
-from ._osm_boundaries import classify_cards
+from ._osm_boundaries import classify_cards, _CAUSE_SKIP_VALUES, _SOP_NPDD_FILTER_WORDS
 from analytics import _safe_int
 
 logger = logging.getLogger(__name__)

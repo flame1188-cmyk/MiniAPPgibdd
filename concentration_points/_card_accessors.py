@@ -1,7 +1,11 @@
 """Карточные акцессоры — чистые функции извлечения данных из карточек ДТП."""
 import math
 
-from ._constants import EARTH_RADIUS_KM
+from ._constants import (
+    EARTH_RADIUS_KM,
+    INTERSECTION_KEYWORDS,
+    EXCLUDED_SDOR_ALWAYS, EXCLUDED_K_UL, EXCLUDED_SDOR_FOR_KUL,
+)
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Расстояние в метрах между двумя точками по формуле Гаверсинуса."""
