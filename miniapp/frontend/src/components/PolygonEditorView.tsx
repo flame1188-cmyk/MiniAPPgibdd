@@ -107,6 +107,12 @@ export function PolygonEditorView() {
 
     mapRef.current = map
 
+    // Leaflet не всегда корректно определяет размеры контейнера
+    // при lazy-loading / переключении вкладок — принудительно обновляем
+    requestAnimationFrame(() => {
+      map.invalidateSize()
+    })
+
     // Слой для GeoJSON полигонов
     geojsonLayerRef.current = L.geoJSON(undefined, {
       style: (f) => featureStyle(f!),
@@ -380,7 +386,7 @@ export function PolygonEditorView() {
 
       {/* Карта */}
       <div className="rounded-xl overflow-hidden relative" style={{ border: '1px solid var(--tg-color-hint, #999)' }}>
-        <div ref={mapContainerRef} style={{ height: '50vh', minHeight: 300 }} />
+        <div ref={mapContainerRef} style={{ height: '50vh', minHeight: 300, width: '100%' }} />
         {loadingMap && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/20">
             <span className="text-xs text-white">Загрузка полигонов...</span>
