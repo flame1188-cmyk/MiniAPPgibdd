@@ -320,6 +320,50 @@ async def update_polygon_geometry(
         return cur.rowcount > 0
 
 
+async def create_polygon(
+    pool,
+    region_code: str,
+    geometry_geojson: dict,
+    name: str,
+    place_type: str,
+    created_by: int,
+) -> int | None:
+    """
+    Создаёт новый пользовательский полигон в регионе.
+
+    Для пользовательских полигонов используется osm_type='user',
+    а osm_id генерируется как отрицательное число (мс с эпохи),
+    чтобы избежать коллизий с настоящими OSM ID.
+
+    Returns:
+        ID созданной записи или None.
+    """
+    import time
+
+    osm_type = "user"
+    osm_id = -int(time.time() * 1000)
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            INSERT INTO settlement_polygons
+                (region_code, osm_type, osm_id, name, place_type, geometry,
+                 is_edited, edited_at, edited_by)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, true, now(), %s)
+            RETURNING id
+            """,
+            (
+                region_code, osm_type, osm_id, name, place_type,
+                json.dumps(geometry_geojson, ensure_ascii=False), created_by,
+            ),
+        )
+        row = await cur.fetchone()
+        await conn.commit()
+        if row:
+            return row["id"] if isinstance(row, dict) else row[0]
+        return None
+
+
 async def reset_polygon_to_original(
     pool,
     polygon_id: int,
@@ -396,7 +440,7 @@ async def get_regions_with_polygons(pool) -> list[dict]:
     return [
         {
             "region_code": r["region_code"] if isinstance(r, dict) else r[0],
-            "count": r["polygon_count"] if isinstance(r, dict) else r[1],
+            "polygon_count": r["polygon_count"] if isinstance(r, dict) else r[1],
         }
         for r in rows
     ]

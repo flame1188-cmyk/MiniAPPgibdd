@@ -984,4 +984,10 @@ export const api = {
       `/api/polygons/${regionCode}/reset/${polygonId}`,
       { method: 'POST' }
     ),
+
+  polygonCreate: (regionCode: string, geometry: GeoJSON.Geometry, name: string, placeType: string) =>
+    request<{ status: string; id: number }>(`/api/polygons/${regionCode}/create`, {
+      method: 'POST',
+      body: JSON.stringify({ geometry, name, place_type: placeType }),
+    }),
 }

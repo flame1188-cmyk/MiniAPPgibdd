@@ -28,6 +28,7 @@ from ..db.polygon_repository import (
     update_polygon_geometry,
     reset_polygon_to_original,
     save_polygons_to_db,
+    create_polygon,
     is_polygon_editor,
     get_polygon_editors,
     add_polygon_editor,
@@ -50,6 +51,12 @@ class UpdateGeometryRequest(BaseModel):
 class AddEditorRequest(BaseModel):
     telegram_id: int
     name: str = ""
+
+
+class CreatePolygonRequest(BaseModel):
+    geometry: dict  # GeoJSON Geometry
+    name: str = ""
+    place_type: str = ""
 
 
 class ImportRequest(BaseModel):
@@ -206,6 +213,30 @@ async def reset_polygon(
     if not ok:
         raise HTTPException(404, "Не удалось сбросить (элемент не найден в JSON-кэше)")
     return {"status": "ok", "id": polygon_id, "reset": True}
+
+
+# ========================
+# Создание нового полигона (для редакторов)
+# ========================
+
+@router.post("/{region_code}/create")
+async def create_new_polygon(
+    region_code: str,
+    req: CreatePolygonRequest,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """Создаёт новый пользовательский полигон в регионе."""
+    await _require_editor(user)
+    pool = get_pool()
+    if pool is None:
+        raise HTTPException(503, "БД недоступна")
+
+    new_id = await create_polygon(
+        pool, region_code, req.geometry, req.name, req.place_type, user.id
+    )
+    if new_id is None:
+        raise HTTPException(500, "Не удалось создать полигон")
+    return {"status": "ok", "id": new_id}
 
 
 # ========================
