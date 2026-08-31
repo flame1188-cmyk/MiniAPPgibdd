@@ -10,6 +10,7 @@
  *  - Сброс к оригинальной версии из OSM
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
+import L from 'leaflet'
 import { api, ApiError } from '@/lib/api'
 import { haptic, showAlert } from '@/lib/telegram'
 
@@ -108,7 +109,7 @@ export function PolygonEditorView() {
 
     // Слой для GeoJSON полигонов
     geojsonLayerRef.current = L.geoJSON(undefined, {
-      style: featureStyle,
+      style: (f) => featureStyle(f!),
       onEachFeature: (feature, layer) => {
         layer.on('click', () => {
           if (isEditingRef.current) return // Не переключаем полигон при редактировании
@@ -120,8 +121,9 @@ export function PolygonEditorView() {
           })
           haptic('light')
           // Зум к полигону
-          if (layer.getBounds) {
-            map.fitBounds(layer.getBounds(), { padding: [30, 30], maxZoom: 15 })
+          const pathLayer = layer as unknown as L.Polyline
+          if (pathLayer.getBounds) {
+            map.fitBounds(pathLayer.getBounds(), { padding: [30, 30], maxZoom: 15 })
           }
         })
       },
@@ -210,7 +212,7 @@ export function PolygonEditorView() {
 
     const coords = (geom as GeoJSON.Polygon).coordinates
     // GeoJSON: [lon, lat] → Leaflet: [lat, lon]
-    const latLngs: L.LatLngExpression[] = coords[0].map(c => [c[1], c[0]])
+    const latLngs: L.LatLngTuple[] = coords[0].map(c => [c[1], c[0]] as L.LatLngTuple)
 
     // Создаём редактируемый полигон
     const polygon = L.polygon(latLngs, {
@@ -245,7 +247,7 @@ export function PolygonEditorView() {
         const pos = marker.getLatLng()
         currentCoords[i] = [pos.lng, pos.lat] // Обновляем [lon, lat]
         // Обновляем полигон
-        const newLatLngs = currentCoords.map(cc => [cc[1], cc[0]])
+        const newLatLngs: L.LatLngTuple[] = currentCoords.map(cc => [cc[1], cc[0]] as L.LatLngTuple)
         polygon.setLatLngs(newLatLngs)
         setEditCoords([currentCoords.map(cc => [...cc])]) // Копия для React state
       })
