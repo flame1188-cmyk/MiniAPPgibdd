@@ -89,6 +89,24 @@ export function PolygonEditorView() {
   const editPolygonRef = useRef<L.Polygon | null>(null)
 
   // ========================
+  // Исправление Tailwind preflight для Leaflet
+  // ========================
+
+  useEffect(() => {
+    // Tailwind preflight ставит img { max-width: 100%; height: auto },
+    // что ломает рендеринг тайлов в Leaflet — тайлы схлопываются.
+    const id = 'leaflet-tailwind-fix'
+    if (document.getElementById(id)) return
+    const style = document.createElement('style')
+    style.id = id
+    style.textContent = [
+      '.leaflet-container img{max-width:none!important;max-height:none!important}',
+      '.leaflet-container .leaflet-tile-pane img{width:256px;height:256px}',
+    ].join('')
+    document.head.appendChild(style)
+  }, [])
+
+  // ========================
   // Инициализация карты
   // ========================
 
@@ -107,18 +125,19 @@ export function PolygonEditorView() {
 
     mapRef.current = map
 
-    // Leaflet не всегда корректно определяет размеры контейнера
-    // при lazy-loading / переключении вкладок — принудительно обновляем
-    requestAnimationFrame(() => {
-      map.invalidateSize()
-    })
+    // Leaflet некорректно определяет размеры при lazy-loading
+    // и в Telegram WebView — используем ResizeObserver + задержку
+    const ro = new ResizeObserver(() => map.invalidateSize())
+    ro.observe(mapContainerRef.current!)
+    // Фоллбэк: принудительный пересчёт через 300мс
+    const timer = setTimeout(() => map.invalidateSize(), 300)
 
     // Слой для GeoJSON полигонов
     geojsonLayerRef.current = L.geoJSON(undefined, {
       style: (f) => featureStyle(f!),
       onEachFeature: (feature, layer) => {
         layer.on('click', () => {
-          if (isEditingRef.current) return // Не переключаем полигон при редактировании
+          if (isEditingRef.current) return
           const props = feature.properties as PolygonFeature['properties']
           setSelectedFeature({
             type: 'Feature',
@@ -126,7 +145,6 @@ export function PolygonEditorView() {
             geometry: feature.geometry,
           })
           haptic('light')
-          // Зум к полигону
           const pathLayer = layer as unknown as L.Polyline
           if (pathLayer.getBounds) {
             map.fitBounds(pathLayer.getBounds(), { padding: [30, 30], maxZoom: 15 })
@@ -139,6 +157,8 @@ export function PolygonEditorView() {
     editLayerGroupRef.current = L.layerGroup().addTo(map)
 
     return () => {
+      clearTimeout(timer)
+      ro.disconnect()
       map.remove()
       mapRef.current = null
     }
