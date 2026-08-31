@@ -695,7 +695,7 @@ async def main() -> int:
             results.append(result)
 
             # Загрузка в PostgreSQL
-            if (args.db or args.db_only) and result["status"] == "ok":
+            if (args.db or args.db_only) and result["status"] in ("ok", "cached"):
                 await _save_to_db(code, result)
 
             # Пауза между регионами (для Overpass)
