@@ -83,6 +83,13 @@ const DRAW_VERTEX_ICON = L.divIcon({
   iconAnchor: [7, 7],
 })
 
+const DELETE_VERTEX_ICON = L.divIcon({
+  className: '',
+  html: '<div style="width:16px;height:16px;background:#ff3b30;border:2px solid #fff;border-radius:50%;box-shadow:0 0 0 2px rgba(255,59,48,.3),0 1px 3px rgba(0,0,0,.4);cursor:pointer;"></div>',
+  iconSize: [16, 16],
+  iconAnchor: [8, 8],
+})
+
 const DRAW_CLOSE_ICON = L.divIcon({
   className: '',
   html: '<div style="width:18px;height:18px;background:#4caf50;border:3px solid #fff;border-radius:50%;box-shadow:0 0 0 2px rgba(76,175,80,.3);cursor:pointer;"></div>',
@@ -118,6 +125,9 @@ export function PolygonEditorView() {
   const [selectedPartIndex, setSelectedPartIndex] = useState(0)
 
   // --- Рисование нового полигона ---
+  const [deleteVertexMode, setDeleteVertexMode] = useState(false)
+  const deleteVertexModeRef = useRef(false)
+
   const [isDrawing, setIsDrawing] = useState(false)
   const [drawPoints, setDrawPoints] = useState<number[][]>([]) // [lon, lat][]
   const [showNewPolyForm, setShowNewPolyForm] = useState(false)
@@ -154,6 +164,7 @@ export function PolygonEditorView() {
   // Синхронизируем refs с state
   useEffect(() => { isEditingRef.current = isEditing }, [isEditing])
   useEffect(() => { isDrawingRef.current = isDrawing }, [isDrawing])
+  useEffect(() => { deleteVertexModeRef.current = deleteVertexMode }, [deleteVertexMode])
 
   // ========================
   // Исправление Tailwind preflight для Leaflet + стили midpoint
@@ -325,6 +336,30 @@ export function PolygonEditorView() {
   // РЕДАКТИРОВАНИЕ ПОЛИГОНА
   // ============================================================
 
+  // --- Удалить вершину по индексу ---
+  function deleteVertexAt(index: number) {
+    const ring = editCurrentCoordsRef.current
+    if (ring.length <= 4) {
+      showAlert('Нельзя удалить: минимум 3 вершины')
+      return
+    }
+    ring.splice(index, 1)
+    ring[ring.length - 1] = [...ring[0]]
+    haptic('light')
+    rebuildEditLayer()
+  }
+
+  const deleteVertexRef = useRef<(index: number) => void>(() => {})
+  deleteVertexRef.current = deleteVertexAt
+
+  // --- Переключить режим удаления ---
+  const toggleDeleteMode = useCallback(() => {
+    const next = !deleteVertexModeRef.current
+    setDeleteVertexMode(next)
+    deleteVertexModeRef.current = next
+    if (isEditing) rebuildEditLayer()
+  }, [isEditing])
+
   // --- Обновить позиции midpoint-маркеров ---
   function updateMidPointPositions() {
     const ring = editCurrentCoordsRef.current
@@ -387,47 +422,52 @@ export function PolygonEditorView() {
     editPolygonRef.current = polygon
     layerGroup.addLayer(polygon)
 
-    // Создаём вершинные маркеры
+    // Создаём вершинные маркеры (без замыкающей — она дублирует первую)
     const vMarkers: L.Marker[] = []
-    ring.forEach((c, i) => {
-      const marker = L.marker([c[1], c[0]], {
-        icon: VERTEX_ICON,
-        draggable: true,
-        autoPan: true,
-      })
+    const isDel = deleteVertexModeRef.current
+    const uniqueCount = ring.length - 1 // без замыкающей
 
-      marker.on('drag', () => {
-        const pos = marker.getLatLng()
-        editCurrentCoordsRef.current[i] = [pos.lng, pos.lat]
-        const newLatLngs = editCurrentCoordsRef.current.map(cc => [cc[1], cc[0]] as L.LatLngTuple)
-        polygon.setLatLngs(newLatLngs)
-        updateMidPointPositions()
-      })
+    for (let i = 0; i < uniqueCount; i++) {
+      const c = ring[i]
 
-      marker.on('dragstart', () => {
-        ;(marker.getElement()?.firstChild as HTMLElement)?.style.setProperty('cursor', 'grabbing')
-      })
-
-      marker.on('dragend', () => {
-        ;(marker.getElement()?.firstChild as HTMLElement)?.style.setProperty('cursor', 'grab')
-        // Обновляем замыкающую вершину (последняя == первая)
-        editCurrentCoordsRef.current[editCurrentCoordsRef.current.length - 1] = [
-          ...editCurrentCoordsRef.current[0],
-        ]
-        const newLatLngs = editCurrentCoordsRef.current.map(cc => [cc[1], cc[0]] as L.LatLngTuple)
-        polygon.setLatLngs(newLatLngs)
-        updateMidPointPositions()
-        setEditCoords([editCurrentCoordsRef.current.map(cc => [...cc])])
-      })
-
-      layerGroup.addLayer(marker)
-      vMarkers.push(marker)
-    })
+      if (isDel) {
+        const marker = L.marker([c[1], c[0]], { icon: DELETE_VERTEX_ICON, draggable: false })
+        marker.on('click', () => { deleteVertexRef.current(i) })
+        layerGroup.addLayer(marker)
+        vMarkers.push(marker)
+      } else {
+        const marker = L.marker([c[1], c[0]], {
+          icon: VERTEX_ICON, draggable: true, autoPan: true,
+        })
+        marker.on('drag', () => {
+          const pos = marker.getLatLng()
+          editCurrentCoordsRef.current[i] = [pos.lng, pos.lat]
+          const newLatLngs = editCurrentCoordsRef.current.map(cc => [cc[1], cc[0]] as L.LatLngTuple)
+          polygon.setLatLngs(newLatLngs)
+          updateMidPointPositions()
+        })
+        marker.on('dragstart', () => {
+          ;(marker.getElement()?.firstChild as HTMLElement)?.style.setProperty('cursor', 'grabbing')
+        })
+        marker.on('dragend', () => {
+          ;(marker.getElement()?.firstChild as HTMLElement)?.style.setProperty('cursor', 'grab')
+          editCurrentCoordsRef.current[editCurrentCoordsRef.current.length - 1] = [
+            ...editCurrentCoordsRef.current[0],
+          ]
+          const newLatLngs = editCurrentCoordsRef.current.map(cc => [cc[1], cc[0]] as L.LatLngTuple)
+          polygon.setLatLngs(newLatLngs)
+          updateMidPointPositions()
+          setEditCoords([editCurrentCoordsRef.current.map(cc => [...cc])])
+        })
+        layerGroup.addLayer(marker)
+        vMarkers.push(marker)
+      }
+    }
 
     vertexMarkersRef.current = vMarkers
 
-    // Создаём midpoint-маркеры на рёбрах
-    createMidPointMarkers()
+    // Midpoint-маркеры только в режиме перетаскивания
+    if (!isDel) createMidPointMarkers()
 
     // Обновляем React-стейт
     setEditCoords([ring.map(c => [...c])])
@@ -507,6 +547,8 @@ export function PolygonEditorView() {
     editOriginalGeomRef.current = null
     setEditCoords(null)
     setIsEditing(false)
+    setDeleteVertexMode(false)
+    deleteVertexModeRef.current = false
   }, [selectedFeature])
 
   // --- Сохранить отредактированный полигон ---
@@ -676,6 +718,33 @@ export function PolygonEditorView() {
     haptic('light')
   }, [isEditing, cancelEdit])
 
+  // --- Отменить последнюю точку при рисовании ---
+  const undoLastDrawPoint = useCallback(() => {
+    const pts = drawLatLngsRef.current
+    if (pts.length === 0) return
+
+    pts.pop()
+
+    const removed = drawingMarkersRef.current.pop()
+    if (removed) drawingLayerRef.current?.removeLayer(removed)
+
+    if (pts.length === 0) {
+      if (drawingPolylineRef.current) {
+        drawingLayerRef.current?.removeLayer(drawingPolylineRef.current)
+        drawingPolylineRef.current = null
+      }
+      if (drawingFillRef.current) {
+        drawingLayerRef.current?.removeLayer(drawingFillRef.current)
+        drawingFillRef.current = null
+      }
+    } else {
+      updateDrawingVisuals()
+    }
+
+    setDrawPoints(pts.map(p => [p.lng, p.lat]))
+    haptic('light')
+  }, [])
+
   // --- Замкнуть полигон ---
   function closeDrawPolygon() {
     isDrawingRef.current = false
@@ -833,6 +902,18 @@ export function PolygonEditorView() {
                 : `${drawPoints.length} вершин. Нажмите зелёный маркер для замыкания.`
             }
           </span>
+          {drawPoints.length > 0 && (
+            <button
+              className="px-3 py-1.5 rounded-lg text-xs font-medium"
+              style={{
+                backgroundColor: 'var(--tg-color-section-bg, #fff)',
+                border: '1px solid var(--tg-color-hint, #999)',
+              }}
+              onClick={undoLastDrawPoint}
+            >
+              Шаг назад
+            </button>
+          )}
           <button
             className="px-3 py-1.5 rounded-lg text-xs font-medium"
             style={{
@@ -953,8 +1034,10 @@ export function PolygonEditorView() {
             </span>
           </div>
           <p className="text-xs opacity-60">
-            Перетащите синие маркеры для изменения границ.
-            Нажмите на полупрозрачный маркер на ребре для добавления вершины.
+            {deleteVertexMode
+              ? 'Нажмите на красный маркер для удаления вершины.'
+              : 'Перетащите синие маркеры для изменения границ. Нажмите на полупрозрачный маркер на ребре для добавления вершины.'
+            }
           </p>
           <div className="flex gap-2">
             <button
@@ -966,7 +1049,18 @@ export function PolygonEditorView() {
               {saving ? 'Сохранение...' : 'Сохранить'}
             </button>
             <button
-              className="flex-1 py-2 rounded-lg text-sm font-medium"
+              className="py-2 px-3 rounded-lg text-xs font-medium"
+              style={{
+                backgroundColor: deleteVertexMode ? 'rgba(255,59,48,0.15)' : 'var(--tg-color-section-bg, #fff)',
+                color: deleteVertexMode ? '#ff3b30' : 'var(--tg-color-text, #000)',
+                border: deleteVertexMode ? '1px solid rgba(255,59,48,0.3)' : '1px solid var(--tg-color-hint, #999)',
+              }}
+              onClick={toggleDeleteMode}
+            >
+              {deleteVertexMode ? 'Готово' : 'Удалить'}
+            </button>
+            <button
+              className="py-2 px-3 rounded-lg text-sm font-medium"
               style={{
                 backgroundColor: 'var(--tg-color-section-bg, #fff)',
                 border: '1px solid var(--tg-color-hint, #999)',
