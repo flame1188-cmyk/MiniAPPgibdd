@@ -499,3 +499,23 @@ async def remove_polygon_editor(pool, telegram_id: int) -> bool:
         )
         await conn.commit()
         return cur.rowcount > 0
+
+
+async def delete_polygon(pool, polygon_id: int) -> bool:
+    """
+    Удаляет полигон из БД по его ID.
+
+    Args:
+        pool: AsyncConnectionPool
+        polygon_id: ID записи в settlement_polygons
+
+    Returns:
+        True если удалено, False если не найдено.
+    """
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "DELETE FROM settlement_polygons WHERE id = %s",
+            (polygon_id,),
+        )
+        await conn.commit()
+        return cur.rowcount > 0

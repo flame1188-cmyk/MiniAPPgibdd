@@ -6,8 +6,10 @@ Endpoints:
   GET  /api/polygons/regions         — список регионов с полигонами в БД
   GET  /api/polygons/{region_code}  — GeoJSON FeatureCollection
   PUT  /api/polygons/{polygon_id}   — сохранить отредактированный полигон
+  DELETE /api/polygons/{polygon_id}  — удалить полигон
   POST /api/polygons/{region_code}/import — импорт из JSON-кэша в БД
   POST /api/polygons/{region_code}/reset/{pid} — сброс к оригиналу
+  POST /api/polygons/{region_code}/create — создать новый полигон
   GET  /api/polygons/editors        — список редакторов
   POST /api/polygons/editors        — добавить редактора
   DELETE /api/polygons/editors/{tid} — удалить редактора
@@ -29,6 +31,7 @@ from ..db.polygon_repository import (
     reset_polygon_to_original,
     save_polygons_to_db,
     create_polygon,
+    delete_polygon,
     is_polygon_editor,
     get_polygon_editors,
     add_polygon_editor,
@@ -237,6 +240,23 @@ async def create_new_polygon(
     if new_id is None:
         raise HTTPException(500, "Не удалось создать полигон")
     return {"status": "ok", "id": new_id}
+
+
+@router.delete("/{polygon_id}")
+async def delete_polygon_endpoint(
+    polygon_id: int,
+    user: TelegramUser = Depends(get_current_user),
+):
+    """Удаляет полигон из БД."""
+    await _require_editor(user)
+    pool = get_pool()
+    if pool is None:
+        raise HTTPException(503, "БД недоступна")
+
+    ok = await delete_polygon(pool, polygon_id)
+    if not ok:
+        raise HTTPException(404, f"Полигон {polygon_id} не найден")
+    return {"status": "ok", "id": polygon_id, "deleted": True}
 
 
 # ========================

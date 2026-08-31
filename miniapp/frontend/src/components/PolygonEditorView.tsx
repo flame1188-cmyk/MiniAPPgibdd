@@ -128,6 +128,9 @@ export function PolygonEditorView() {
   const [deleteVertexMode, setDeleteVertexMode] = useState(false)
   const deleteVertexModeRef = useRef(false)
 
+  // --- Подтверждение удаления полигона ---
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+
   const [isDrawing, setIsDrawing] = useState(false)
   const [drawPoints, setDrawPoints] = useState<number[][]>([]) // [lon, lat][]
   const [showNewPolyForm, setShowNewPolyForm] = useState(false)
@@ -235,6 +238,7 @@ export function PolygonEditorView() {
               geometry: feature.geometry,
             })
             setSelectedPartIndex(0)
+            setConfirmDeleteId(null)
             haptic('light')
             const pathLayer = layer as unknown as L.Polyline
             if (pathLayer.getBounds) {
@@ -294,6 +298,7 @@ export function PolygonEditorView() {
     setError('')
     setSelectedFeature(null)
     setSelectedPartIndex(0)
+    setConfirmDeleteId(null)
     cancelEdit()
     cancelDrawing()
 
@@ -604,6 +609,31 @@ export function PolygonEditorView() {
       setSaving(false)
     }
   }, [selectedFeature, selectedRegion])
+
+  // --- Удалить полигон целиком ---
+  const deletePolygon = useCallback(async (polygonId: number) => {
+    if (!selectedRegion) return
+    setSaving(true)
+    try {
+      await api.polygonDelete(polygonId)
+      haptic('success')
+      setConfirmDeleteId(null)
+      setSelectedFeature(null)
+      // Обновляем карту
+      const data = await api.polygonGetGeojson(selectedRegion, false)
+      setGeojson(data)
+      geojsonLayerRef.current?.clearLayers()
+      geojsonLayerRef.current?.addData(data)
+      // Обновляем список регионов (счётчик полигонов изменился)
+      const regionsData = await api.polygonListRegions()
+      setRegions(regionsData)
+    } catch (err) {
+      haptic('error')
+      showAlert(err instanceof ApiError ? err.detail : 'Ошибка удаления')
+    } finally {
+      setSaving(false)
+    }
+  }, [selectedRegion])
 
   // ============================================================
   // РИСОВАНИЕ НОВОГО ПОЛИГОНА
@@ -1017,6 +1047,9 @@ export function PolygonEditorView() {
           onPartChange={setSelectedPartIndex}
           onEdit={enterEditMode}
           onReset={resetPolygon}
+          onDelete={deletePolygon}
+          confirmDeleteId={confirmDeleteId}
+          onConfirmDelete={setConfirmDeleteId}
           saving={saving}
         />
       )}
@@ -1106,10 +1139,13 @@ interface InfoPanelProps {
   onPartChange: (i: number) => void
   onEdit: (partIndex?: number) => void
   onReset: () => void
+  onDelete: (polygonId: number) => void
+  confirmDeleteId: number | null
+  onConfirmDelete: (id: number | null) => void
   saving: boolean
 }
 
-function PolygonInfoPanel({ feature, selectedPartIndex, onPartChange, onEdit, onReset, saving }: InfoPanelProps) {
+function PolygonInfoPanel({ feature, selectedPartIndex, onPartChange, onEdit, onReset, onDelete, confirmDeleteId, onConfirmDelete, saving }: InfoPanelProps) {
   const p = feature.properties
   const geom = feature.geometry
   const isMulti = geom.type === 'MultiPolygon'
@@ -1201,6 +1237,48 @@ function PolygonInfoPanel({ feature, selectedPartIndex, onPartChange, onEdit, on
           </button>
         )}
       </div>
+
+      {/* Удаление полигона */}
+      {confirmDeleteId === p.id ? (
+        <div className="space-y-2 pt-1">
+          <div className="text-xs" style={{ color: '#ff3b30' }}>
+            Удалить полигон «{p.name || 'Без названия'}»? Это действие необратимо.
+          </div>
+          <div className="flex gap-2">
+            <button
+              className="flex-1 py-2 rounded-lg text-sm font-medium text-white"
+              style={{ backgroundColor: '#ff3b30' }}
+              disabled={saving}
+              onClick={() => onDelete(p.id)}
+            >
+              {saving ? 'Удаление...' : 'Удалить'}
+            </button>
+            <button
+              className="flex-1 py-2 rounded-lg text-sm font-medium"
+              style={{
+                backgroundColor: 'var(--tg-color-section-bg, #fff)',
+                border: '1px solid var(--tg-color-hint, #999)',
+              }}
+              disabled={saving}
+              onClick={() => onConfirmDelete(null)}
+            >
+              Отмена
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          className="w-full py-2 rounded-lg text-sm font-medium"
+          style={{
+            color: '#ff3b30',
+            border: '1px solid rgba(255,59,48,0.3)',
+            backgroundColor: 'rgba(255,59,48,0.06)',
+          }}
+          onClick={() => onConfirmDelete(p.id)}
+        >
+          Удалить полигон
+        </button>
+      )}
     </div>
   )
 }

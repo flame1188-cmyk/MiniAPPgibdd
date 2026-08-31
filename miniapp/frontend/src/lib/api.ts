@@ -990,4 +990,9 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ geometry, name, place_type: placeType }),
     }),
+
+  polygonDelete: (polygonId: number) =>
+    request<{ status: string; id: number; deleted: boolean }>(`/api/polygons/${polygonId}`, {
+      method: 'DELETE',
+    }),
 }
