@@ -112,6 +112,8 @@ export function PolygonEditorView() {
   // ========================
 
   useEffect(() => {
+    // Не инициализируем карту, пока идёт начальная загрузка (ранний return в render)
+    if (loading) return
     const el = mapContainerRef.current
     if (!el || mapRef.current) return
 
@@ -119,7 +121,6 @@ export function PolygonEditorView() {
     setDebugInfo(`container: ${Math.round(rect.width)}x${Math.round(rect.height)}`)
 
     if (rect.width === 0 || rect.height === 0) {
-      // Контейнер ещё не имеет размеров — ждём
       const ro = new ResizeObserver((entries) => {
         const r = entries[0].contentRect
         if (r.width > 0 && r.height > 0) {
@@ -159,7 +160,6 @@ export function PolygonEditorView() {
       mapRef.current = map
       setDebugInfo(prev => `${prev} | map created`)
 
-      // Принудительный пересчёт размеров
       const ro2 = new ResizeObserver(() => map.invalidateSize())
       ro2.observe(container)
       const timer = setTimeout(() => {
@@ -168,7 +168,6 @@ export function PolygonEditorView() {
         setDebugInfo(prev => `${prev} | invalidate: ${Math.round(r3.width)}x${Math.round(r3.height)}`)
       }, 300)
 
-    // Слой для GeoJSON полигонов
     geojsonLayerRef.current = L.geoJSON(undefined, {
       style: (f) => featureStyle(f!),
       onEachFeature: (feature, layer) => {
@@ -189,7 +188,6 @@ export function PolygonEditorView() {
       },
     }).addTo(map)
 
-    // Слой для редактирования (поверх GeoJSON)
     editLayerGroupRef.current = L.layerGroup().addTo(map)
 
     return () => {
@@ -200,7 +198,7 @@ export function PolygonEditorView() {
     }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [loading])
 
   // ========================
   // Загрузка регионов
