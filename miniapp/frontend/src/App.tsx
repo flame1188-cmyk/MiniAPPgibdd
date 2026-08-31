@@ -2,7 +2,7 @@
  * Главный компонент Mini App.
  *
  * Layout:
- *  - Шапка с переключателем вкладок: «ДТП» / «Выгрузка файлов» / «НП БДД»
+ *  - Шапка с переключателем вкладок: «ДТП» / «Выгрузка файлов» / «НП БДД» / «Редактор карты»
  *  - Вкладка «ДТП»:
  *      - Форма запроса
  *      - Прогресс активной задачи
@@ -13,6 +13,8 @@
  *      - Кнопка «Выгрузить ZIP-архив»
  *  - Вкладка «НП БДД»:
  *      - NpBddView (KPI + 2 графика + заморозка)
+ *  - Вкладка «Редактор карты» (только для редакторов):
+ *      - PolygonEditorView (Leaflet карта с полигонами)
  */
 import { useState, useEffect, lazy, Suspense } from 'react'
 import { StructuredForm } from '@/components/StructuredForm'
@@ -21,9 +23,11 @@ import { ProgressIndicator } from '@/components/ProgressIndicator'
 import { ResultsPanel } from '@/components/ResultsPanel'
 import { HistoryList } from '@/components/HistoryList'
 import { VersionBanner } from '@/components/VersionBanner'
+import { api } from '@/lib/api'
 
 const ExportView = lazy(() => import('@/components/ExportView').then(m => ({ default: m.ExportView })))
 const NpBddView = lazy(() => import('@/components/NpBddView').then(m => ({ default: m.NpBddView })))
+const PolygonEditorView = lazy(() => import('@/components/PolygonEditorView').then(m => ({ default: m.PolygonEditorView })))
 
 function TabSpinner() {
   return (
@@ -47,17 +51,25 @@ import {
   onFullscreenChange,
 } from '@/lib/telegram'
 
-type Tab = 'dtp' | 'export' | 'np-bdd'
+type Tab = 'dtp' | 'export' | 'np-bdd' | 'polygons'
 
 export default function App() {
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null)
   const [tab, setTab] = useState<Tab>('dtp')
   const [fullscreen, setFullscreen] = useState<boolean>(isFullscreenActive())
+  const [isPolygonEditor, setIsPolygonEditor] = useState(false)
 
   const { data: task, isError } = useTaskPolling(activeTaskId)
 
   // Проверка версии: раз в 60 сек опрашивает /api/version.
   const hasUpdate = useVersionCheck()
+
+  // Проверка доступа к редактору полигонов (один раз при монтировании)
+  useEffect(() => {
+    api.polygonCheckAccess()
+      .then(r => setIsPolygonEditor(r.is_editor))
+      .catch(() => { /* Не редактор — вкладка не покажется */ })
+  }, [])
 
   const user = getCurrentUser()
   const showDevWarning = !isInsideTelegram()
@@ -172,6 +184,18 @@ export default function App() {
           >
             НП БДД
           </button>
+          {isPolygonEditor && (
+            <button
+              className={`flex-1 py-2 px-3 rounded-lg text-sm font-medium transition-colors ${
+                tab === 'polygons'
+                  ? 'bg-tg-section-bg text-tg-text shadow-sm'
+                  : 'text-tg-hint'
+              }`}
+              onClick={() => handleTabChange('polygons')}
+            >
+              Карта
+            </button>
+          )}
         </div>
 
         {/* Подсказка для desktop-пользователей */}
@@ -258,6 +282,13 @@ export default function App() {
         {tab === 'np-bdd' && (
           <Suspense fallback={<TabSpinner />}>
             <NpBddView />
+          </Suspense>
+        )}
+
+        {/* --- Вкладка «Редактор карты» (только для редакторов) --- */}
+        {tab === 'polygons' && isPolygonEditor && (
+          <Suspense fallback={<TabSpinner />}>
+            <PolygonEditorView />
           </Suspense>
         )}
 

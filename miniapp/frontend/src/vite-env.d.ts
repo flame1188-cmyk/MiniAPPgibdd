@@ -1,4 +1,5 @@
 /// <reference types="vite/client" />
+/// <reference types="leaflet" />
 
 interface ImportMetaEnv {
   /** Базовый URL API. Пусто = тот же origin (для production). */

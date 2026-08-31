@@ -2,19 +2,21 @@
 API для работы с полигонами границ населённых пунктов.
 
 Endpoints:
-  GET  /api/polygons/regions          — список регионов с полигонами в БД
-  GET  /api/polygons/{region_code}   — GeoJSON FeatureCollection
-  PUT  /api/polygons/{polygon_id}    — сохранить отредактированный полигон
+  GET  /api/polygons/check-access   — проверка доступа к редактору
+  GET  /api/polygons/regions         — список регионов с полигонами в БД
+  GET  /api/polygons/{region_code}  — GeoJSON FeatureCollection
+  PUT  /api/polygons/{polygon_id}   — сохранить отредактированный полигон
   POST /api/polygons/{region_code}/import — импорт из JSON-кэша в БД
-  GET  /api/polygons/editors         — список редакторов (только для редакторов)
-  POST /api/polygons/editors         — добавить редактора
+  POST /api/polygons/{region_code}/reset/{pid} — сброс к оригиналу
+  GET  /api/polygons/editors        — список редакторов
+  POST /api/polygons/editors        — добавить редактора
   DELETE /api/polygons/editors/{tid} — удалить редактора
 """
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 
@@ -71,6 +73,15 @@ async def _require_editor(user: TelegramUser) -> None:
 # Публичные эндпоинты (для всех авторизованных)
 # ========================
 
+@router.get("/check-access")
+async def check_access(user: TelegramUser = Depends(get_current_user)):
+    """Проверяет, имеет ли текущий пользователь доступ к редактору."""
+    pool = get_pool()
+    if pool is None:
+        return {"is_editor": False}
+    return {"is_editor": await is_polygon_editor(pool, user.id)}
+
+
 @router.get("/regions")
 async def list_regions():
     """Список регионов, для которых есть полигоны в БД."""
@@ -104,7 +115,7 @@ async def get_region_polygons(
 async def update_polygon(
     polygon_id: int,
     req: UpdateGeometryRequest,
-    user: TelegramUser = get_current_user,
+    user: TelegramUser = Depends(get_current_user),
 ):
     """Сохраняет отредактированную геометрию полигона."""
     await _require_editor(user)
@@ -122,7 +133,7 @@ async def update_polygon(
 async def import_region_from_cache(
     region_code: str,
     req: ImportRequest = ImportRequest(),
-    user: TelegramUser = get_current_user,
+    user: TelegramUser = Depends(get_current_user),
 ):
     """
     Импортирует полигоны региона из JSON-кэша в БД.
@@ -167,7 +178,7 @@ async def import_region_from_cache(
 async def reset_polygon(
     region_code: str,
     polygon_id: int,
-    user: TelegramUser = get_current_user,
+    user: TelegramUser = Depends(get_current_user),
 ):
     """Сбрасывает полигон к оригинальной версии из JSON-кэша."""
     await _require_editor(user)
@@ -202,7 +213,7 @@ async def reset_polygon(
 # ========================
 
 @router.get("/editors")
-async def list_editors(user: TelegramUser = get_current_user):
+async def list_editors(user: TelegramUser = Depends(get_current_user)):
     """Возвращает список пользователей с доступом к редактору."""
     await _require_editor(user)
     pool = get_pool()
@@ -212,7 +223,7 @@ async def list_editors(user: TelegramUser = get_current_user):
 
 
 @router.post("/editors")
-async def add_editor(req: AddEditorRequest, user: TelegramUser = get_current_user):
+async def add_editor(req: AddEditorRequest, user: TelegramUser = Depends(get_current_user)):
     """Добавляет пользователя в список редакторов."""
     await _require_editor(user)
     pool = get_pool()
@@ -228,7 +239,7 @@ async def add_editor(req: AddEditorRequest, user: TelegramUser = get_current_use
 
 
 @router.delete("/editors/{telegram_id}")
-async def delete_editor(telegram_id: int, user: TelegramUser = get_current_user):
+async def delete_editor(telegram_id: int, user: TelegramUser = Depends(get_current_user)):
     """Удаляет пользователя из списка редакторов."""
     await _require_editor(user)
     pool = get_pool()

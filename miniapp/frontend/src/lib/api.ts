@@ -958,4 +958,30 @@ export const api = {
       '/api/np-bdd/unfreeze',
       { method: 'POST', body: JSON.stringify({ region_code: regionCode, year }) }
     ),
+
+  // ============================================================
+  // Редактор полигонов
+  // ============================================================
+  polygonCheckAccess: () =>
+    request<{ is_editor: boolean }>('/api/polygons/check-access'),
+
+  polygonListRegions: () =>
+    request<{ region_code: string; polygon_count: number }[]>('/api/polygons/regions'),
+
+  polygonGetGeojson: (regionCode: string, simplified = false) =>
+    request<GeoJSON.FeatureCollection>(
+      `/api/polygons/${regionCode}?simplified=${simplified}`
+    ),
+
+  polygonUpdateGeometry: (polygonId: number, geometry: GeoJSON.Geometry) =>
+    request<{ status: string; id: number }>(`/api/polygons/${polygonId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ geometry }),
+    }),
+
+  polygonReset: (regionCode: string, polygonId: number) =>
+    request<{ status: string; id: number; reset: boolean }>(
+      `/api/polygons/${regionCode}/reset/${polygonId}`,
+      { method: 'POST' }
+    ),
 }
