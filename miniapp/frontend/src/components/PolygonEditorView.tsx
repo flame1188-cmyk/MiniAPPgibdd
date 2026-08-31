@@ -286,7 +286,7 @@ export function PolygonEditorView() {
     cancelEdit()
     cancelDrawing()
 
-    api.polygonGetGeojson(selectedRegion, true)
+    api.polygonGetGeojson(selectedRegion, false)
       .then(data => {
         if (!cancelled) {
           setGeojson(data)
@@ -530,7 +530,7 @@ export function PolygonEditorView() {
       cancelEdit()
       setSelectedFeature(null)
       if (selectedRegion) {
-        const data = await api.polygonGetGeojson(selectedRegion, true)
+        const data = await api.polygonGetGeojson(selectedRegion, false)
         setGeojson(data)
         geojsonLayerRef.current?.clearLayers()
         geojsonLayerRef.current?.addData(data)
@@ -551,7 +551,7 @@ export function PolygonEditorView() {
       await api.polygonReset(selectedRegion, selectedFeature.properties.id)
       haptic('success')
       setSelectedFeature(null)
-      const data = await api.polygonGetGeojson(selectedRegion, true)
+      const data = await api.polygonGetGeojson(selectedRegion, false)
       setGeojson(data)
       geojsonLayerRef.current?.clearLayers()
       geojsonLayerRef.current?.addData(data)
@@ -741,8 +741,8 @@ export function PolygonEditorView() {
       await api.polygonCreate(selectedRegion, geometry, name, newPolyPlaceType)
       haptic('success')
       cancelDrawing()
-      // Обновляем карту
-      const data = await api.polygonGetGeojson(selectedRegion, true)
+      // Обновляем карту (без упрощения, чтобы показать точную геометрию)
+      const data = await api.polygonGetGeojson(selectedRegion, false)
       setGeojson(data)
       geojsonLayerRef.current?.clearLayers()
       geojsonLayerRef.current?.addData(data)
