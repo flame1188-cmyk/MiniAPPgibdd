@@ -1,5 +1,6 @@
 """OSM/Overpass: кэш, HTTP-запросы, парсинг полигонов, classify_cards."""
 import json
+import math
 import os
 import time
 import gc
