@@ -598,43 +598,67 @@ CREATE TABLE IF NOT EXISTS gibdd_indicators (
 );
 
 -- ─────────────────────────────────────────────────────────────────────────
--- 8. ПАП — административные правонарушения
+-- 7. КОЛЛИЗИИ kart_id (для ручного разбора)
 -- ─────────────────────────────────────────────────────────────────────────
--- Предагрегированные данные ПАП из gibdd_db.
--- Заполняется скриптом sync_pap.py (запускается вручную с VPN).
--- Приложение читает из этой таблицы вместо прямого подключения к gibdd_db.
---
--- Каждая строка = одна статья (koap_id) в одной точке за один день.
--- Агрегация по lat/lon делается локально при запросе (как раньше).
-CREATE TABLE IF NOT EXISTS pap_points (
-    id              BIGSERIAL      PRIMARY KEY,
-    app_region_code VARCHAR(16)    NOT NULL,  -- код региона приложения (11XX)
-    gibdd_region_id INT            NOT NULL,  -- код региона в gibdd_db (874-966)
-    date            DATE           NOT NULL,  -- дата ПАП
-    lat             DOUBLE PRECISION NOT NULL,
-    lon             DOUBLE PRECISION NOT NULL,
-    koap_id         INT,                      -- ID статьи КоАП
-    article_num     TEXT,                     -- номер статьи ("12.6", "12.9"...)
-    viol_group      TEXT,                     -- группа нарушения ("Ремни", "Скорость"...)
-    pap_cnt         INT            NOT NULL DEFAULT 0,
-    repeat_cnt      INT            NOT NULL DEFAULT 0,
-    synced_at       TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+-- Когда две разные карточки дают одинаковый kart_id (т.е. одинаковые
+-- last-5 empt_number в одном регионе-годе), первая попадает в gibdd_cards,
+-- а вторая — сюда. По этим записям можно найти ДТП, которые ГИБДД
+-- нумерует одинаковыми empt_number, и разобраться с ними вручную.
+CREATE TABLE IF NOT EXISTS gibdd_cards_collisions (
+    id              BIGSERIAL    PRIMARY KEY,
+    kart_id         VARCHAR(32)  NOT NULL,                -- kart_id, который коллизировал
+    reg_code        VARCHAR(16)  NOT NULL,
+    dat_period      VARCHAR(8)   NOT NULL,
+    date_dtp        DATE,
+    empt_number     VARCHAR(32),                          -- оригинальный empt_number
+    coord_w         NUMERIC(9,6),
+    coord_l         NUMERIC(9,6),
+    pog             SMALLINT,
+    ran             SMALLINT,
+    raw_payload     JSONB,                                -- полная карточка для разбора
+    conflict_with   BIGINT,                               -- id карты в gibdd_cards, занявшей kart_id
+    detected_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_pap_points_unique
-    ON pap_points (app_region_code, date, lat, lon, koap_id);
-
-CREATE INDEX IF NOT EXISTS idx_pap_points_region_date
-    ON pap_points (app_region_code, date);
-
-CREATE INDEX IF NOT EXISTS idx_pap_points_date
-    ON pap_points (date);
-
-CREATE INDEX IF NOT EXISTS idx_pap_points_synced
-    ON pap_points (synced_at);
 
 CREATE INDEX IF NOT EXISTS idx_collisions_kart_id
     ON gibdd_cards_collisions (kart_id);
 
 CREATE INDEX IF NOT EXISTS idx_collisions_reg_date
     ON gibdd_cards_collisions (reg_code, date_dtp);
+
+
+-- ============================================================
+-- settlement_polygons: полигоны границ населённых пунктов из OSM
+-- ============================================================
+-- Хранит GeoJSON-полигоны для классификации ДТП (в НП / вне НП).
+-- Источник: precache_osm.py → PostgreSQL.
+-- Формат geometry: GeoJSON Feature (Polygon/MultiPolygon).
+-- Без PostGIS — все spatial-операции в Python/Shapely.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS settlement_polygons (
+    id              SERIAL PRIMARY KEY,
+    region_code     VARCHAR(16)  NOT NULL,
+    osm_type        VARCHAR(16)  NOT NULL,          -- 'way' или 'relation'
+    osm_id          BIGINT       NOT NULL,
+    name            TEXT         NOT NULL DEFAULT '',
+    place_type      TEXT,                           -- 'city', 'town', 'village', 'hamlet'
+    geometry        JSONB        NOT NULL,           -- GeoJSON Polygon или MultiPolygon
+    is_edited       BOOLEAN      NOT NULL DEFAULT false,
+    edited_at       TIMESTAMPTZ,
+    edited_by       BIGINT,                        -- Telegram user ID
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    UNIQUE (region_code, osm_type, osm_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sp_region ON settlement_polygons (region_code);
+CREATE INDEX IF NOT EXISTS idx_sp_name ON settlement_polygons (region_code, name);
+
+
+-- ============================================================
+-- polygon_editors: пользователи с доступом к редактору полигонов
+-- ============================================================
+CREATE TABLE IF NOT EXISTS polygon_editors (
+    telegram_id  BIGINT PRIMARY KEY,
+    name         TEXT,
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);

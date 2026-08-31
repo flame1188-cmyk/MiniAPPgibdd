@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .routers import analyze, cameras, dtp, np_bdd, parse, regions
+from .routers import analyze, cameras, dtp, np_bdd, parse, polygons, regions
 from .version import VERSION as APP_VERSION, BUILD_TIME as APP_BUILD_TIME
 
 
@@ -50,6 +50,7 @@ app.include_router(dtp.router)
 app.include_router(analyze.router)
 app.include_router(cameras.router)
 app.include_router(np_bdd.router)
+app.include_router(polygons.router)
 
 
 @app.get("/miniapp/health")

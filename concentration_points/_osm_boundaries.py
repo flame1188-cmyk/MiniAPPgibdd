@@ -16,6 +16,48 @@ from shapely.prepared import prep
 from shapely.strtree import STRtree
 
 from analytics import _safe_int
+
+# --- Загрузка полигонов из PostgreSQL (если доступна БД) ---
+def _try_load_polygons_from_db(reg_code: str):
+    """Пытается загрузить полигоны региона из БД (синхронная обёртка).
+
+    Используется в fetch_settlement_boundaries как приоритетный источник.
+    Возвращает list[Polygon|MultiPolygon] или None.
+    """
+    try:
+        from miniapp.backend.db.connection import get_pool
+        from miniapp.backend.db.polygon_repository import load_polygons_from_db
+        pool = get_pool()
+        if pool is None:
+            return None
+        # Синхронная обёртка над async-функцией
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Внутри async-контекста — используем create_task
+            return None  # Фолбэк на JSON-кэш, DB будет проверена в async-контексте
+        return loop.run_until_complete(load_polygons_from_db(pool, reg_code))
+    except Exception as e:
+        logger.debug(f"DB polygons not available for {reg_code}: {e}")
+        return None
+
+
+async def _load_polygons_from_db_async(reg_code: str):
+    """Async-загрузка полигонов региона из PostgreSQL.
+
+    Возвращает list[Polygon|MultiPolygon] или None.
+    """
+    try:
+        from miniapp.backend.db.connection import get_pool
+        from miniapp.backend.db.polygon_repository import load_polygons_from_db
+        pool = get_pool()
+        if pool is None:
+            return None
+        return await load_polygons_from_db(pool, reg_code)
+    except Exception as e:
+        logger.debug(f"DB polygons not available for {reg_code}: {e}")
+        return None
+
+
 from ._constants import (
     CACHE_DIR, REGION_CACHE_DIR, CACHE_TTL_SECONDS, REGION_CACHE_TTL_SECONDS,
     MEMORY_CACHE_MAX, BBOX_MARGIN, BBOX_TILE_MAX_DEG, BBOX_TILE_OVERLAP,
@@ -599,10 +641,9 @@ async def fetch_settlement_boundaries(
 
     bbox = f"{lat_min},{lon_min},{lat_max},{lon_max}"
 
-    # --- Шаг 0: Регион-уровневый кэш (предкэш от precache_osm.py) ---
-    # Проверяем ПЕРВЫМ, чтобы избежать тайл-запросов для предкэшированных
-    # регионов. Если регион закэширован целиком — фильтруем полигоны по bbox
-    # текущих ДТП и возвращаем. Тайл-уровень не затрагивается.
+    # --- Шаг 0: PostgreSQL (приоритет) ---
+    # Если полигоны загружены в БД через precache_osm.py --db
+    # или через API /api/polygons/{region_code}/import — используем их.
     if reg_code:
         region_key = f"region:{reg_code}"
         mem_polygons = _memory_cache_get(region_key)
@@ -613,7 +654,17 @@ async def fetch_settlement_boundaries(
             )
             return mem_polygons
 
-        # Дисковый регион-кэш
+        # Пробуем загрузить из PostgreSQL
+        db_polygons = await _load_polygons_from_db_async(reg_code)
+        if db_polygons is not None:
+            _memory_cache_put(region_key, db_polygons)
+            logger.info(
+                f"Полигоны региона {reg_code} из БД: "
+                f"{len(db_polygons)} полигонов (OSM-запрос не требуется)"
+            )
+            return db_polygons
+
+        # Дисковый регион-кэш (фолбэк)
         region_elements = _load_region_cache(reg_code)
         if region_elements is not None:
             if progress_callback:

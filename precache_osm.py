@@ -614,6 +614,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Подробное логирование",
     )
+    p.add_argument(
+        "--db",
+        action="store_true",
+        help="Загрузить полигоны также в PostgreSQL (требуется DATABASE_URL)",
+    )
+    p.add_argument(
+        "--db-only",
+        action="store_true",
+        help="Загрузить только в PostgreSQL, без JSON-файла",
+    )
     return p.parse_args()
 
 
@@ -658,6 +668,7 @@ async def main() -> int:
     print(f"TTL: {REGION_CACHE_TTL_SECONDS // 86400} дней")
     print(f"Force: {args.force}")
     print(f"Dry-run: {args.dry_run}")
+    print(f"DB: {args.db or args.db_only}")
     print(f"{'=' * 60}\n")
 
     # Проверяем, что директория кэша существует (создаём если нет)
@@ -682,6 +693,10 @@ async def main() -> int:
             print(f"\n[{i}/{len(regions)}] === {name} ({code}) ===")
             result = await precache_region(code, name, client, force=args.force)
             results.append(result)
+
+            # Загрузка в PostgreSQL
+            if (args.db or args.db_only) and result["status"] == "ok":
+                await _save_to_db(code, result)
 
             # Пауза между регионами (для Overpass)
             if i < len(regions):
@@ -746,6 +761,36 @@ async def main() -> int:
     print(f"\nОтчёт: {report_path}")
 
     return 0 if err_count == 0 else 1
+
+
+async def _save_to_db(reg_code: str, result: dict) -> None:
+    """Загружает элементы региона в PostgreSQL."""
+    try:
+        from miniapp.backend.db.connection import get_pool, init_pool
+        from miniapp.backend.db.polygon_repository import save_polygons_to_db
+
+        # Инициализируем пул (precache_osm.py запускается отдельно от FastAPI)
+        pool = get_pool()
+        if pool is None:
+            logger.info(f"  [{reg_code}] Инициализация пула PostgreSQL...")
+            await init_pool()
+            pool = get_pool()
+        if pool is None:
+            logger.warning(f"  [{reg_code}] БД недоступна, пропуск")
+            return
+
+        # Читаем сохранённый JSON-кэш
+        elements = _load_region_cache(reg_code)
+        if elements is None:
+            logger.warning(f"  [{reg_code}] JSON-кэш не найден, пропуск DB")
+            return
+
+        count = await save_polygons_to_db(pool, reg_code, elements)
+        logger.info(f"  [{reg_code}] В БД: {count} полигонов")
+        result["db_polygons"] = count
+    except Exception as e:
+        logger.error(f"  [{reg_code}] Ошибка загрузки в БД: {e}")
+        result["db_error"] = str(e)
 
 
 if __name__ == "__main__":
