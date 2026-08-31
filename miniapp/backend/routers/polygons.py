@@ -36,7 +36,7 @@ from ..db.polygon_repository import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/polygons", tags=["polygons"])
+router = APIRouter(prefix="/polygons", tags=["polygons"])
 
 
 # ========================
