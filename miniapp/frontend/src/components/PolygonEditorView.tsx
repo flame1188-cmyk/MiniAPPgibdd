@@ -71,7 +71,6 @@ export function PolygonEditorView() {
   const [loadingMap, setLoadingMap] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [debugInfo, setDebugInfo] = useState('')
 
    // --- Редактирование ---
   const [isEditing, setIsEditing] = useState(false)
@@ -117,10 +116,7 @@ export function PolygonEditorView() {
     const el = mapContainerRef.current
     if (!el || mapRef.current) return
 
-    const rect = el.getBoundingClientRect()
-    setDebugInfo(`container: ${Math.round(rect.width)}x${Math.round(rect.height)}`)
-
-    if (rect.width === 0 || rect.height === 0) {
+    if (el.getBoundingClientRect().width === 0 || el.getBoundingClientRect().height === 0) {
       const ro = new ResizeObserver((entries) => {
         const r = entries[0].contentRect
         if (r.width > 0 && r.height > 0) {
@@ -135,38 +131,21 @@ export function PolygonEditorView() {
     initMap(el)
 
     function initMap(container: HTMLDivElement) {
-      const r2 = container.getBoundingClientRect()
-      setDebugInfo(prev => `${prev} → init: ${Math.round(r2.width)}x${Math.round(r2.height)}`)
-
       const map = L.map(container, {
         zoomControl: true,
         attributionControl: false,
         preferCanvas: true,
       }).setView([55.75, 37.62], 7)
 
-      const tiles = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
-      })
+      }).addTo(map)
 
-      tiles.on('tileerror', (e) => {
-        setDebugInfo(prev => `${prev} | TILE ERROR: ${e.tile.src}`)
-      })
-
-      tiles.on('load', () => {
-        setDebugInfo(prev => `${prev} | tiles OK`)
-      })
-
-      tiles.addTo(map)
       mapRef.current = map
-      setDebugInfo(prev => `${prev} | map created`)
 
       const ro2 = new ResizeObserver(() => map.invalidateSize())
       ro2.observe(container)
-      const timer = setTimeout(() => {
-        map.invalidateSize()
-        const r3 = container.getBoundingClientRect()
-        setDebugInfo(prev => `${prev} | invalidate: ${Math.round(r3.width)}x${Math.round(r3.height)}`)
-      }, 300)
+      const timer = setTimeout(() => map.invalidateSize(), 300)
 
     geojsonLayerRef.current = L.geoJSON(undefined, {
       style: (f) => featureStyle(f!),
@@ -439,15 +418,8 @@ export function PolygonEditorView() {
         </div>
       )}
 
-      {/* Дебаг-панель (временная) */}
-      {debugInfo && (
-        <div className="tg-card text-xs font-mono opacity-70 break-all" style={{ fontSize: 11 }}>
-          {debugInfo}
-        </div>
-      )}
-
       {/* Карта */}
-      <div className="rounded-xl overflow-hidden relative" style={{ border: '1px solid var(--tg-color-hint, #999)', background: '#e0f0ff' }}>
+      <div className="rounded-xl overflow-hidden relative" style={{ border: '1px solid var(--tg-color-hint, #999)' }}>
         <div ref={mapContainerRef} style={{ height: '50vh', minHeight: 300, width: '100%' }} />
         {loadingMap && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/20">
