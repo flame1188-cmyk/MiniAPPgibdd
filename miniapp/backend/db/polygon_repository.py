@@ -133,28 +133,29 @@ async def save_polygons_to_db(
         ))
 
     async with pool.connection() as conn:
-        from psycopg import sql
-        from psycopg.extras import execute_values
-
-        query = sql.SQL("""
-            INSERT INTO settlement_polygons
-                (region_code, osm_type, osm_id, name, place_type, geometry,
-                 is_edited, edited_at, edited_by)
-            VALUES %s
-            ON CONFLICT (region_code, osm_type, osm_id)
-            DO UPDATE SET
-                name = EXCLUDED.name,
-                place_type = EXCLUDED.place_type,
-                geometry = EXCLUDED.geometry
-            WHERE settlement_polygons.is_edited = false
-        """)
-
-        await execute_values(
-            conn,
-            query,
-            rows,
-            template="(%s, %s, %s, %s, %s, %s::jsonb, false, NULL, NULL)",
-        )
+        # Пакетная вставка чанками по 500 (без psycopg.extras.execute_values,
+        # который недоступен в некоторых версиях psycopg 3.x).
+        CHUNK = 500
+        for i in range(0, len(rows), CHUNK):
+            chunk = rows[i:i + CHUNK]
+            placeholders = ",".join(
+                "(%s, %s, %s, %s, %s, %s::jsonb, false, NULL, NULL)"
+                for _ in chunk
+            )
+            query = f"""
+                INSERT INTO settlement_polygons
+                    (region_code, osm_type, osm_id, name, place_type, geometry,
+                     is_edited, edited_at, edited_by)
+                VALUES {placeholders}
+                ON CONFLICT (region_code, osm_type, osm_id)
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    place_type = EXCLUDED.place_type,
+                    geometry = EXCLUDED.geometry
+                WHERE settlement_polygons.is_edited = false
+            """
+            flat_params = [p for row in chunk for p in row]
+            await conn.execute(query, flat_params)
         await conn.commit()
 
     logger.info(
