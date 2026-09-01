@@ -230,7 +230,7 @@ export default function App() {
         {tab === 'dtp' && (
           <>
             {/* Форма запроса */}
-            <StructuredForm onTaskCreated={setActiveTaskId} />
+            <StructuredForm onTaskCreated={setActiveTaskId} collapseTrigger={activeTaskId} />
 
             {/* Загрузка камер фотовидеофиксации */}
             <CamerasWidget />
