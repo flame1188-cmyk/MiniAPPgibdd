@@ -673,26 +673,12 @@ def _build_clusters_map_html(task: Task) -> str:
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-html, body, #map {{ margin: 0; padding: 0; height: 100%; width: 100%; }}
-.legend {{
-  position: absolute; bottom: 10px; left: 10px; z-index: 1000;
-  background: white; padding: 8px 12px; border-radius: 6px;
-  font: 12px/1.4 -apple-system, system-ui, sans-serif;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-}}
-.legend-item {{ display: flex; align-items: center; gap: 6px; margin: 2px 0; }}
-.legend-dot {{ width: 12px; height: 12px; border-radius: 50%; }}
+html, body {{ margin: 0; padding: 0; height: 100%; width: 100%; }}
+#map {{ height: 100%; width: 100%; }}
 </style>
 </head>
 <body>
 <div id="map"></div>
-<div class="legend">
-<div class="legend-item"><span class="legend-dot" style="background:#5ac8fa;border:2px dashed #007aff;"></span>АППГ (повторён в текущем)</div>
-<div class="legend-item"><span class="legend-dot" style="background:#c0c0c0;border:2px dashed #9e9e9e;"></span>Исчезнувший очаг</div>
-<div class="legend-item"><span class="legend-dot" style="background:#2481cc"></span>Очаг (низкая тяжесть)</div>
-<div class="legend-item"><span class="legend-dot" style="background:#ff9500"></span>Очаг (высокая тяжесть)</div>
-<div class="legend-item"><span class="legend-dot" style="background:#34c759;opacity:0.5"></span>Предочаг</div>
-</div>
 <script>
 var map = L.map('map').setView([{center_lat}, {center_lon}], 11);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{

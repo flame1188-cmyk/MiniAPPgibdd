@@ -353,25 +353,48 @@ async def delete_task_endpoint(
 @router.get("/tasks/{task_id}/map", response_class=HTMLResponse)
 async def get_task_map(
     task_id: str,
+    refresh: bool = Query(False, description="Перегенерировать карту и перезагрузить данные из ГИБДД"),
     user: TelegramUser = Depends(get_current_user),
 ):
     """
     Отдаёт HTML-карту (inline Leaflet с кластеризацией).
     Генерируется лениво при первом запросе и кэшируется в task.files.
+    При refresh=True — удаляет кэш карты и перезагружает карточки из ГИБДД.
     """
     task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # Ищем уже сгенерированную карту
-    map_file = next(
-        (f for f in task.files if f["type"] == "map_html"),
-        None,
-    )
-    if map_file:
-        path = Path(map_file["path"])
-        if path.exists():
-            return HTMLResponse(content=path.read_text(encoding="utf-8"))
+    # При refresh=True — инвалидируем кэш, перезагружаем данные
+    if refresh:
+        # 1. Удаляем кэшированный файл карты
+        task.files = [f for f in task.files if f.get("type") != "map_html"]
+        # 2. Инвалидируем cards_cache для этой задачи
+        try:
+            from ..db.cards_cache import invalidate_entry
+            removed = await invalidate_entry(task.region_code, task.dat_list)
+            if removed:
+                logger.info(f"Task {task.id}: cards_cache invalidated ({removed} entries)")
+        except Exception as exc:
+            logger.warning(f"Task {task.id}: cards_cache invalidate failed: {exc}")
+        # 3. Сбрасываем аналитику (пересчитается при следующем запросе)
+        task.cross_tables = None
+        task.cross_tables_cards_id = None
+        task.current_metrics = None
+        task.current_metrics_cards_id = None
+        task.comparison = None
+        task.analytics = None
+        task.cards = []  # Принудительно пустые — ensure_cards перезагрузит
+    else:
+        # Ищем уже сгенерированную карту
+        map_file = next(
+            (f for f in task.files if f["type"] == "map_html"),
+            None,
+        )
+        if map_file:
+            path = Path(map_file["path"])
+            if path.exists():
+                return HTMLResponse(content=path.read_text(encoding="utf-8"))
 
     # Карта ещё не сгенерирована — генерируем лениво
     if not task.cards:

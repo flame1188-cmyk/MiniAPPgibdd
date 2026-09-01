@@ -203,6 +203,47 @@ async def put_cached_cards(
 # ====================================================================
 # INVALIDATE BY REGION
 # ====================================================================
+async def invalidate_entry(
+    reg_code: str, dat_list: List[str],
+) -> int:
+    """
+    Удаляет конкретную запись кэша (по reg_code + dat_hash) из БД.
+
+    Возвращает количество удалённых строк.
+    """
+    if not is_db_ready():
+        return 0
+
+    pool = get_pool()
+    if pool is None:
+        return 0
+
+    dat_hash = _make_dat_hash(dat_list)
+
+    try:
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "DELETE FROM dtp_cards_cache WHERE reg_code = %(reg)s AND dat_hash = %(hash)s",
+                params={"reg": reg_code, "hash": dat_hash},
+                prepare=False,
+            )
+            await conn.commit()
+            removed = cur.rowcount or 0
+
+        if removed:
+            logger.info(
+                f"cards_cache: invalidate_entry(reg={reg_code}, hash={dat_hash[:8]}..) — "
+                f"removed {removed}"
+            )
+        return removed
+
+    except Exception as exc:
+        logger.warning(
+            f"cards_cache: invalidate_entry failed (reg={reg_code}): {exc}"
+        )
+        return 0
+
+
 async def invalidate_region(reg_code: str) -> int:
     """
     Удаляет ВСЕ записи кэша для заданного региона из БД.
