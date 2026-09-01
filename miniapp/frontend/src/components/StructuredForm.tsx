@@ -63,7 +63,7 @@ export function StructuredForm({ onTaskCreated, collapseTrigger }: StructuredFor
 
   // Автоматическое сворачивание при выборе задачи из истории
   useEffect(() => {
-    if (collapseTrigger && selectedRegion) {
+    if (collapseTrigger) {
       setCollapsed(true)
     }
   }, [collapseTrigger])
@@ -193,21 +193,18 @@ export function StructuredForm({ onTaskCreated, collapseTrigger }: StructuredFor
     <div className="tg-card">
       <div className="flex items-center justify-between mb-3">
         <div className="tg-section-header">Запрос данных ДТП</div>
-        {/* Кнопка свернуть (иконка ▲) — видна только если уже есть выбранные параметры */}
-        {canSubmit && (
-          <button
-            type="button"
-            onClick={handleToggleCollapse}
-            className="text-xs px-2 py-1 rounded-md"
-            style={{
-              backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
-              color: 'var(--tg-color-link, #2481cc)',
-            }}
-            title="Свернуть"
-          >
-            ▲ Свернуть
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={handleToggleCollapse}
+          className="text-xs px-2 py-1 rounded-md"
+          style={{
+            backgroundColor: 'var(--tg-color-secondary-bg, #f1f1f1)',
+            color: 'var(--tg-color-link, #2481cc)',
+          }}
+          title="Свернуть"
+        >
+          ▲ Свернуть
+        </button>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
