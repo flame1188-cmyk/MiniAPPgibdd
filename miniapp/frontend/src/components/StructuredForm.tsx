@@ -34,7 +34,7 @@ const MONTH_LABELS = [
   'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек',
 ]
 
-const YEARS = [2026, 2025, 2024, 2023]
+const YEARS = [2026, 2025, 2024, 2023, 2022]
 
 const PRESETS: { label: string; months: number[] }[] = [
   { label: 'Весь год', months: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] },

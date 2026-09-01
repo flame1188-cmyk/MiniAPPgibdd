@@ -13,6 +13,7 @@
  *  - Карта очагов — отдельный iframe (Leaflet с маркерами)
  */
 import { useEffect, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   api,
   ApiError,
@@ -62,13 +63,18 @@ export function ClustersView({ task }: ClustersViewProps) {
   // Флаг «пересчитываем» — пользователь нажал «Пересчитать» на готовом результате
   const [refreshing, setRefreshing] = useState(false)
 
-  // Опрашиваем только если пользователь запустил расчёт ИЛИ
-  // если операция уже была запущена (например, в предыдущей сессии вкладки)
+  // ВСЕГДА опрашиваем при наличии taskId:
+  //   - Если очаги рассчитаны (done) — один запрос, результат из кэша,
+  //     polling останавливается (refetchInterval: false на done/failed/idle).
+  //   - Если расчёт в процессе (running) — long-polling до завершения.
+  //   - Если не рассчитаны (idle) — один запрос, polling останавливается.
+  // Это даёт авто-загрузку из кэша при повторном открытии вкладки.
+  const queryClient = useQueryClient()
   const {
     data,
     isError,
     error,
-  } = useClustersPolling(task.task_id, started)
+  } = useClustersPolling(task.task_id, true)
 
   // Hotfix Sprint 7: при 404 (Task not found) или 403 (Access denied)
   // задача недоступна навсегда — polling уже остановлен в хуке, но нам
@@ -80,13 +86,16 @@ export function ClustersView({ task }: ClustersViewProps) {
     error instanceof ApiError &&
     (error.status === 404 || error.status === 403)
 
-  // Если при загрузке уже есть результат — автоматически показываем его
+  // Авто-показ результата из кэша и сброс локальных флагов
+  // при смене статуса (running → starting/refreshing сбрасываются,
+  // done → всё готово).
   useEffect(() => {
     if (data?.state.status === 'done') {
       setStarted(true)
       setStarting(false)
+      setRefreshing(false)
     }
-    // Когда пришёл первый ответ со статусом running — локальный loading можно снять
+    // Когда пришёл ответ со статусом running — локальные флаги можно снять
     if (data?.state.status === 'running') {
       setStarting(false)
       setRefreshing(false)
@@ -96,12 +105,18 @@ export function ClustersView({ task }: ClustersViewProps) {
   const handleStart = async () => {
     setStartError(null)
     setStarting(true)  // мгновенно показываем прогресс
-    setStarted(true)   // запускаем polling
+    setStarted(true)   // на случай если polling был остановлен
     haptic('medium')
     try {
       const resp = await api.startClusters(task.task_id)
+      // 1) setQueryData — мгновенно обновляем кэш (UI показывает RUNNING).
+      // 2) invalidateQueries — перезапускает refetchInterval таймер,
+      //    который был убит когда data был 'done'.
+      //    Без invalidate таймер НЕ перезапускается после setQueryData!
+      queryClient.setQueryData(['clusters', task.task_id], resp)
+      queryClient.invalidateQueries({ queryKey: ['clusters', task.task_id] })
       if (resp.state.status === 'done') {
-        // Уже было рассчитано раньше — polling подхватит результат
+        // Уже было рассчитано (кэш) — polling подхватит и остановится
         haptic('success')
       }
     } catch (e: any) {
@@ -118,7 +133,13 @@ export function ClustersView({ task }: ClustersViewProps) {
     setStarted(true)
     haptic('medium')
     try {
-      await api.startClusters(task.task_id, true)
+      const resp = await api.startClusters(task.task_id, true)
+      // 1) setQueryData — мгновенно обновляем кэш (UI показывает RUNNING).
+      // 2) invalidateQueries — перезапускает refetchInterval таймер,
+      //    который был убит когда data был 'done'.
+      //    Без invalidate таймер НЕ перезапускается после setQueryData!
+      queryClient.setQueryData(['clusters', task.task_id], resp)
+      queryClient.invalidateQueries({ queryKey: ['clusters', task.task_id] })
     } catch (e: any) {
       setStartError(e?.message ?? 'Не удалось перезапустить расчёт')
       setRefreshing(false)
@@ -514,7 +535,32 @@ export function ClustersView({ task }: ClustersViewProps) {
                 display: 'block',
               }}
               title="Карта очагов ДТП"
-            />
+            />\n          </div>
+          {/* Легенда карты */}
+          <div
+            className="flex flex-wrap gap-x-4 gap-y-1.5 mt-2 px-1"
+            style={{ fontSize: 11, lineHeight: '16px', opacity: 0.7 }}
+          >
+            <span className="flex items-center gap-1.5">
+              <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#5ac8fa', border: '2px dashed #007aff', display: 'inline-block', flexShrink: 0 }} />
+              АППГ (повторён)
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#c0c0c0', border: '2px dashed #9e9e9e', display: 'inline-block', flexShrink: 0 }} />
+              Исчезнувший
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#2481cc', display: 'inline-block', flexShrink: 0 }} />
+              Очаг (низкая тяжесть)
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#ff9500', display: 'inline-block', flexShrink: 0 }} />
+              Очаг (высокая тяжесть)
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span style={{ width: 10, height: 10, borderRadius: '50%', background: '#34c759', opacity: 0.5, display: 'inline-block', flexShrink: 0 }} />
+              Предочаг
+            </span>
           </div>
         </div>
 
