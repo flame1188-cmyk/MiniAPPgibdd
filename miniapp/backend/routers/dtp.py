@@ -384,6 +384,10 @@ async def get_task_map(
         task.current_metrics_cards_id = None
         task.comparison = None
         task.analytics = None
+        # 4. Сбрасываем АППГ — перезагрузится при генерации карты
+        task.prev_cards = None
+        task.prev_label = None
+        task.prev_cards_loaded = False
         task.cards = []  # Принудительно пустые — ensure_cards перезагрузит
     else:
         # Ищем уже сгенерированную карту
@@ -406,6 +410,11 @@ async def get_task_map(
                 status_code=503,
                 detail=result.get("error", "Карточки не загружены"),
             )
+
+    # Загружаем АППГ если ещё нет (при refresh — флаг сброшен)
+    if not task.prev_cards_loaded:
+        from ..services.pipeline import ensure_prev_cards
+        await ensure_prev_cards(task)
 
     html_content = await _generate_map_html(task)
     if html_content is None:
