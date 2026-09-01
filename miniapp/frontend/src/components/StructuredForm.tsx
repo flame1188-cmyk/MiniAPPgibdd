@@ -19,7 +19,7 @@
  * Отправляет на backend уже готовый region_code + dat_list —
  * парсинг текста не выполняется.
  */
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { api, type Region } from '@/lib/api'
 import { haptic, showAlert } from '@/lib/telegram'
@@ -27,6 +27,10 @@ import { cn } from '@/lib/utils'
 
 interface StructuredFormProps {
   onTaskCreated: (taskId: string) => void
+  /** При изменении значения форма автоматически сворачивается.
+   *  Передавайте activeTaskId из App — при выборе задачи из истории
+   *  форма свернётся, освободив место для результатов. */
+  collapseTrigger?: string | null
 }
 
 const MONTH_LABELS = [
@@ -45,7 +49,7 @@ const PRESETS: { label: string; months: number[] }[] = [
   { label: 'Полгода', months: [1, 2, 3, 4, 5, 6] },
 ]
 
-export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
+export function StructuredForm({ onTaskCreated, collapseTrigger }: StructuredFormProps) {
   // === Состояние формы ===
   const [regionQuery, setRegionQuery] = useState('')
   const [selectedRegion, setSelectedRegion] = useState<Region | null>(null)
@@ -54,7 +58,15 @@ export function StructuredForm({ onTaskCreated }: StructuredFormProps) {
 
   // Сворачиваемый блок: по умолчанию развёрнут.
   // После успешной отправки задачи — автоматически сворачивается.
+  // Также сворачивается при выборе задачи из истории (collapseTrigger).
   const [collapsed, setCollapsed] = useState(false)
+
+  // Автоматическое сворачивание при выборе задачи из истории
+  useEffect(() => {
+    if (collapseTrigger && selectedRegion) {
+      setCollapsed(true)
+    }
+  }, [collapseTrigger])
 
   // === Загрузка регионов ===
   const regionsQuery = useQuery({
