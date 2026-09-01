@@ -201,7 +201,7 @@ async def put_cached_cards(
 
 
 # ====================================================================
-# INVALIDATE BY REGION
+# INVALIDATE BY ENTRY (точечная инвалидация)
 # ====================================================================
 async def invalidate_entry(
     reg_code: str, dat_list: List[str],
@@ -244,6 +244,9 @@ async def invalidate_entry(
         return 0
 
 
+# ====================================================================
+# INVALIDATE BY REGION
+# ====================================================================
 async def invalidate_region(reg_code: str) -> int:
     """
     Удаляет ВСЕ записи кэша для заданного региона из БД.
