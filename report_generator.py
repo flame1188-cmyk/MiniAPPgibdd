@@ -2586,13 +2586,13 @@ var {chart_id} = echarts.init(document.getElementById('{chart_id}'));
 
         body = f"""
 {summary_html}
-{legend_html}
 {filter_html}
 {self._build_coord_search_html()}
 <div class="map-container">
   <div class="map-title">Карта очагов ДТП — {self._esc(self.region_name)}</div>
   <div id="map"></div>
 </div>
+{legend_html}
 <script>
 {map_js}
 </script>
