@@ -353,108 +353,48 @@ async def delete_task_endpoint(
 @router.get("/tasks/{task_id}/map", response_class=HTMLResponse)
 async def get_task_map(
     task_id: str,
-    refresh: bool = Query(False, description="Сбросить кэш и перезагрузить данные из БД ГИБДД"),
+    refresh: bool = Query(False, description="Перегенерировать карту и перезагрузить данные из ГИБДД"),
     user: TelegramUser = Depends(get_current_user),
 ):
     """
     Отдаёт HTML-карту (inline Leaflet с кластеризацией).
     Генерируется лениво при первом запросе и кэшируется в task.files.
-
-    При refresh=True:
-      1. Инвалидирует cards_cache для региона (PostgreSQL)
-      2. Очищает task.cards и in-memory аналитические кэши
-      3. Удаляет кэшированный HTML-файл карты
-      4. Перескачивает карточки из БД ГИБДД
-      5. Перегенерирует карту с новыми данными
+    При refresh=True — удаляет кэш карты и перезагружает карточки из ГИБДД.
     """
     task = await get_task_async(task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    # При refresh=True — инвалидируем кэш, перезагружаем данные
     if refresh:
-        logger.info(f"Task {task_id}: refresh requested — invalidating caches")
-
-        # 1. Инвалидируем PostgreSQL cards_cache для региона
+        # 1. Удаляем кэшированный файл карты
+        task.files = [f for f in task.files if f.get("type") != "map_html"]
+        # 2. Инвалидируем cards_cache для этой задачи
         try:
-            from ..db.cards_cache import invalidate_region as invalidate_cards_cache
-            db_removed = await invalidate_cards_cache(task.region_code)
-            logger.info(f"Task {task_id}: cards_cache invalidated — {db_removed} rows removed")
+            from ..db.cards_cache import invalidate_entry
+            removed = await invalidate_entry(task.region_code, task.dat_list)
+            if removed:
+                logger.info(f"Task {task.id}: cards_cache invalidated ({removed} entries)")
         except Exception as exc:
-            logger.warning(f"Task {task_id}: cards_cache invalidation failed: {exc}")
-
-        # 2. Очищаем in-memory кэши задачи
-        task.cards = []
-        task.current_metrics = None
-        task.current_metrics_cards_id = None
+            logger.warning(f"Task {task.id}: cards_cache invalidate failed: {exc}")
+        # 3. Сбрасываем аналитику (пересчитается при следующем запросе)
         task.cross_tables = None
         task.cross_tables_cards_id = None
+        task.current_metrics = None
+        task.current_metrics_cards_id = None
         task.comparison = None
         task.analytics = None
-
-        # 3. Удаляем кэшированный HTML-файл карты
-        map_file_entry = next(
+        task.cards = []  # Принудительно пустые — ensure_cards перезагрузит
+    else:
+        # Ищем уже сгенерированную карту
+        map_file = next(
             (f for f in task.files if f["type"] == "map_html"),
             None,
         )
-        if map_file_entry:
-            try:
-                map_path = Path(map_file_entry["path"])
-                if map_path.exists():
-                    map_path.unlink()
-                    logger.info(f"Task {task_id}: cached map HTML deleted")
-                task.files = [f for f in task.files if f["type"] != "map_html"]
-            except Exception as exc:
-                logger.warning(f"Task {task_id}: failed to delete cached map: {exc}")
-
-        # 4. Перескачиваем карточки из БД ГИБДД
-        # cards_cache уже инвалидирован, поэтому _fetch_cards_for_period
-        # не найдёт кэш и пойдёт в API/архив.
-        try:
-            bot_module = __import__("bot", fromlist=["_fetch_cards_for_period"])
-            cards, fetch_errors = await bot_module._fetch_cards_for_period(
-                dat_list=task.dat_list,
-                reg_code=task.region_code,
-                log_prefix=f"MiniApp[{task.id}]/refresh",
-                cache_result=True,
-            )
-            if cards:
-                task.cards = cards
-                task.total_dtp = len(cards)
-                task.total_dead = sum(int(c.get("pog", 0) or 0) for c in cards)
-                task.total_injured = sum(int(c.get("ran", 0) or 0) for c in cards)
-                logger.info(f"Task {task_id}: refreshed — {len(cards)} ДТП re-fetched")
-            else:
-                logger.warning(f"Task {task_id}: refresh got 0 cards, errors: {fetch_errors[:3]}")
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Не удалось перезагрузить данные: {'; '.join(fetch_errors[:2]) if fetch_errors else 'нет данных'}",
-                )
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.exception(f"Task {task_id}: refresh fetch failed")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Ошибка перезагрузки данных: {exc}",
-            )
-
-        # 5. Перегенерируем карту
-        html_content = await _generate_map_html(task)
-        if html_content is None:
-            raise HTTPException(
-                status_code=500, detail="Не удалось перегенерировать карту"
-            )
-        return HTMLResponse(content=html_content)
-
-    # Обычный путь (без refresh): отдаём кэшированную или лениво генерируем карту
-    map_file = next(
-        (f for f in task.files if f["type"] == "map_html"),
-        None,
-    )
-    if map_file:
-        path = Path(map_file["path"])
-        if path.exists():
-            return HTMLResponse(content=path.read_text(encoding="utf-8"))
+        if map_file:
+            path = Path(map_file["path"])
+            if path.exists():
+                return HTMLResponse(content=path.read_text(encoding="utf-8"))
 
     # Карта ещё не сгенерирована — генерируем лениво
     if not task.cards:
@@ -474,6 +414,7 @@ async def get_task_map(
         )
 
     return HTMLResponse(content=html_content)
+
 
 
 # ============================================================
