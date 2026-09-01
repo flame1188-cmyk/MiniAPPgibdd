@@ -406,11 +406,9 @@ async def get_task_map(
             except Exception as exc:
                 logger.warning(f"Task {task_id}: failed to delete cached map: {exc}")
 
-        # 4. Перескачиваем карточки из БД ГИБДД (force_refresh=True — пропускает кэш)
-        from ..services.pipeline import ensure_cards
-        # ensure_cards использует _fetch_cards_for_period(cache_result=True),
-        # но мы уже инвалидировали cards_cache, так что пойдёт в API/архив.
-        # Для гарантии можно принудительно вызвать _fetch_cards_for_period(force_refresh=True).
+        # 4. Перескачиваем карточки из БД ГИБДД
+        # cards_cache уже инвалидирован, поэтому _fetch_cards_for_period
+        # не найдёт кэш и пойдёт в API/архив.
         try:
             bot_module = __import__("bot", fromlist=["_fetch_cards_for_period"])
             cards, fetch_errors = await bot_module._fetch_cards_for_period(
@@ -418,7 +416,6 @@ async def get_task_map(
                 reg_code=task.region_code,
                 log_prefix=f"MiniApp[{task.id}]/refresh",
                 cache_result=True,
-                force_refresh=True,
             )
             if cards:
                 task.cards = cards
