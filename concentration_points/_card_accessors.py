@@ -74,6 +74,22 @@ def _is_intersection(card: dict) -> bool:
     return False
 
 
+def _is_regulated_intersection(card: dict) -> bool:
+    """Произошло ли ДТП на регулируемом перекрёстке.
+
+    Строго проверяет наличие «Регулируемый перекрёсток» в sdor.
+    НЕ совпадает с «Регулируемый пешеходный переход».
+    """
+    dor_usl = card.get("dor_usl") or {}
+    sdor_list = dor_usl.get("sdor") or []
+    if isinstance(sdor_list, list):
+        for item in sdor_list:
+            item_lower = str(item).strip().lower()
+            if "регулируемый перекрёсток" in item_lower:
+                return True
+    return False
+
+
 def _is_off_road(card: dict) -> bool:
     """Произошло ли ДТП вне дороги (внутридворовая территория, автостоянка).
 

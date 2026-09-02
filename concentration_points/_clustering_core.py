@@ -16,6 +16,7 @@ from ._constants import (
 )
 from ._card_accessors import (
     haversine_meters, _parse_coords, _is_intersection, _is_off_road,
+    _is_regulated_intersection,
     _get_dtp_type, _get_road_name, _get_date, _get_km_m, _has_road_and_piketazh,
     _max_gps_spread,
 )
@@ -513,6 +514,7 @@ def find_settlement_preclusters(
     road_cards_with_km = [
         (idx, card) for idx, card in indexed_with_coords
         if idx not in assigned and _has_road_and_piketazh(card)
+        and not _is_regulated_intersection(card)
     ]
 
     road_groups: dict[str, list[tuple[int, dict]]] = {}
@@ -546,6 +548,8 @@ def find_settlement_preclusters(
             for j in range(i + 1, len(items_pos)):
                 other_idx, other_card, other_pos = items_pos[j]
                 if other_idx in assigned:
+                    continue
+                if _is_regulated_intersection(other_card):
                     continue
                 if other_pos > window_end:
                     break
@@ -581,6 +585,9 @@ def find_settlement_preclusters(
     for idx, card in indexed_with_coords:
         if idx in assigned:
             continue
+        if _is_regulated_intersection(card):
+            assigned.add(idx)
+            continue
 
         center = _parse_coords(card)
         if center is None:
@@ -594,6 +601,7 @@ def find_settlement_preclusters(
         candidates = [
             (j, c) for j, c in indexed_with_coords
             if j not in assigned and j != idx
+            and not _is_regulated_intersection(c)
         ]
 
         group_indices = [idx]
@@ -822,6 +830,7 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
     road_cards_with_km = [
         (idx, card) for idx, card in indexed_with_coords
         if idx not in assigned and _has_road_and_piketazh(card)
+        and not _is_regulated_intersection(card)
     ]
 
     # Группируем по названию дороги
@@ -861,6 +870,8 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
             for j in range(i + 1, len(items_pos)):
                 other_idx, other_card, other_pos = items_pos[j]
                 if other_idx in assigned:
+                    continue
+                if _is_regulated_intersection(other_card):
                     continue
                 if other_pos > window_end:
                     break
@@ -906,6 +917,9 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
     for idx, card in indexed_with_coords:
         if idx in assigned:
             continue
+        if _is_regulated_intersection(card):
+            assigned.add(idx)
+            continue
 
         center = _parse_coords(card)
         if center is None:
@@ -920,6 +934,7 @@ def find_settlement_concentration_points(cards: list[dict]) -> list[dict]:
         candidates = [
             (j, c) for j, c in indexed_with_coords
             if j not in assigned and j != idx
+            and not _is_regulated_intersection(c)
         ]
 
         group_indices = [idx]
