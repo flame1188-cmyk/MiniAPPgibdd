@@ -29,7 +29,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-ZHIPU_API_URL = "https://api.aitunnel.ru/v1/chat/completions"
+ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 
 # Тип провайдера: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
 LLMProvider = Literal["free", "paid"]
@@ -1881,11 +1881,10 @@ async def _ask_free_llm(
     history: list[dict[str, str]] | None = None,
     temperature: float = 0.7,
 ) -> str:
-    """Запрос к бесплатному провайдеру (ZhipuAI / GLM)."""
-    if not LLM_API_KEY:
+    """Запрос к быстрому провайдеру (AItunnel / DeepSeek V4 Flash)."""
+    if not LLM_PAID_API_KEY:
         raise ValueError(
-            "LLM_API_KEY не задан. Добавьте его в .env файл. "
-            "Получить ключ: https://open.bigmodel.cn"
+            "LLM_PAID_API_KEY не задан. Добавьте его в .env файл."
         )
 
     if system_prompt is None:
@@ -1904,23 +1903,26 @@ async def _ask_free_llm(
                 messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user_message})
 
+    base_url = LLM_PAID_API_URL.rstrip("/")
+    api_url = f"{base_url}/chat/completions"
+
     payload = {
-        "model": LLM_MODEL,
+        "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": 8192,
     }
 
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {LLM_PAID_API_KEY}",
         "Content-Type": "application/json",
     }
 
     return await _do_llm_request(
-        api_url=ZHIPU_API_URL,
+        api_url=api_url,
         headers=headers,
         payload=payload,
-        model_name=LLM_MODEL,
+        model_name=LLM_PAID_MODEL,
         prompt_len=len(user_message),
         max_retries=max_retries,
         client_getter=_get_free_llm_client,
@@ -2348,42 +2350,35 @@ async def _ask_llm_stream_free(
     history: list[dict[str, str]] | None,
     temperature: float,
 ) -> AsyncIterator[str]:
-    """Streaming-запрос к бесплатному провайдеру (ZhipuAI/GLM)."""
-    if not LLM_API_KEY:
-        raise ValueError(
-            "LLM_API_KEY не задан. Добавьте его в .env файл. "
-            "Получить ключ: https://open.bigmodel.cn"
-        )
+    """Streaming-запрос к быстрому провайдеру (AItunnel / DeepSeek V4 Flash)."""
+    if not LLM_PAID_API_KEY:
+        raise ValueError("LLM_PAID_API_KEY не задан. Добавьте его в .env файл.")
+
+    base_url = LLM_PAID_API_URL.rstrip("/")
+    api_url = f"{base_url}/chat/completions"
 
     messages = await _build_stream_messages(
         system_prompt, SYSTEM_PROMPT, user_message, history,
     )
     payload = {
-        "model": LLM_MODEL,
+        "model": LLM_PAID_MODEL,
         "messages": messages,
         "temperature": temperature,
-        # Sprint 5.1: GLM-4.7-Flash имеет reasoning mode (thinking).
-        # reasoning_content не входит в лимит max_tokens, но если вопрос
-        # сложный и требует много reasoning, может сгенерировать 8192+ токенов
-        # reasoning, после чего content так и не появится (finish_reason=length).
-        # Увеличиваем max_tokens до 16384 (раньше было 8192).
         "max_tokens": 16384,
         "stream": True,
-        # Sprint 5: запрашиваем usage (prompt_tokens, completion_tokens, total_tokens)
-        # в финальном chunk'е стрима. Без этого ZhipuAI не возвращает usage в streaming mode.
         "stream_options": {"include_usage": True},
     }
     headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Authorization": f"Bearer {LLM_PAID_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
     }
 
     async for delta in _do_llm_stream_request(
-        api_url=ZHIPU_API_URL,
+        api_url=api_url,
         headers=headers,
         payload=payload,
-        model_name=LLM_MODEL,
+        model_name=LLM_PAID_MODEL,
         prompt_len=len(user_message),
         client_getter=_get_free_llm_client,
         provider="free",
@@ -3054,4 +3049,3 @@ async def get_ai_answer_stream(
         temperature=0.3,
     ):
         yield delta
-
