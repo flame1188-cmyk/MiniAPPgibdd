@@ -7,8 +7,8 @@ LLM-аналитика: summary + Q&A.
 - get_llm_providers_status() — статус доступности провайдеров (free/paid)
 
 Провайдеры:
-- "free" — ZhipuAI/GLM (LLM_API_KEY, дефолт)
-- "paid" — DeepSeek (LLM_PAID_API_KEY/LLM_PAID_API_URL)
+- "free" — AItunnel/DeepSeek V4 Flash (LLM_PAID_API_KEY/LLM_PAID_API_URL)
+- "paid" — AItunnel/DeepSeek (LLM_PAID_API_KEY/LLM_PAID_API_URL, полные данные)
 
 === Sprint 2: LLM_SEMAPHORE + LLM cache ===
 
@@ -193,7 +193,7 @@ async def _check_llm_cache(
         if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
             return False
     else:
-        if not config.LLM_API_KEY:
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
             return False
 
     # Готовим clusters_ctx
@@ -215,13 +215,6 @@ async def _check_llm_cache(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
-                # Причины ДТП (счётчики для LLM-рекомендаций)
-                "npdd_counter": c.get("npdd_counter", {}),
-                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
-                "ndu_counter": c.get("ndu_counter", {}),
-                "spch_counter": c.get("spch_counter", {}),
-                "factor_counter": c.get("factor_counter", {}),
-                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -363,9 +356,9 @@ async def _run_llm_summary_inner(
                 "(LLM_PAID_API_KEY/LLM_PAID_API_URL)"
             )
     else:
-        if not config.LLM_API_KEY:
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
             raise RuntimeError(
-                "Бесплатный LLM-провайдер не настроен (LLM_API_KEY)"
+                "Быстрый LLM-провайдер не настроен (LLM_PAID_API_KEY/LLM_PAID_API_URL)"
             )
 
     state.progress = 10
@@ -431,13 +424,6 @@ async def _run_llm_summary_inner(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
-                # Причины ДТП (счётчики для LLM-рекомендаций)
-                "npdd_counter": c.get("npdd_counter", {}),
-                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
-                "ndu_counter": c.get("ndu_counter", {}),
-                "spch_counter": c.get("spch_counter", {}),
-                "factor_counter": c.get("factor_counter", {}),
-                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -581,8 +567,8 @@ async def ask_llm_question(
             if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
                 return {"ok": False, "error": "Платный LLM не настроен"}
         else:
-            if not config.LLM_API_KEY:
-                return {"ok": False, "error": "Бесплатный LLM не настроен"}
+            if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
+                return {"ok": False, "error": "Быстрый LLM не настроен"}
 
         # Sprint 3.1: гарантируем, что task.cards есть (восстановление
         # из cards_cache для старых задач после рестарта).
@@ -738,13 +724,16 @@ def get_llm_providers_status() -> Dict[str, bool]:
     try:
         config = _imports._import_module("config")
         return {
-            "free": bool(config.LLM_API_KEY),
+            "free": bool(
+                getattr(config, "LLM_PAID_API_KEY", None)
+                and getattr(config, "LLM_PAID_API_URL", None)
+            ),
             "paid": bool(
                 getattr(config, "LLM_PAID_API_KEY", None)
                 and getattr(config, "LLM_PAID_API_URL", None)
             ),
-            "free_model": getattr(config, "LLM_MODEL", "glm-4-flash"),
-            "paid_model": getattr(config, "LLM_PAID_MODEL", "deepseek-chat"),
+            "free_model": getattr(config, "LLM_PAID_MODEL", "deepseek-v4-flash"),
+            "paid_model": getattr(config, "LLM_PAID_MODEL", "deepseek-v4-flash"),
         }
     except Exception:
         return {"free": False, "paid": False,
@@ -801,8 +790,8 @@ async def ask_llm_question_stream(
         if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
             raise RuntimeError("Платный LLM не настроен")
     else:
-        if not config.LLM_API_KEY:
-            raise RuntimeError("Бесплатный LLM не настроен")
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
+            raise RuntimeError("Быстрый LLM не настроен")
 
     # Sprint 3.1: гарантируем task.cards (восстановление из cards_cache).
     cards_result = await ensure_cards(task)
@@ -853,13 +842,6 @@ async def ask_llm_question_stream(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
-                # Причины ДТП (счётчики для LLM-рекомендаций)
-                "npdd_counter": c.get("npdd_counter", {}),
-                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
-                "ndu_counter": c.get("ndu_counter", {}),
-                "spch_counter": c.get("spch_counter", {}),
-                "factor_counter": c.get("factor_counter", {}),
-                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -1036,12 +1018,12 @@ async def stream_llm_summary(
             state.finished_at = datetime.now(timezone.utc)
             raise RuntimeError("Платный LLM не настроен")
     else:
-        if not config.LLM_API_KEY:
+        if not (config.LLM_PAID_API_KEY and config.LLM_PAID_API_URL):
             state.status = AnalysisStatus.FAILED
-            state.error = "Бесплатный LLM не настроен"
+            state.error = "Быстрый LLM не настроен"
             state.stage = "Ошибка"
             state.finished_at = datetime.now(timezone.utc)
-            raise RuntimeError("Бесплатный LLM не настроен")
+            raise RuntimeError("Быстрый LLM не настроен")
 
     state.progress = 10
     state.stage = "Восстановление данных задачи..."
@@ -1090,13 +1072,6 @@ async def stream_llm_summary(
                 "dynamics": c.get("dynamics", {}),
                 "_is_lost": c.get("is_lost", False),
                 "_is_prev_matched": c.get("is_prev_matched", False),
-                # Причины ДТП (счётчики для LLM-рекомендаций)
-                "npdd_counter": c.get("npdd_counter", {}),
-                "sop_npdd_counter": c.get("sop_npdd_counter", {}),
-                "ndu_counter": c.get("ndu_counter", {}),
-                "spch_counter": c.get("spch_counter", {}),
-                "factor_counter": c.get("factor_counter", {}),
-                "tn_counter": c.get("tn_counter", {}),
             }
             for c in task.clusters_state.result.get("clusters", [])
         ]
@@ -1258,4 +1233,3 @@ async def stream_llm_summary(
         ))
     except Exception as exc:
         logger.debug(f"Task {task.id}: save_llm_session (stream) failed: {exc}")
-
