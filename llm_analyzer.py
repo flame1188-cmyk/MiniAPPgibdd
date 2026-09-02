@@ -29,7 +29,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+ZHIPU_API_URL = "https://api.aitunnel.ru/v1/"
 
 # Тип провайдера: "free" (ZhipuAI/GLM) или "paid" (OpenAI-совместимый)
 LLMProvider = Literal["free", "paid"]
