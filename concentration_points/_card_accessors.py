@@ -75,7 +75,7 @@ def _is_intersection(card: dict) -> bool:
 
 
 def _is_regulated_intersection(card: dict) -> bool:
-    """Произошло ли ДТП на регулируемом перекрёстке.
+    """Произошло ли ДТП на регулируемом перекрестке.
 
     Строго проверяет наличие «Регулируемый перекрёсток» в sdor.
     НЕ совпадает с «Регулируемый пешеходный переход».
@@ -85,7 +85,7 @@ def _is_regulated_intersection(card: dict) -> bool:
     if isinstance(sdor_list, list):
         for item in sdor_list:
             item_lower = str(item).strip().lower()
-            if "регулируемый перекрёсток" in item_lower:
+            if "регулируемый перекресток" in item_lower:
                 return True
     return False
 
