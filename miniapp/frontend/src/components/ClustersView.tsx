@@ -60,6 +60,8 @@ export function ClustersView({ task }: ClustersViewProps) {
   const [startError, setStartError] = useState<string | null>(null)
   const [excelLoading, setExcelLoading] = useState(false)
   const [excelError, setExcelError] = useState<string | null>(null)
+  const [topClustersOpen, setTopClustersOpen] = useState(false)
+  const [preclustersOpen, setPreclustersOpen] = useState(false)
   // Флаг «пересчитываем» — пользователь нажал «Пересчитать» на готовом результате
   const [refreshing, setRefreshing] = useState(false)
 
@@ -604,31 +606,45 @@ export function ClustersView({ task }: ClustersViewProps) {
 
         {/* Топ-очаги */}
         <div className="tg-card">
-          <div className="tg-section-header mb-3">
+          <div
+            className="tg-section-header mb-3 flex justify-between items-center cursor-pointer select-none"
+            onClick={() => { setTopClustersOpen(v => !v); haptic('light') }}
+          >
             Топ-10 очагов по тяжести
+            <span style={{ fontSize: 16, lineHeight: 1 }}>{topClustersOpen ? '▾' : '▸'}</span>
           </div>
+          {topClustersOpen && (
           <div className="space-y-2">
             {sortedClusters.slice(0, 10).map((c, idx) => (
               <ClusterCard key={idx} cluster={c} index={idx + 1} />
             ))}
           </div>
+          )}
         </div>
 
         {/* Предочаги */}
         {preclusters.length > 0 && (
           <div className="tg-card">
-            <div className="tg-section-header mb-3">
-              ⚠ Предочаги ({preclusters.length})
+            <div
+              className="tg-section-header mb-3 flex justify-between items-center cursor-pointer select-none"
+              onClick={() => { setPreclustersOpen(v => !v); haptic('light') }}
+            >
+              ⚠ Топ-5 предочагов ({preclusters.length})
+              <span style={{ fontSize: 16, lineHeight: 1 }}>{preclustersOpen ? '▾' : '▸'}</span>
             </div>
-            <p className="text-xs opacity-70 mb-2">
-              Участки с ДТП ниже порога очага, но требующие внимания
-              (потенциальные очаги следующего периода).
-            </p>
-            <div className="space-y-2">
-              {preclusters.slice(0, 5).map((c, idx) => (
-                <ClusterCard key={`pre-${idx}`} cluster={c} index={idx + 1} isPrecluster />
-              ))}
-            </div>
+            {preclustersOpen && (
+            <>
+              <p className="text-xs opacity-70 mb-2">
+                Участки с ДТП ниже порога очага, но требующие внимания
+                (потенциальные очаги следующего периода).
+              </p>
+              <div className="space-y-2">
+                {preclusters.slice(0, 5).map((c, idx) => (
+                  <ClusterCard key={`pre-${idx}`} cluster={c} index={idx + 1} isPrecluster />
+                ))}
+              </div>
+            </>
+            )}
           </div>
         )}
 
