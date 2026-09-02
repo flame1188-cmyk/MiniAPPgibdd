@@ -535,7 +535,8 @@ export function ClustersView({ task }: ClustersViewProps) {
                 display: 'block',
               }}
               title="Карта очагов ДТП"
-            />\n          </div>
+            />
+          </div>
           {/* Легенда карты */}
           <div
             className="flex flex-wrap gap-x-4 gap-y-1.5 mt-2 px-1"
