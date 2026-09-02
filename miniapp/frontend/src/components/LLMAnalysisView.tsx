@@ -501,8 +501,8 @@ export function LLMAnalysisView({ task }: LLMAnalysisViewProps) {
                 setProvider('free')
                 haptic('light')
               }}
-              title="Бесплатный"
-              subtitle={providers.free_model || 'GLM'}
+              title="Быстрый"
+              subtitle={providers.free_model || 'DeepSeek'}
               icon="⚡"
             />
             <ProviderButton
