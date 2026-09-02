@@ -78,14 +78,19 @@ def _is_regulated_intersection(card: dict) -> bool:
     """Произошло ли ДТП на регулируемом перекрестке.
 
     Строго проверяет наличие «Регулируемый перекрёсток» в sdor.
-    НЕ совпадает с «Регулируемый пешеходный переход».
+    НЕ совпадает с «Нерегулируемый перекрёсток»
+    и «Регулируемый пешеходный переход».
+    Учитывает оба варианта написания: «перекрёсток» (ё) и «перекресток» (е).
     """
     dor_usl = card.get("dor_usl") or {}
     sdor_list = dor_usl.get("sdor") or []
     if isinstance(sdor_list, list):
         for item in sdor_list:
             item_lower = str(item).strip().lower()
-            if "регулируемый перекресток" in item_lower:
+            # Нормализуем ё → е для единообразной проверки
+            item_normalized = item_lower.replace("ё", "е")
+            if ("регулируемый перекресток" in item_normalized
+                    and "нерегулируемый" not in item_normalized):
                 return True
     return False
 
